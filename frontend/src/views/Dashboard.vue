@@ -1,5 +1,14 @@
 <template>
   <div v-loading="loading">
+    <el-card v-if="indexes.length" class="page-card" style="margin-bottom:16px">
+      <div style="display:flex;gap:16px;overflow-x:auto">
+        <div v-for="ix in indexes" :key="ix.code" style="min-width:140px">
+          <div class="muted" style="font-size:12px">{{ ix.name }}</div>
+          <div style="font-size:18px;font-weight:700">{{ fmtNum(ix.close) }}</div>
+          <div :class="upDownClass(ix.pct_chg)" style="font-size:12px">{{ fmtPct(ix.pct_chg) }} · {{ ix.trade_date }}</div>
+        </div>
+      </div>
+    </el-card>
     <el-row :gutter="16">
       <el-col :xs="24" :sm="24" :md="8">
         <el-card class="page-card state-card">
@@ -20,21 +29,25 @@
               </el-descriptions-item>
             </el-descriptions>
           </template>
+          <el-empty v-else-if="loadError" description="市场状态加载失败，请检查网络后重试" :image-size="60">
+            <el-button size="small" type="primary" @click="load">重试</el-button>
+          </el-empty>
           <el-empty v-else description="暂无市场状态,请先在任务中心运行 market_state 任务" :image-size="60" />
         </el-card>
       </el-col>
       <el-col :xs="24" :sm="24" :md="8">
         <el-card class="page-card state-card">
           <template #header>
-            拥挤度回避名单(SC-U08,已验证)
+            拥挤度回避名单(SC-U08,待验证)
             <el-tag v-if="d.market_wide_crowded" type="danger" size="small">全市场过度拥挤,建议整体降仓</el-tag>
           </template>
           <el-tag v-for="name in d.crowd_avoid" :key="name" type="danger" style="margin:4px">{{ name }}</el-tag>
-          <el-empty v-if="!d.crowd_avoid?.length" description="当前无拥挤行业" :image-size="60" />
+          <el-empty v-if="!d.crowd_avoid?.length" description="当前无拥挤行业" :image-size="60"
+                    title="SC-U08:行业成交占比偏离自身 MA120 超 300% 即列入回避" />
         </el-card>
         <el-card class="page-card state-card">
           <template #header>商品涨价信号(供需跟踪)</template>
-          <el-table :data="commodities" size="small" max-height="220">
+          <el-table :data="commodities" size="small" max-height="220" stripe border>
             <el-table-column prop="series_name" label="品种" width="90" />
             <el-table-column label="信号" width="80">
               <template #default="{ row }">
@@ -67,12 +80,12 @@
           <el-empty v-else description="暂无池表现数据" :image-size="60" />
         </el-card>
         <el-card class="page-card state-card">
-          <template #header>今日技术信号</template>
-          <el-table :data="d.signals" size="small" max-height="240">
+          <template #header>今日技术信号<span v-if="signalDate" class="muted" style="font-size:12px;margin-left:8px">{{ signalDate }}</span></template>
+          <el-table :data="d.signals" size="small" max-height="240" stripe border>
             <el-table-column prop="code" label="代码" width="85" />
-            <el-table-column label="名称" min-width="90">
-              <template #default="{ row }">{{ cleanName(row.name) || '-' }}</template>
-            </el-table-column>
+          <el-table-column label="名称" min-width="90">
+            <template #default="{ row }">{{ nameOrCode(row) }}</template>
+          </el-table-column>
             <el-table-column label="信号" width="120">
               <template #default="{ row }">
                 <el-tag :type="row.type === 'buy_setup' ? 'danger' : row.type === 'rs_weak' ? 'warning' : 'info'"
@@ -91,21 +104,26 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import api from '../api'
 import { cleanName, fmtInt, fmtNum, fmtPct, upDownClass } from '../utils/fmt'
 
 const d = ref({})
+const indexes = ref([])
 const loading = ref(false)
+const loadError = ref(false)
+let loadSeq = 0
 const labels = {
   buy_setup: '入场组合', bottom_fractal: '底分型', red_streak: '连红',
   volume_surge: '量能放大', rs_strong: '强于行业', rs_weak: '弱于行业',
 }
 function typeLabel(t) { return labels[t] || t }
 
-// 建议仓位区间(如 "50%-70%")取中值作可视化
+// 建议仓位区间(如 "50%-70%" / "50%~70%" / "50%—70%")取中值作可视化
+// 兼容:整数/小数、两侧 %、半角连字符、波浪线、中文破折号(——/—/–)
 const positionPct = computed(() => {
-  const m = String(d.value.market_state?.position_range || '').match(/(\d+)\s*[-~]\s*(\d+)%?/)
+  const m = String(d.value.market_state?.position_range || '')
+    .match(/(\d+(?:\.\d+)?)\s*%?\s*[-~～—–─―﹣－]+\s*(\d+(?:\.\d+)?)\s*%?/)
   if (!m) return 0
   return Math.round((Number(m[1]) + Number(m[2])) / 2)
 })
@@ -118,14 +136,39 @@ const commodities = computed(() => {
   return list.filter((c) => c.signal || Math.abs(Number(c.mom_20) || 0) > 0.5).slice(0, 8)
 })
 
-onMounted(async () => {
-  loading.value = true
-  try {
-    d.value = await api.get('/api/screener/dashboard')
-  } finally {
-    loading.value = false
-  }
+// 信号缺名:批量后仍缺则回退显示 code，避免整列 '-'
+function nameOrCode(row) {
+  return cleanName(row.name) || row.code || '-'
+}
+
+// 今日技术信号日期标题:取返回的最大 trade_date(后端已按时间倒序)
+const signalDate = computed(() => {
+  const dates = (d.value.signals || []).map((s) => s.trade_date).filter(Boolean)
+  return dates.length ? dates.sort().at(-1) : ''
 })
+
+onMounted(load)
+onBeforeUnmount(() => { loadSeq += 1 })
+
+async function load() {
+  const seq = (loadSeq += 1)
+  loading.value = true
+  loadError.value = false
+  try {
+    const data = await api.get('/api/screener/dashboard', { silent: true })
+    if (seq !== loadSeq) return // 竞态:丢弃过期响应
+    d.value = data || {}
+    try {
+      const ix = await api.get('/api/screener/indexes', { silent: true })
+      if (seq === loadSeq) indexes.value = Array.isArray(ix) ? ix : []
+    } catch { if (seq === loadSeq) indexes.value = [] } // 指数无数据整条隐藏,不弹错
+  } catch {
+    if (seq !== loadSeq) return
+    loadError.value = true
+  } finally {
+    if (seq === loadSeq) loading.value = false
+  }
+}
 </script>
 
 <style scoped>

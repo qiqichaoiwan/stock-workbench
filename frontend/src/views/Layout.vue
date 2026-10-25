@@ -36,6 +36,9 @@
         </el-button>
         <span class="title">{{ headerTitle }}</span>
         <span class="spacer" />
+        <el-autocomplete v-if="!isMobile" v-model="stockQ" :fetch-suggestions="fetchStocks"
+                         placeholder="搜股票代码/名称/拼音" clearable style="width:240px"
+                         value-key="label" @select="onPickStock" />
         <el-dropdown @command="onCommand">
           <span class="user-chip">
             <el-icon style="margin-right:6px"><User /></el-icon>
@@ -100,7 +103,9 @@ const menuGroups = [
     label: '智能选股工作台',
     items: [
       { path: '/dashboard', title: '仪表盘' },
+      { path: '/market', title: '大盘指数' },
       { path: '/pool', title: '选股池' },
+      { path: '/lhb', title: '龙虎榜' },
       { path: '/industries', title: '行业与赛道' },
       { path: '/signals', title: '技术信号' },
       { path: '/news', title: '新闻甄别' },
@@ -113,6 +118,7 @@ const menuGroups = [
     label: '持仓工作台',
     items: [
       { path: '/portfolio', title: '我的持仓' },
+      { path: '/watchlist', title: '自选预警' },
       { path: '/trades', title: '交易历史' },
       { path: '/reports', title: '报告中心' },
       { path: '/settings', title: 'LLM 设置' },
@@ -122,6 +128,10 @@ const menuGroups = [
     label: '系统管理',
     roles: ['admin'],
     items: [{ path: '/users', title: '用户与权限' }],
+  },
+  {
+    label: '使用帮助',
+    items: [{ path: '/help', title: '使用帮助' }],
   },
 ]
 
@@ -153,6 +163,28 @@ const pwdSaving = ref(false)
 const pwdForm = reactive({ old_password: '', new_password: '', confirm: '' })
 
 onMounted(() => { userStore.fetchMe() })
+
+// 全局搜股:选中后跳 /pool + localStorage 透传,Pool.onMounted 读取填 search
+const stockQ = ref('')
+async function fetchStocks(q, cb) {
+  if (!q?.trim()) return cb([])
+  try {
+    const data = await api.get('/api/screener/search',
+      { params: { q: q.trim(), limit: 20 }, silent: true }).catch(() => [])
+    const list = (Array.isArray(data) ? data : []).map((s) => ({
+      ...s, label: `${s.code} ${s.name || ''}`.trim(), value: `${s.code} ${s.name || ''}`.trim(),
+    }))
+    cb(list)
+  } catch { cb([]) }
+}
+function onPickStock(item) {
+  if (!item?.code) return
+  try { localStorage.setItem('pool_search', item.code) } catch { /* 忽略 */ }
+  stockQ.value = ''
+  ElMessage.success(`已定位 ${item.code} ${item.name || ''}`.trim())
+  if (route.path === '/pool') location.reload()
+  else router.push('/pool')
+}
 
 function onCommand(cmd) {
   if (cmd === 'logout') {

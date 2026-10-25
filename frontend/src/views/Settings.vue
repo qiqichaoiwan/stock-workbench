@@ -18,8 +18,11 @@
         <el-input-number v-model="form.temperature" :min="0" :max="2" :step="0.1" />
       </el-form-item>
       <el-form-item label="启用"><el-switch v-model="form.enabled" /></el-form-item>
+      <el-alert v-if="localHttpHint" type="warning" :closable="false" style="margin-bottom:12px"
+                title="检测到本机 HTTP 地址(vLLM/Ollama 本地调试用):仅本机环回地址允许,远程 HTTP 会被服务端拒绝" />
       <el-form-item>
         <el-button type="warning" :loading="testing" @click="test">测试连通</el-button>
+        <el-button v-if="!form.enabled" type="info" :loading="saving" @click="saveDisabled">仅保存停用状态</el-button>
         <el-button type="primary" :loading="saving" @click="save">保存</el-button>
       </el-form-item>
     </el-form>
@@ -28,7 +31,7 @@
 </template>
 
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 
@@ -39,10 +42,32 @@ const testing = ref(false)
 const saving = ref(false)
 const testResult = ref(null)
 
+// 本机环回:允许 http(本地 vLLM 调试);远程 http 由服务端拒绝,这里只做提示不拦截保存
+function isLoopbackHttp(url) {
+  try {
+    const u = new URL(String(url || '').trim())
+    return u.protocol === 'http:' && ['localhost', '127.0.0.1', '::1'].includes(u.hostname)
+  } catch { return false }
+}
+const localHttpHint = computed(() => isLoopbackHttp(form.value.base_url))
+function isRemoteHttp(url) {
+  try {
+    const u = new URL(String(url || '').trim())
+    return u.protocol === 'http:' && !['localhost', '127.0.0.1', '::1'].includes(u.hostname)
+  } catch { return false }
+}
+
 const rules = {
   base_url: [
     { required: true, message: '请输入 Base URL', trigger: 'blur' },
     { pattern: /^https?:\/\/.+/, message: '需以 http(s):// 开头', trigger: 'blur' },
+    {
+      validator: (_r, v, cb) => {
+        if (isRemoteHttp(v)) cb(new Error('远程地址必须使用 HTTPS;仅本机环回(localhost/127.0.0.1)允许 HTTP'))
+        else cb()
+      },
+      trigger: 'blur',
+    },
   ],
   model: [{ required: true, message: '请输入模型名', trigger: 'blur' }],
 }
@@ -59,6 +84,18 @@ async function save() {
   try {
     await api.put('/api/settings/llm', form.value)
     ElMessage.success('已保存')
+  } finally {
+    saving.value = false
+  }
+}
+
+// 停用状态单保存:不校验 URL/模型(后端 enabled=false 时不要求必填),只下发 enabled=false
+async function saveDisabled() {
+  saving.value = true
+  try {
+    await api.put('/api/settings/llm', { ...form.value, enabled: false })
+    form.value.enabled = false
+    ElMessage.success('已保存为停用状态(URL/模型未校验)')
   } finally {
     saving.value = false
   }

@@ -91,6 +91,7 @@ async function doLogin() {
   loading.value = true
   try {
     await store.login(loginForm.value.username, loginForm.value.password)
+    await store.fetchMe() // 登录后拉最新角色,菜单/按钮权限即时生效
     ElMessage.success('登录成功')
     router.push('/dashboard')
   } finally {

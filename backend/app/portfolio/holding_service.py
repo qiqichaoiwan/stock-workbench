@@ -10,7 +10,7 @@ G03 引擎(代码硬规则,不可被 AI 覆盖):
 import logging
 from datetime import date, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -70,33 +70,61 @@ def init_holding(db: Session, user_id: int, code: str, buy_price: float, quantit
     return h
 
 
-def update_daily(db: Session, trade_date: date | None = None) -> list[dict]:
-    """每日巡检:更新最高价、推进止损阶段、生成风险提醒(供日报)。"""
+def update_daily(db: Session, user_id: int | None = None,
+                 trade_date: date | None = None) -> list[dict]:
+    """每日巡检(唯一写止损的入口):更新最高价、推进止损阶段、生成风险提醒。
+
+    - user_id=None:全量扫描,供巡检任务(holding_patrol)使用;
+      有值:只扫该用户持仓。GET/日报禁止调用本函数(避免读请求触发跨租户写入),
+      日报一律走 report_service._alerts 只读计算。
+    - 行情统一截止 completed_trade_day(经 stock_ref.latest_quote_date/
+      latest_close/quote_history/atr14 的 as-of 过滤),禁止偷看未来;
+      长期停牌(>5天无有效收盘,qd < trade_date-5d)跳过,不推进止损。
+    G03 相位(代码硬规则,不可被 AI 覆盖):
+    - A:初始止损,禁止上移、禁止放宽;仅 _stage_b_reached 命中才晋升 B。
+    - B:止损=真实保本价;当 trail(percent/ATR 取高) > 保本价时晋升 C 并抬止损到 trail。
+      (旧 bug:旧代码 B 分支 new_stop=max(stop, be),new_stop 恒 <=be,故
+      "stop > be 则晋升 C" 永不成立,G03 卡死在 B;现改为直接比较 trail > be。)
+    - C:按 trail 持续抬升,只上不下,永不回退 A/B。
+    """
     trade_date = trade_date or stock_ref.latest_quote_date(db)
+    if trade_date is None:
+        return []
     alerts: list[dict] = []
-    holdings = db.execute(select(Holding).where(Holding.status == "holding")).scalars().all()
+    q = select(Holding).where(Holding.status == "holding")
+    if user_id is not None:
+        q = q.where(Holding.user_id == user_id)
+    holdings = db.execute(q).scalars().all()
     for h in holdings:
         latest = stock_ref.latest_close(db, h.code)
         if latest is None:
             continue
         qd, close = latest
         if qd < trade_date - timedelta(days=5):
-            continue  # 长期停牌
-        hist = stock_ref.quote_history(db, h.code, days=30)
+            continue  # 长期停牌:无有效收盘,跳过不推进止损,避免脏数据误触发
+        hist = stock_ref.quote_history(db, h.code, days=30, as_of=trade_date)
         high_recent = max((q["high"] or q["close"]) for q in hist) if hist else close
         h.highest_price = max(h.highest_price or h.buy_price, high_recent, close)
 
+        # 阶段A:止损保持初始价不动(禁上移/禁放宽);达标才晋升 B。
         if h.stop_stage == "A" and _stage_b_reached(close, h):
+            # B 入口:止损一次性上移至真实保本价(含全部摩擦成本)。
             h.stop_stage = "B"
             h.stop_price = max(h.stop_price, h.breakeven_price)
-        if h.stop_stage in ("B", "C"):
-            atr = stock_ref.atr14(db, h.code)
+        if h.stop_stage == "B":
+            # B->C 晋升:trail(percent/ATR 取高)已超过保本价 → 晋升 C 并抬止损到 trail;
+            # 否则停留在 B(止损保持保本价,不退回 A,更不下调)。
+            atr = stock_ref.atr14(db, h.code, as_of=trade_date)
             trail = _trail_stop(h, atr)
-            new_stop = max(h.stop_price, trail if h.stop_stage == "C" else h.breakeven_price)
-            if new_stop > h.stop_price:  # 只上不下(禁止浮亏放宽)
-                h.stop_price = round(new_stop, 4)
-                if h.stop_stage == "B" and h.stop_price > h.breakeven_price:
-                    h.stop_stage = "C"
+            if trail > h.breakeven_price:
+                h.stop_stage = "C"
+                h.stop_price = round(max(h.stop_price, trail), 4)
+        elif h.stop_stage == "C":
+            # C 阶段:按 trail 持续抬升,只上不下;永不回退到 A/B。
+            atr = stock_ref.atr14(db, h.code, as_of=trade_date)
+            trail = _trail_stop(h, atr)
+            if trail > h.stop_price:  # 只上不下(禁止浮亏放宽)
+                h.stop_price = round(trail, 4)
         if close <= h.stop_price:
             alerts.append({
                 "code": h.code, "name": h.name, "close": close,
@@ -118,11 +146,17 @@ def update_daily(db: Session, trade_date: date | None = None) -> list[dict]:
 def sell(db: Session, user_id: int, holding_id: int, sell_price: float,
          sell_date: date, exit_trigger: str = "manual", note: str = "") -> TradeRecord:
     """点击「已卖出」:含费盈亏入审计库,持仓关闭。"""
-    h = db.get(Holding, holding_id)
-    if h is None or h.user_id != user_id:
-        raise ValueError("持仓不存在")
-    if h.status != "holding":
+    # Conditional update is the serialization point: only one concurrent request can claim it.
+    claimed = db.execute(update(Holding).where(
+        Holding.id == holding_id, Holding.user_id == user_id,
+        Holding.status == "holding").values(status="sold")).rowcount
+    if not claimed:
+        db.rollback()
         raise ValueError("该持仓已卖出")
+    h = db.get(Holding, holding_id)
+    if h is None:
+        db.rollback()
+        raise ValueError("持仓不存在")
     net_buy = h.buy_price * h.quantity * (1 + BUY_COMMISSION + TRANSFER_FEE)
     net_sell = sell_price * h.quantity * (1 - SELL_COMMISSION - STAMP_TAX)
     pnl = net_sell - net_buy

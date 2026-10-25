@@ -28,8 +28,16 @@ body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #f5f7
 /* 卡片头部工具行允许换行(窄屏) */
 .card-head { flex-wrap: wrap; row-gap: 8px; }
 
+/* 表格容器横滚(窄屏长表不溢出),优先列保留 + 省略 tooltip */
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.table-scroll .el-table { min-width: 640px; }
+
 /* ---------- 移动端(<=768px) ---------- */
 @media (max-width: 768px) {
+  /* 次要列隐藏(与 hide-mobile 类配合),保留优先列 */
+  .hide-mobile { display: none !important; }
+  /* 表格容器最小宽放宽,允许横滚而非挤压 */
+  .table-scroll .el-table { min-width: 560px; }
   /* 对话框不超过屏宽,内容区可滚动 */
   .el-dialog { width: 92vw !important; max-width: 92vw !important; margin-top: 6vh !important; }
   .el-dialog__body { max-height: 64vh; overflow-y: auto; }

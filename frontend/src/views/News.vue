@@ -7,7 +7,7 @@
         <el-switch v-model="screenedOnly" active-text="仅甄别通过" @change="load" />
       </div>
     </template>
-    <el-table :data="pagedRows" size="small" v-loading="loading" max-height="620" stripe>
+    <el-table :data="pagedRows" size="small" v-loading="loading" max-height="620" stripe border>
       <el-table-column label="时间" width="150">
         <template #default="{ row }">{{ fmtDT(row.publish_time) }}</template>
       </el-table-column>
@@ -34,15 +34,22 @@
         </template>
       </el-table-column>
     </el-table>
+    <el-empty v-if="!loading && !rows.length" description="暂无新闻" :image-size="60">
+      <template #description>
+        <p>暂无新闻,请先在任务中心运行 news 后可见</p>
+        <p class="muted" style="font-size:12px">交易日 11:40 / 14:40 低频采集;若开启「仅甄别通过」仍为空,可关掉开关确认是否连噪声也没有</p>
+      </template>
+    </el-empty>
     <div class="pager">
       <el-pagination layout="total, prev, pager, next" :total="rows.length" :page-size="pageSize"
                      v-model:current-page="page" />
     </div>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">前端分页 · 共 {{ rows.length }} 条(服务端 limit=200 取回,切换开关即重新请求)</p>
   </el-card>
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import api from '../api'
 import { fmtDT, fmtInt } from '../utils/fmt'
 
@@ -51,18 +58,23 @@ const screenedOnly = ref(true)
 const loading = ref(false)
 const page = ref(1)
 const pageSize = 20
+let loadSeq = 0
 const pagedRows = computed(() => rows.value.slice((page.value - 1) * pageSize, page.value * pageSize))
 
 async function load() {
+  const seq = (loadSeq += 1)
   loading.value = true
   try {
-    rows.value = await api.get('/api/screener/news',
-      { params: { screened_only: screenedOnly.value, limit: 200 } })
+    const data = await api.get('/api/screener/news',
+      { params: { screened_only: screenedOnly.value, limit: 200 }, silent: true })
+    if (seq !== loadSeq) return // 竞态:丢弃过期响应
+    rows.value = Array.isArray(data) ? data : (data?.items || data?.data || [])
     page.value = 1
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
 onMounted(load)
+onBeforeUnmount(() => { loadSeq += 1 })
 </script>

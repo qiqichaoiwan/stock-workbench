@@ -12,6 +12,7 @@ api.interceptors.request.use((cfg) => {
 api.interceptors.response.use(
   (resp) => resp.data,
   (err) => {
+    if (err.config?.silent) return Promise.reject(err) // 调用方自行展示内联错误态
     const msg = err.response?.data?.detail || err.message
     if (err.response?.status === 401) {
       localStorage.removeItem('token')

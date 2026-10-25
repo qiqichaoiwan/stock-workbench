@@ -19,8 +19,9 @@ export function fmtPct(v, digits = 2, dash = '-') {
 // A股口径:红涨绿跌(0 视为平,不着色)
 export function upDownClass(v) {
   const n = Number(v)
-  if (Number.isNaN(n) || n > 0) return n > 0 ? 'up' : ''
-  return 'down'
+  if (Number.isNaN(n) || v === null || v === undefined || v === '') return ''
+  if (n === 0) return ''
+  return n > 0 ? 'up' : 'down'
 }
 
 // ISO 时间 → 'YYYY-MM-DD HH:mm'(已是该格式则原样;秒为 00 时省略)
@@ -61,9 +62,9 @@ export function ratingType(r) {
 }
 
 // 秒/毫秒耗时 → 可读
-export function fmtDuration(ms) {
+export function fmtDuration(ms, dash = '-') {
   const n = Number(ms)
-  if (Number.isNaN(n) || n < 0) return '-'
+  if (ms === null || ms === undefined || ms === '' || Number.isNaN(n) || n < 0) return dash
   if (n < 1000) return `${n}ms`
   if (n < 60000) return `${(n / 1000).toFixed(1)}s`
   return `${Math.floor(n / 60000)}m${Math.round((n % 60000) / 1000)}s`

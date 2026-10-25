@@ -1,20 +1,48 @@
 version: "3.8"
 
+# 部署约束(必读,与 app/config.py + app/task_runner.py 对应):
+# - 单 scheduler/单写进程:deploy.replicas=1 固定,不要扩副本。SQLite(WAL)只允许
+#   单写进程,多副本会 WAL 双写冲突 → database is locked / 数据损坏。
+#   横向扩展前必须先切 MySQL/Postgres(DATABASE_URL)+DB advisory 锁,再放开 replicas。
+# - 数据备份:data/selectmoney.db(+ -wal/-shm)在 ./data 卷。建议宿主机 cron 每日:
+#     sqlite3 ./data/selectmoney.db ".backup './data/backup-$(date +%F).db'"
+#   保留 7 天;恢复前先停容器(docker compose stop)再整体拷回,不要热覆盖。
+# - 健康检查:/api/health;调度器靠 APScheduler 进程内单例,容器重启即重建,
+#   zombie running 行由 cleanup_zombie_tasks 自愈。
 services:
   stock-workbench:
     build: .
     container_name: stock-workbench
     restart: unless-stopped
+    deploy:
+      replicas: 1  # 单 scheduler 守卫:禁止扩副本(见顶部约束)
+      restart_policy:
+        condition: on-failure
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
     environment:
       - TZ=Asia/Shanghai
+      - APP_ENV=production  # 显式生产标记:main.py 无强 JWT_SECRET 直接拒绝启动
       # 生产环境务必修改 JWT 密钥并提供 Fernet 主密钥(可用 python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())")
       - JWT_SECRET=${JWT_SECRET:?请在 .env 或环境变量设置 JWT_SECRET(可用 openssl rand -hex 32 生成)}
       - FERNET_KEY=${FERNET_KEY:-}
-      # 系统兜底 LLM(可选;用户可在界面自配)
+      # 系统兜底 LLM(可选;用户可在界面自配)。默认空=无兜底,纯规则输出。
       - DEFAULT_LLM_BASE_URL=${DEFAULT_LLM_BASE_URL:-}
       - DEFAULT_LLM_API_KEY=${DEFAULT_LLM_API_KEY:-}
       - DEFAULT_LLM_MODEL=${DEFAULT_LLM_MODEL:-}
+      # 采集超时/重试(默认 60s 超时×3 次×5s 退避;见 app/config.py)
+      - FETCH_TIMEOUT_SECONDS=${FETCH_TIMEOUT_SECONDS:-60}
+      - FETCH_RETRY_TIMES=${FETCH_RETRY_TIMES:-3}
+      - FETCH_RETRY_WAIT_SECONDS=${FETCH_RETRY_WAIT_SECONDS:-5}
+      # 后台任务全局并发上限(默认 3,超限 API 转 409)
+      - MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-3}
+      # 生产前后端分离部署时显式配置,如 CORS_ORIGINS=https://app.example.com
+      - CORS_ORIGINS=${CORS_ORIGINS:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

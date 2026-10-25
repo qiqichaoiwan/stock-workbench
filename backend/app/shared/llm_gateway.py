@@ -8,6 +8,28 @@ from ..config import settings
 from ..portfolio.models import UserLlmConfig
 from ..shared.security import decrypt_secret
 
+import ipaddress
+from urllib.parse import urlparse
+
+
+def _validate_base_url(base_url: str, allow_local: bool = False) -> str:
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https":
+        if not (allow_local and parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}):
+            raise ValueError("LLM 地址必须使用 HTTPS；仅允许明确配置的本机模型使用 HTTP")
+    host = parsed.hostname or ""
+    try:
+        ip = ipaddress.ip_address(host)
+        if not (allow_local and ip.is_loopback):
+            raise ValueError("禁止访问内网或特殊地址")
+    except ValueError as exc:
+        if "禁止" in str(exc):
+            raise
+    if not host or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("LLM 地址无效")
+    return base_url.rstrip("/")
+
+
 log = logging.getLogger("llm_gateway")
 
 
@@ -16,12 +38,19 @@ def resolve_config(db: Session, user_id: int) -> dict:
     cfg = db.execute(select(UserLlmConfig).where(
         UserLlmConfig.user_id == user_id)).scalar_one_or_none()
     if cfg and cfg.enabled and cfg.base_url and cfg.model:
-        key = decrypt_secret(cfg.api_key_cipher)
-        if key:
-            return {"base_url": cfg.base_url, "api_key": key, "model": cfg.model,
-                    "temperature": cfg.temperature, "source": "user"}
+        try:
+            base_url = _validate_base_url(cfg.base_url, allow_local=False)
+        except ValueError:
+            log.warning("blocked unsafe user LLM URL")
+            base_url = ""
+        if base_url:
+            key = decrypt_secret(cfg.api_key_cipher)
+            if key:
+                return {"base_url": base_url, "api_key": key, "model": cfg.model,
+                        "temperature": cfg.temperature, "source": "user"}
     if settings.default_llm_api_key:
-        return {"base_url": settings.default_llm_base_url, "api_key": settings.default_llm_api_key,
+        base_url = _validate_base_url(settings.default_llm_base_url, allow_local=False)
+        return {"base_url": base_url, "api_key": settings.default_llm_api_key,
                 "model": settings.default_llm_model, "temperature": 0.3, "source": "system"}
     return {"base_url": "", "api_key": "", "model": "", "temperature": 0.3,
             "source": "none", "enabled": False}
@@ -51,12 +80,15 @@ def chat(db: Session, user_id: int, system: str, user_content: str,
         raise
 
 
-def test_config(base_url: str, api_key: str, model: str) -> tuple[bool, str]:
-    """连通性测试。"""
+def test_config(base_url: str, api_key: str, model: str,
+                timeout: float = 8.0) -> tuple[bool, str]:
+    """连通性测试:先做服务端 URL 校验(复用 _validate_base_url,拒绝 SSRF),
+    再用短超时探测连通性,避免 /settings/llm/test 长时间挂起。"""
     try:
+        base_url = _validate_base_url(base_url, allow_local=False)
         from openai import OpenAI
 
-        client = OpenAI(base_url=base_url, api_key=api_key, timeout=20)
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
         resp = client.chat.completions.create(
             model=model, max_tokens=8,
             messages=[{"role": "user", "content": "ping"}])

@@ -1,5 +1,7 @@
 """安全基座:JWT、bcrypt 密码哈希、Fernet 密钥加密(用户 LLM api_key)。"""
 import base64
+import hashlib
+import hmac
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -48,8 +50,13 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 # ---------- JWT ----------
 
-def create_access_token(user_id: int, username: str) -> str:
+def credential_fingerprint(password_hash: str) -> str:
+    return hmac.new(settings.jwt_secret.encode(), password_hash.encode(), hashlib.sha256).hexdigest()
+
+
+def create_access_token(user_id: int, username: str, password_hash: str) -> str:
     payload = {
+        "credential": credential_fingerprint(password_hash),
         "sub": str(user_id),
         "username": username,
         "exp": datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_expire_minutes),
@@ -81,6 +88,8 @@ def current_user_id(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户不存在")
     if not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "账号已停用,请联系管理员")
+    if payload.get("credential") != credential_fingerprint(user.password_hash):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "凭证已撤销,请重新登录")
     return user_id
 
 

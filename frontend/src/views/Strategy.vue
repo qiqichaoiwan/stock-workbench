@@ -8,7 +8,7 @@
           <el-button v-if="canOperate" type="primary" size="small" :loading="saving" @click="save">保存修改</el-button>
         </div>
       </template>
-      <el-table :data="params" size="small" stripe>
+      <el-table :data="params" size="small" stripe border>
         <el-table-column prop="key" label="参数" width="200" />
         <el-table-column label="值" width="200">
           <template #default="{ row }">
@@ -17,6 +17,12 @@
         </el-table-column>
         <el-table-column prop="note" label="说明" />
       </el-table>
+      <el-empty v-if="!params.length" description="暂无策略参数" :image-size="60">
+        <template #description>
+          <p>暂无策略参数,请检查后端策略参数接口是否正常</p>
+          <p class="muted" style="font-size:12px">正常情况下参数表由后端预置;为空多为网络或服务端异常,刷新重试</p>
+        </template>
+      </el-empty>
       <el-alert v-if="!canOperate" type="info" :closable="false" title="当前角色只读;修改需策略员或管理员权限" style="margin-top:10px" />
     </el-card>
   </div>

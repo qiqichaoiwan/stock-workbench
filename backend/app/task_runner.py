@@ -3,10 +3,22 @@
 定时与手动触发共用同一入口 _log_wrap,失败写 task_log 便于后台排查。
 同一任务带互斥锁(重入直接拒绝),后台线程执行供 API 手动触发使用,
 避免慢任务(如行业重试、历史回填)阻塞请求线程造成"页面卡死"。
+
+并发与多 worker 约束(必读):
+- 进程内:同名任务互斥(_task_locks) + 全局并发上限(MAX_CONCURRENT_TASKS,
+  默认 3,超限直接 409 拒绝,防止回填拖垮采集)。
+- 多进程/多 worker:SQLite 只允许单写进程。本项目默认单容器单 scheduler
+  (见 docker-compose deploy.replicas=1);如需横向扩展,必须先迁移到
+  MySQL/Postgres 并把 _file_lock 换成 DB advisory 锁,详见 _file_lock 说明。
+- 状态语义:success=全部完成;degraded=部分完成(有 errors/codes_failed);
+  failed=整体抛错。degraded 不冒充 success,前端任务日志可直接区分。
 """
 import logging
+import json
+import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import date, timedelta
 
 import pandas as pd
@@ -18,8 +30,9 @@ from .portfolio.models import User
 from .portfolio.report_service import weekly_report
 from .screener import industry_monitor, market_regime, news_monitor, strategy_engine, \
     technical_signal, universe_manager
-from .screener.models import (DailyQuote, FinancialIndicator, IntradaySnapshot,
-                              StockBasic, TaskLog, Valuation)
+from .screener.models import (DailyQuote, FinancialIndicator, FundFlowSnapshot,
+                              IntradaySnapshot, LhbDaily, MarketStat, StockBasic,
+                              TaskLog, Valuation)
 from .shared import data_gateway as dg
 
 log = logging.getLogger("tasks")
@@ -27,6 +40,58 @@ log = logging.getLogger("tasks")
 # 任务互斥:同名任务运行中时拒绝再次触发(定时/手动共用)
 _task_locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
+_pending_tasks: set[str] = set()
+# 全局并发上限:后台任务同时运行数,超限 run_task_async 返回 False(API 转 409)。
+# 取值见 config.max_concurrent_tasks(默认 3,环境变量 MAX_CONCURRENT_TASKS 覆盖)。
+def _max_concurrent_tasks() -> int:
+    try:
+        from .config import settings as _settings
+
+        return int(_settings.max_concurrent_tasks)
+    except Exception:
+        return int(os.environ.get("MAX_CONCURRENT_TASKS", "3"))
+
+
+MAX_CONCURRENT_TASKS = _max_concurrent_tasks()
+
+
+@contextmanager
+def _file_lock(name: str):
+    """跨进程互斥(单机多 worker 场景)。
+
+    当前实现:SQLite 单写进程 + docker-compose replicas=1,进程内锁已足够,
+    此处为文档型守卫——同一 data 目录下若意外起第二个进程,第二个直接拒绝,
+    避免双写 WAL 冲突。如迁移到 MySQL/Postgres 后需多副本,请把这里换成
+    DB advisory 锁(GET_LOCK/pg_advisory_lock)再放开 replicas。
+    """
+    try:
+        import fcntl  # noqa: PLC0415 unix 容器路径使用,Windows 无此模块则降级
+    except ImportError:
+        # Windows 开发机:退化为进程内锁(生产跑 linux 容器,有 flock 保护)
+        yield True
+        return
+
+    from .config import ROOT_DIR
+
+    lock_path = ROOT_DIR / "data" / f".task-{name}.lock"
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield False
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
 
 
 def _get_lock(name: str) -> threading.Lock:
@@ -51,21 +116,29 @@ def cleanup_zombie_tasks() -> int:
 
 
 def run_task_async(name: str, **kwargs) -> bool:
-    """后台线程执行任务;已在运行则返回 False。调用方立即返回响应。
+    """后台线程执行任务;同名任务在提交时原子占位,避免检查-提交竞态。
 
-    这里只做非阻塞探测(探测即释放),真正互斥由 run_task 内部锁保证;
-    极端并发下第二个线程会在 run_task 处被拒并写失败日志。
+    全局并发上限 MAX_CONCURRENT_TASKS:超限直接返回 False(API 转 409),
+    防止回填等慢任务拖垮采集流水线。
     """
-    lock = _get_lock(name)
-    if not lock.acquire(blocking=False):
-        return False
-    lock.release()
+    with _locks_guard:
+        if name in _pending_tasks:
+            return False
+        limit = _max_concurrent_tasks()
+        if len(_pending_tasks) >= limit:
+            log.warning("task %s rejected: %d tasks running (max %d)",
+                        name, len(_pending_tasks), limit)
+            return False
+        _pending_tasks.add(name)
 
     def _worker():
         try:
             run_task(name, **kwargs)
         except Exception as exc:  # noqa: BLE001
             log.warning("async task %s rejected/failed: %s", name, exc)
+        finally:
+            with _locks_guard:
+                _pending_tasks.discard(name)
 
     threading.Thread(target=_worker, name=f"task-{name}", daemon=True).start()
     return True
@@ -86,23 +159,65 @@ def recent_periods(n: int = 8) -> list[str]:
     return sorted(periods)
 
 
+TASK_DEGRADED_MARKERS = ("errors", "codes_failed", "failed")
+
+
+def _is_degraded(result: dict) -> bool:
+    """degraded=部分完成:任一标记非空即降级,不冒充 success。
+
+    - error:单点致命错误字符串(如策略引擎返回 {"error": ...})
+    - errors:逐项错误列表/字典/字符串(如赛道同步单赛道失败、回填失败明细)
+    - codes_failed/failed:计数类(如回填失败数)
+    向后兼容:旧调用方只看 success/failed 时,degraded 在 _log_wrap 统一转 failed
+    (带 degraded 前缀,日志可区分);新调用方可直接用此函数预判。
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("error"):
+        return True
+    for key in TASK_DEGRADED_MARKERS:
+        val = result.get(key)
+        if isinstance(val, (list, tuple, set)) and len(val) > 0:
+            return True
+        if isinstance(val, dict) and len(val) > 0:
+            return True
+        if isinstance(val, str) and val.strip():
+            return True
+        if isinstance(val, (int, float)) and val > 0:
+            return True
+    return False
+
+
 def _log_wrap(name: str, fn, **kwargs):
     db = SessionLocal()
     t = TaskLog(task_name=name, status="running")
-    db.add(t)
-    db.commit()
     started = time.monotonic()
     try:
+        db.add(t)
+        db.commit()
         result = fn(db, **kwargs) or {}
+        # degraded(部分完成)绝不冒充 success:统一记 failed,detail 带 degraded 前缀
+        if isinstance(result, dict) and _is_degraded(result):
+            raise RuntimeError(f"task degraded: {result}")
         t.status, t.detail = "success", str(result)[:2000]
         return result
     except Exception as exc:  # noqa: BLE001
         log.exception("task %s failed", name)
+        db.rollback()
         t.status, t.detail = "failed", f"{exc}"[:2000]
+        try:
+            db.add(t)
+            db.commit()
+        except Exception:
+            db.rollback()
+            log.exception("task %s failure log persistence failed", name)
         raise
     finally:
         t.duration_ms = int((time.monotonic() - started) * 1000)
-        db.commit()
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
         db.close()
 
 
@@ -115,7 +230,11 @@ def run_task(name: str, **kwargs):
     if not lock.acquire(blocking=False):
         raise RuntimeError(f"任务 {name} 正在运行中,请稍候")
     try:
-        return _log_wrap(name, TASKS[name], **kwargs)
+        # 多 worker(多进程)守卫:同一 data 目录下第二个进程直接拒绝,防双写 WAL
+        with _file_lock(name) as acquired:
+            if not acquired:
+                raise RuntimeError(f"任务 {name} 已在另一进程运行中,请稍候")
+            return _log_wrap(name, TASKS[name], **kwargs)
     finally:
         lock.release()
 
@@ -129,40 +248,152 @@ def task_sync_members(db: Session):
 
 
 def task_sync_tracks(db: Session):
+    """赛道成分同步:单赛道失败隔离,返回 tracks{name:{added,source}} + errors。"""
     universe_manager.ensure_default_tracks(db)
     out, errors = {}, []
     for t in universe_manager.list_tracks(db):
         try:
-            out[t.name] = universe_manager.sync_track_members(db, t)
+            n = universe_manager.sync_track_members(db, t)
+            out[t.name] = {"added": n, "source": getattr(t, "member_source", "") or ""}
         except Exception as exc:  # noqa: BLE001 单赛道失败不拖垮整体
             errors.append(f"{t.name}: {exc}")
     return {"tracks": out, "errors": errors}
 
 
+def task_tracks_backfill(db: Session):
+    """一键回填赛道成分:ensure_default_tracks + 逐 track sync,逐项隔离。
+
+    返回 {results: {name: {"added": n, "source": s}}, errors: [...]}
+    (与 backfill_all_tracks 一致,供 POST /tracks/backfill 复用)。"""
+    return universe_manager.backfill_all_tracks(db)
+
+
+def task_sync_indexes(db: Session):
+    """指数日线落库(INDEX_DISPLAY):取最后一行落库,单指数失败继续。
+
+    窗口取近 90 天:网关 get_index_daily 有 30 行门限(<30 行判失败),
+    长窗口保证门限通过,落库仍是最新一行(即近 5 交易日内数据)。
+    """
+    from datetime import timedelta
+
+    from .screener.models import IndexDaily
+
+    start = (dg.today() - timedelta(days=90)).strftime("%Y%m%d")
+    out, errors = {}, {}
+    for code, name in dg.INDEX_DISPLAY:
+        try:
+            df, source = dg.get_index_daily_with_source(code, start)
+            if df.empty:
+                continue
+            last = df.sort_values("trade_date").iloc[-1]
+            td = last["trade_date"]
+            if hasattr(td, "date"):
+                td = td.date()
+            amount = float(last.get("amount") or 0.0)
+            # pct_chg:源无此列时由收盘推导
+            if "pct_chg" in df.columns:
+                pct = float(last.get("pct_chg") or 0.0)
+            else:
+                closes = pd.to_numeric(df.sort_values("trade_date")["close"],
+                                       errors="coerce").dropna()
+                pct = ((float(closes.iloc[-1]) / float(closes.iloc[-2]) - 1) * 100
+                       if len(closes) >= 2 else 0.0)
+            row = db.execute(select(IndexDaily).where(
+                IndexDaily.code == code, IndexDaily.trade_date == td)
+            ).scalar_one_or_none()
+            if row is None:
+                row = IndexDaily(code=code, name=name, trade_date=td)
+                db.add(row)
+            row.name, row.close = name, float(last.get("close") or 0.0)
+            row.pct_chg, row.amount = pct, amount
+            row.source = source
+            db.commit()
+            out[code] = 1
+        except Exception as exc:  # noqa: BLE001 单指数失败记 errors 继续
+            db.rollback()
+            errors[code] = str(exc)[:200]
+            log.warning("sync index %s failed: %s", code, exc)
+    result: dict = {"indexes": out}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def task_lhb_sync(db: Session, trade_date=None) -> dict:
+    """龙虎榜日同步:拉取当日龙虎榜 + 席位→游资匹配落库(逐条 savepoint)。
+
+    trade_date: date/datetime/'YYYYMMDD' 均可,缺省 completed_trade_day。
+    seats 映射缺失(无 JSON)时 matched_traders 为空继续落库,不抛错;网关失败抛错。
+    """
+    seats_map = dg.load_hot_money_seats()
+    td = dg.completed_trade_day() if trade_date is None else trade_date
+    if hasattr(td, "strftime") and not isinstance(td, str):
+        pass
+    df = dg.get_lhb_daily(td)
+    rows = 0
+    for _, r in df.iterrows():
+        buy = list(r.get("buy_seats") or [])
+        sell = list(r.get("sell_seats") or [])
+        matched = []
+        for seat in buy + sell:
+            hit = seats_map.get(str(seat).strip())
+            if hit:
+                matched.append({"seat": str(seat).strip(), **hit})
+        tdate = r.get("trade_date")
+        if hasattr(tdate, "date"):
+            tdate = tdate.date()
+        with db.begin_nested():
+            exists = db.execute(select(LhbDaily).where(
+                LhbDaily.code == r["code"], LhbDaily.trade_date == tdate)
+            ).scalar_one_or_none()
+            vals = {
+                "name": str(r.get("name", "")), "close": _f(r.get("close")),
+                "pct_chg": _f(r.get("pct_chg")), "lhb_net": _f(r.get("lhb_net")),
+                "buy_seats": json.dumps(buy, ensure_ascii=False),
+                "sell_seats": json.dumps(sell, ensure_ascii=False),
+                "matched_traders": json.dumps(matched, ensure_ascii=False),
+            }
+            if exists is None:
+                db.add(LhbDaily(code=r["code"], trade_date=tdate, **vals))
+            else:
+                for k, v in vals.items():
+                    setattr(exists, k, v)
+        rows += 1
+    db.commit()
+    ds = tdate.isoformat() if hasattr(tdate, "isoformat") else str(trade_date)
+    return {"date": ds, "lhb_rows": rows}
+
+
 def task_sync_quotes_from_spot(db: Session):
-    """收盘后:用全市场快照一次性生成当日日线行(候选域)。"""
-    snap = dg.get_spot_snapshot()
+    """收盘后:用全市场快照一次性生成当日日线行(候选域)。
+
+    落库前经 validate_quote_date 校验:非交易日/未来日期直接抛错,不写脏数据。
+    TaskLog detail 首字段写数据来源(供前端显示):{"source": ...}。
+    """
+    snap, source = dg.get_spot_snapshot_with_source()
     codes = set(universe_manager.candidate_universe(db))
-    trade_date = dg.prev_trade_day()
+    trade_date = dg.validate_quote_date(dg.completed_trade_day())
     df = snap[snap["code"].isin(codes)].dropna(subset=["price"])
     rows = 0
     for _, r in df.iterrows():
-        exists = db.execute(select(DailyQuote).where(
-            DailyQuote.code == r["code"], DailyQuote.trade_date == trade_date)).scalar_one_or_none()
-        vals = {
-            "open": _f(r.get("open")), "high": _f(r.get("high")),
-            "low": _f(r.get("low")), "close": _f(r["price"]),
-            "amount": _f(r.get("amount")), "turnover": _f(r.get("turnover")),
-            "pct_chg": _f(r.get("pct_chg")), "total_mv": _f(r.get("total_mv")),
-        }
-        if exists is None:
-            db.add(DailyQuote(code=r["code"], trade_date=trade_date, **vals))
-        else:
-            for k, v in vals.items():
-                setattr(exists, k, v)
+        # 逐条 savepoint:单 code 脏数据只回滚本条,不污染整批
+        with db.begin_nested():
+            exists = db.execute(select(DailyQuote).where(
+                DailyQuote.code == r["code"], DailyQuote.trade_date == trade_date)).scalar_one_or_none()
+            vals = {
+                "open": _f(r.get("open")), "high": _f(r.get("high")),
+                "low": _f(r.get("low")), "close": _f(r["price"]),
+                "amount": _f(r.get("amount")), "turnover": _f(r.get("turnover")),
+                "pct_chg": _f(r.get("pct_chg")), "total_mv": _f(r.get("total_mv")),
+            }
+            if exists is None:
+                db.add(DailyQuote(code=r["code"], trade_date=trade_date, **vals))
+            else:
+                for k, v in vals.items():
+                    setattr(exists, k, v)
         rows += 1
     db.commit()
-    return {"date": trade_date.isoformat(), "quotes": rows}
+    return {"source": source, "date": trade_date.isoformat(), "quotes": rows}
 
 
 def task_intraday_snapshot(db: Session):
@@ -246,7 +477,7 @@ def task_sync_financials(db: Session):
 
 def task_sync_valuation(db: Session):
     """估值快照:快照PE/PB入库 + 相对自身历史分位(随库内历史增长)。"""
-    trade_date = dg.prev_trade_day()
+    trade_date = dg.completed_trade_day()
     snap = dg.get_spot_snapshot()
     codes = set(universe_manager.candidate_universe(db))
     snap = snap[snap["code"].isin(codes)].dropna(subset=["pe"])
@@ -310,11 +541,172 @@ def task_weekly_reports(db: Session):
     return {"reports": done}
 
 
+def task_fund_flow_snapshot(db: Session):
+    """板块概念资金流盘中快照:industry/concept 各一行/板块落 FundFlowSnapshot。
+
+    单源失败记 errors 继续另一源;返回 {"rows": n, "errors": [...]}。"""
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    snap_time = dg.now_tz().replace(tzinfo=None, second=0, microsecond=0)
+    sources = (("industry", dg.get_industry_fund_flow),
+               ("concept", dg.get_concept_fund_flow))
+    rows, errors = 0, []
+    for board_type, fetch in sources:
+        try:
+            df = fetch()
+        except Exception as exc:  # noqa: BLE001 单源失败隔离,继续另一源
+            errors.append(f"{board_type}: {exc}"[:200])
+            log.warning("fund flow %s failed: %s", board_type, exc)
+            continue
+        for _, r in df.iterrows():
+            name = str(r.get("board_name") or "").strip()
+            if not name:
+                continue
+            # 源无 board_code 时用 board_name 兜底,保证
+            # (board_type, board_code, snap_time) 唯一约束下同截面多板块不互踩。
+            code = str(r.get("board_code") or name).strip()[:32]
+            try:
+                vals = {"board_type": board_type, "board_code": code,
+                        "board_name": name,
+                        "net_inflow": _f(r.get("fund_flow")),
+                        "snap_time": snap_time, "source": "akshare"}
+                if db.bind and db.bind.dialect.name == "sqlite":
+                    stmt = sqlite_insert(FundFlowSnapshot).values(**vals)
+                    stmt = stmt.on_conflict_do_nothing(
+                        index_elements=["board_type", "board_code", "snap_time"])
+                    db.execute(stmt)
+                else:
+                    exists = db.execute(select(FundFlowSnapshot).where(
+                        FundFlowSnapshot.board_type == board_type,
+                        FundFlowSnapshot.board_code == code,
+                        FundFlowSnapshot.snap_time == snap_time)).scalar_one_or_none()
+                    if exists is None:
+                        db.add(FundFlowSnapshot(**vals))
+                rows += 1
+            except Exception as exc:  # noqa: BLE001 单行失败不污染整批
+                db.rollback()
+                errors.append(f"{board_type}/{name}: {exc}"[:200])
+    db.commit()
+    out: dict = {"rows": rows, "time": snap_time.isoformat()}
+    if errors:
+        out["errors"] = errors
+    return out
+
+
+def task_market_stat(db: Session):
+    """大盘统计盘中快照:落库一行 MarketStat,返回 {"stat": {...}}。"""
+    stat = dg.get_market_stat_spot()
+    snap_time = dg.now_tz().replace(tzinfo=None, second=0, microsecond=0)
+    exists = db.execute(select(MarketStat).where(
+        MarketStat.snap_time == snap_time)).scalar_one_or_none()
+    if exists is None:
+        db.add(MarketStat(
+            snap_time=snap_time, advance=int(stat.get("advance") or 0),
+            decline=int(stat.get("decline") or 0),
+            limit_up=int(stat.get("limit_up") or 0),
+            limit_down=int(stat.get("limit_down") or 0),
+            amount_total=_f(stat.get("amount_total")),
+            source=str(stat.get("source") or ""),
+            source_note=str(stat.get("source_note") or "")))
+        db.commit()
+    return {"stat": {**{k: stat.get(k) for k in
+                        ("advance", "decline", "limit_up", "limit_down",
+                         "amount_total", "source", "source_note")},
+                     "snap_time": snap_time.isoformat()}}
+
+
+WATCH_ALERT_WINDOW_HOURS = 24
+
+
+def task_watch_alert(db: Session):
+    """自购三价预警(只读,不写止损):遍历 Watchlist,命中规则生成预警并去重落库。
+
+    规则:close>=take_profit / close<=stop_loss / |pct|>=alert_pct /
+    触及 cost_price±1%;去重:同 user+code+rule 24h 内已推送跳过
+    (查 WatchAlertLog,只按时间查,无唯一约束)。
+    返回 {"alerts": n, "errors": [...]}。"""
+    from datetime import datetime, timedelta
+
+    from .portfolio.models import WatchAlertLog, Watchlist
+    from .shared import stock_ref
+
+    watches = db.execute(select(Watchlist)).scalars().all()
+    alerts, errors = 0, []
+    since = datetime.now() - timedelta(hours=WATCH_ALERT_WINDOW_HOURS)
+    for w in watches:
+        try:
+            latest = stock_ref.latest_close(db, w.code)
+            if latest is None:
+                continue
+            _qd, close = latest
+            hist = stock_ref.quote_history(db, w.code, days=5)
+            prev = hist[-2]["close"] if len(hist) >= 2 else None
+            pct = ((close / prev - 1) * 100) if prev else 0.0
+            hits: list[tuple[str, str]] = []
+            if w.take_profit and close >= w.take_profit:
+                hits.append(("take_profit", f"{w.code} 现价 {close} 已达止盈位 {w.take_profit}"))
+            if w.stop_loss and close <= w.stop_loss:
+                hits.append(("stop_loss", f"{w.code} 现价 {close} 已触止损位 {w.stop_loss}"))
+            if w.alert_pct and abs(pct) >= w.alert_pct:
+                hits.append(("alert_pct", f"{w.code} 涨跌幅 {pct:.2f}% 触阈值 ±{w.alert_pct}%"))
+            if w.cost_price and abs(close / w.cost_price - 1) <= 0.01:
+                hits.append(("cost_touch", f"{w.code} 现价 {close} 触及成本 {w.cost_price}±1%"))
+            for rule, message in hits:
+                dup = db.execute(select(WatchAlertLog.id).where(
+                    WatchAlertLog.user_id == w.user_id, WatchAlertLog.code == w.code,
+                    WatchAlertLog.rule == rule,
+                    WatchAlertLog.created_at >= since)).first()
+                if dup:
+                    continue  # 24h 内已推送,去重跳过
+                db.add(WatchAlertLog(user_id=w.user_id, code=w.code,
+                                     rule=rule, message=message))
+                alerts += 1
+        except Exception as exc:  # noqa: BLE001 单行异常隔离
+            db.rollback()
+            errors.append(f"{w.code}: {exc}"[:200])
+            log.warning("watch alert %s failed: %s", w.code, exc)
+    db.commit()
+    out: dict = {"alerts": alerts}
+    if errors:
+        out["errors"] = errors
+    return out
+
+
+def task_holding_patrol(db: Session):
+    """持仓巡检(唯一写止损的定时入口):逐用户调用 update_daily(user_id=...)。
+
+    异常按用户隔离:单个用户失败记 errors 继续下一用户,整体不中断;
+    有 errors 时记 degraded(前端可区分),不冒充全成功。
+    GET/日报禁止写库,日报一律走 report_service._alerts 只读计算。"""
+    from .portfolio.holding_service import update_daily
+
+    users = db.execute(select(User).where(User.is_active == True)).scalars().all()  # noqa: E712
+    done, errors = [], []
+    for u in users:
+        try:
+            alerts = update_daily(db, user_id=u.id)
+            done.append({"user": u.username,
+                         "alerts": len(alerts) if isinstance(alerts, list) else 0})
+        except Exception as exc:  # noqa: BLE001 单用户异常隔离,不阻断其他用户
+            db.rollback()
+            errors.append(f"{u.username}: {exc}"[:200])
+            log.warning("holding patrol for %s failed: %s", u.username, exc)
+    out: dict = {"users": done}
+    if errors:
+        out["errors"] = errors
+    return out
+
+
 def task_backfill_history(db: Session, years: int = 5):
-    """一次性回填:候选域个股日线(前复权)。仅初始化使用,耗时较长。"""
+    """一次性回填:候选域个股日线(前复权)。仅初始化使用,耗时较长。
+
+    每 code 一个 savepoint:单股异常只回滚本股(insert 全部撤销),
+    不污染已提交的其他 code;失败计数 codes_failed>0 时整体记 degraded。
+    """
     codes = universe_manager.candidate_universe(db)
     start = (dg.today() - timedelta(days=years * 365)).strftime("%Y%m%d")
     done = failed = 0
+    failures: list[str] = []
     for i, code in enumerate(codes):
         try:
             df, _src = dg.get_daily_history(code, start)
@@ -322,24 +714,31 @@ def task_backfill_history(db: Session, years: int = 5):
                 continue
             existing = {d for (d,) in db.execute(select(DailyQuote.trade_date).where(
                 DailyQuote.code == code))}
-            for _, r in df.iterrows():
-                if r["trade_date"] in existing:
-                    continue
-                db.add(DailyQuote(code=code, trade_date=r["trade_date"],
-                                  open=_f(r["open"]), high=_f(r["high"]),
-                                  low=_f(r["low"]), close=_f(r["close"]),
-                                  volume=_f(r.get("volume")),
-                                  amount=_f(r.get("amount")),
-                                  turnover=_f(r.get("turnover")),
-                                  pct_chg=_f(r.get("pct_chg"))))
+            # 逐 code savepoint:本股写库异常整体回滚,不影响其他 code
+            with db.begin_nested():
+                for _, r in df.iterrows():
+                    if r["trade_date"] in existing:
+                        continue
+                    db.add(DailyQuote(code=code, trade_date=r["trade_date"],
+                                      open=_f(r["open"]), high=_f(r["high"]),
+                                      low=_f(r["low"]), close=_f(r["close"]),
+                                      volume=_f(r.get("volume")),
+                                      amount=_f(r.get("amount")),
+                                      turnover=_f(r.get("turnover")),
+                                      pct_chg=_f(r.get("pct_chg"))))
             db.commit()
             done += 1
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 单股异常隔离,继续下一股
+            db.rollback()  # 撤销本股 savepoint 残留,保证连接干净
             failed += 1
-            log.warning("backfill %s failed: %s", code, exc)
+            failures.append(f"{code}: {exc}"[:200])
+            log.warning("backfill %s failed (rolled back): %s", code, exc)
         if (i + 1) % 50 == 0:
             log.info("backfill progress %s/%s (failed %s)", i + 1, len(codes), failed)
-    return {"codes_done": done, "codes_failed": failed}
+    out: dict = {"codes_done": done, "codes_failed": failed}
+    if failures:
+        out["errors"] = failures[:20]  # _is_degraded 据此记 degraded,不冒充 success
+    return out
 
 
 TASKS = {
@@ -356,8 +755,15 @@ TASKS = {
     "signals": task_signals,
     "strategy": task_strategy,
     "news": task_news,
+    "lhb_sync": task_lhb_sync,
     "weekly_reports": task_weekly_reports,
+    "holding_patrol": task_holding_patrol,
     "backfill_history": task_backfill_history,
+    "sync_indexes": task_sync_indexes,
+    "tracks_backfill": task_tracks_backfill,
+    "fund_flow": task_fund_flow_snapshot,
+    "market_stat": task_market_stat,
+    "watch_alert": task_watch_alert,
 }
 
 

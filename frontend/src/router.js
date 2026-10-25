@@ -9,7 +9,9 @@ const routes = [
     children: [
       { path: '', redirect: '/dashboard' },
       { path: 'dashboard', component: () => import('./views/Dashboard.vue'), meta: { group: 'screener', title: '仪表盘' } },
+      { path: 'market', component: () => import('./views/Market.vue'), meta: { group: 'screener', title: '大盘指数' } },
       { path: 'pool', component: () => import('./views/Pool.vue'), meta: { group: 'screener', title: '选股池' } },
+      { path: 'lhb', component: () => import('./views/Lhb.vue'), meta: { group: 'screener', title: '龙虎榜' } },
       { path: 'industries', component: () => import('./views/Industries.vue'), meta: { group: 'screener', title: '行业与赛道' } },
       { path: 'signals', component: () => import('./views/Signals.vue'), meta: { group: 'screener', title: '技术信号' } },
       { path: 'news', component: () => import('./views/News.vue'), meta: { group: 'screener', title: '新闻甄别' } },
@@ -17,10 +19,12 @@ const routes = [
       { path: 'cards', component: () => import('./views/Cards.vue'), meta: { group: 'screener', title: '策略卡', roles: ['admin', 'analyst'] } },
       { path: 'tasks', component: () => import('./views/Tasks.vue'), meta: { group: 'screener', title: '任务中心', roles: ['admin', 'analyst'] } },
       { path: 'portfolio', component: () => import('./views/Portfolio.vue'), meta: { group: 'portfolio', title: '我的持仓' } },
+      { path: 'watchlist', component: () => import('./views/Watchlist.vue'), meta: { group: 'portfolio', title: '自选预警' } },
       { path: 'trades', component: () => import('./views/Trades.vue'), meta: { group: 'portfolio', title: '交易历史' } },
       { path: 'reports', component: () => import('./views/Reports.vue'), meta: { group: 'portfolio', title: '报告中心' } },
       { path: 'settings', component: () => import('./views/Settings.vue'), meta: { group: 'portfolio', title: 'LLM 设置' } },
       { path: 'users', component: () => import('./views/Users.vue'), meta: { group: 'system', title: '用户与权限', roles: ['admin'] } },
+      { path: 'help', component: () => import('./views/Help.vue'), meta: { group: 'help', title: '使用帮助' } },
     ],
   },
 ]

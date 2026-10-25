@@ -6,6 +6,12 @@
         <span class="muted" style="font-size:12px;margin-left:8px">证据链必填 · 风控与 alpha 分离 · 回测需随机对照组</span>
       </div>
     </template>
+    <el-empty v-if="!cards.length" description="暂无策略卡" :image-size="60">
+      <template #description>
+        <p>暂无策略卡,新想法先建卡写假设与证据再进 testing</p>
+        <p class="muted" style="font-size:12px">证据链必填 · 风控与 alpha 分离 · 回测需随机对照组;建卡需策略员或管理员权限</p>
+      </template>
+    </el-empty>
     <el-collapse v-model="openCards">
       <el-collapse-item v-for="c in cards" :key="c.id" :name="c.card_code">
         <template #title>

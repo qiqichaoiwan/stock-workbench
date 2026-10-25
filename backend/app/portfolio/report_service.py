@@ -12,23 +12,42 @@ from ..screener.market_regime import latest_state
 from ..screener.models import NewsItem, StockPool
 from ..screener.strategy_engine import get_params
 from .ai_advisor import DISCLAIMER
-from .holding_service import holdings_view, trade_stats, update_daily
+from .holding_service import holdings_view, trade_stats
 from .models import TradeRecord, WeeklyReport
 
 log = logging.getLogger("report")
 
 
-def _alerts(db: Session) -> list[dict]:
-    try:
-        return update_daily(db)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("holding daily update failed: %s", exc)
-        return []
+def _alerts(db: Session, user_id: int) -> list[dict]:
+    """日报只读计算(禁止写库):按当前用户过滤;danger=已跌破止损,warn=距止损≤3%。
+
+    注意:巡检写止损的唯一入口是 holding_service.update_daily(由 holding_patrol
+    定时任务逐用户调用);GET/日报一律只读,避免读请求触发跨租户写入。"""
+    from .models import Holding
+    alerts = []
+    for h in db.execute(select(Holding).where(Holding.user_id == user_id, Holding.status == "holding")).scalars():
+        latest = stock_ref.latest_close(db, h.code)
+        if not latest:
+            continue
+        close = latest[1]
+        if close <= h.stop_price:
+            alerts.append({"code": h.code, "name": h.name, "close": close,
+                           "stop_price": h.stop_price, "stage": h.stop_stage,
+                           "level": "danger",
+                           "message": f"{h.code} {h.name} 收盘 {close} 已跌破止损价 {h.stop_price}"
+                                      f"(阶段{h.stop_stage}),按纪律次日开盘执行卖出;跳空按开盘价"})
+        elif close <= h.stop_price * 1.03:
+            alerts.append({"code": h.code, "name": h.name, "close": close,
+                           "stop_price": h.stop_price, "stage": h.stop_stage,
+                           "level": "warning",
+                           "message": f"{h.code} {h.name} 收盘 {close} 距止损价 {h.stop_price}"
+                                      f"(阶段{h.stop_stage})仅剩3%以内,注意纪律"})
+    return alerts
 
 
 def daily_report(db: Session, user_id: int) -> str:
     """每日持仓日报:评级变化、止损提醒、市场状态。规则输出,不依赖 LLM。"""
-    alerts = _alerts(db)
+    alerts = _alerts(db, user_id)
     views = holdings_view(db, user_id)
     state = latest_state(db)
     lines = [

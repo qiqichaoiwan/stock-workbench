@@ -43,6 +43,10 @@ class Track(ScreenerBase):
     keywords: Mapped[str] = mapped_column(Text, default="")              # 新闻关键词,逗号分隔
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     note: Mapped[str] = mapped_column(String(256), default="")
+    # 赛道成分同步来源与状态(P0-1):老库缺列只告警不迁移(create_all 只建新表,见 db.py)。
+    member_source: Mapped[str] = mapped_column(String(32), default="")
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    sync_error: Mapped[str] = mapped_column(String(256), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -55,7 +59,7 @@ class TrackMembership(ScreenerBase):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     track_id: Mapped[int] = mapped_column(Integer, index=True)
     stock_code: Mapped[str] = mapped_column(String(12), index=True)
-    source: Mapped[str] = mapped_column(String(32), default="manual")    # manual/concept_board
+    source: Mapped[str] = mapped_column(String(32), default="manual")    # manual/concept_board/concept_board_sina/keyword
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -306,6 +310,23 @@ class StrategyParams(ScreenerBase):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 
+class IndexDaily(ScreenerBase):
+    """主要宽基/风格指数日线(仪表盘指数条用,收盘后落库)。"""
+
+    __tablename__ = "scr_index_daily"
+    __table_args__ = (UniqueConstraint("code", "trade_date", name="uq_idx_daily"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(12), index=True)
+    name: Mapped[str] = mapped_column(String(32), default="")
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    close: Mapped[float] = mapped_column(Float, default=0.0)
+    pct_chg: Mapped[float] = mapped_column(Float, default=0.0)
+    amount: Mapped[float] = mapped_column(Float, default=0.0)           # 成交额(元)
+    source: Mapped[str] = mapped_column(String(16), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
 class TaskLog(ScreenerBase):
     __tablename__ = "scr_task_log"
 
@@ -315,3 +336,62 @@ class TaskLog(ScreenerBase):
     status: Mapped[str] = mapped_column(String(16), default="running")  # running/success/failed
     detail: Mapped[str] = mapped_column(Text, default="")
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class FundFlowSnapshot(ScreenerBase):
+    """板块概念资金流快照(盘中半小时):go-stock bk/concept_fund_flow 落库思路。
+
+    board_type: industry/concept;net_inflow 单位亿;同一截面去重靠
+    (board_type, board_code, snap_time) 唯一约束。"""
+
+    __tablename__ = "scr_fund_flow"
+    __table_args__ = (UniqueConstraint("board_type", "board_code", "snap_time",
+                                       name="uq_fund_flow"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    board_type: Mapped[str] = mapped_column(String(16), index=True)  # industry/concept
+    board_code: Mapped[str] = mapped_column(String(32), default="", index=True)
+    board_name: Mapped[str] = mapped_column(String(64), index=True)
+    net_inflow: Mapped[float] = mapped_column(Float, default=0.0)    # 主力净流入(亿)
+    snap_time: Mapped[datetime] = mapped_column(DateTime, index=True)
+    source: Mapped[str] = mapped_column(String(16), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class MarketStat(ScreenerBase):
+    """大盘统计 5 分钟快照(盘中半小时落库一行):go-stock MarketStatistic 思路。
+
+    amount_total 单位亿;limit_up 按 pct>=9.9 近似,口径见 source_note。"""
+
+    __tablename__ = "scr_market_stat"
+    __table_args__ = (UniqueConstraint("snap_time", name="uq_market_stat"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snap_time: Mapped[datetime] = mapped_column(DateTime, index=True)
+    advance: Mapped[int] = mapped_column(Integer, default=0)         # 上涨家数
+    decline: Mapped[int] = mapped_column(Integer, default=0)        # 下跌家数
+    limit_up: Mapped[int] = mapped_column(Integer, default=0)        # 涨停家数(近似)
+    limit_down: Mapped[int] = mapped_column(Integer, default=0)      # 跌停家数(近似)
+    amount_total: Mapped[float] = mapped_column(Float, default=0.0)  # 两市成交额(亿)
+    source: Mapped[str] = mapped_column(String(16), default="")
+    source_note: Mapped[str] = mapped_column(String(256), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class LhbDaily(ScreenerBase):
+    """龙虎榜日明细:收盘后落库,buy/sell_seats 为席位名 JSON,matched_traders 为命中游资 JSON。"""
+
+    __tablename__ = "scr_lhb_daily"
+    __table_args__ = (UniqueConstraint("code", "trade_date", name="uq_lhb_daily"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(12), index=True)
+    name: Mapped[str] = mapped_column(String(32), default="")
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    close: Mapped[float] = mapped_column(Float, default=0.0)
+    pct_chg: Mapped[float] = mapped_column(Float, default=0.0)
+    lhb_net: Mapped[float] = mapped_column(Float, default=0.0)          # 龙虎榜净买额(万)
+    buy_seats: Mapped[str] = mapped_column(Text, default="[]")         # 买方席位名 JSON
+    sell_seats: Mapped[str] = mapped_column(Text, default="[]")         # 卖方席位名 JSON
+    matched_traders: Mapped[str] = mapped_column(Text, default="[]")    # 命中游资 JSON
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

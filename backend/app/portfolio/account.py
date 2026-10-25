@@ -78,7 +78,15 @@ def register(db: Session, username: str, password: str, nickname: str = "",
                 nickname=nickname or username, role="user")
     db.add(user)
     db.flush()
-    inv.used_by, inv.used_at = user.id, datetime.now(timezone.utc)
+    # 原子占用邀请码:同一事务内按 used_by IS NULL 条件更新,0 行则回滚新建用户
+    claimed = db.execute(
+        InviteCode.__table__.update()
+        .where(InviteCode.code == inv.code, InviteCode.used_by.is_(None))
+        .values(used_by=user.id, used_at=datetime.now(timezone.utc))
+    ).rowcount
+    if not claimed:
+        db.rollback()
+        raise HTTPException(403, "邀请码已被使用")
     db.commit()
     db.refresh(user)
     log.info("新用户注册: %s(邀请码 %s)", username, inv.code)
@@ -94,7 +102,7 @@ def login(db: Session, username: str, password: str, client_ip: str = "") -> dic
         raise HTTPException(401, "用户名或密码错误")
     if not user.is_active:
         raise HTTPException(403, "账号已停用,请联系管理员")
-    return {"token": create_access_token(user.id, user.username),
+    return {"token": create_access_token(user.id, user.username, user.password_hash),
             "user": {"id": user.id, "username": user.username,
                      "nickname": user.nickname, "role": user.role}}
 

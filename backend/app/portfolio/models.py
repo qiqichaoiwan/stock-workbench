@@ -7,7 +7,7 @@
 """
 from datetime import date, datetime, timezone
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..db import PortfolioBase
@@ -91,7 +91,15 @@ class Holding(PortfolioBase):
 
 
 class TradeRecord(PortfolioBase):
-    """卖出审计:用户点击「已卖出」后写入,支持复盘与胜率统计。"""
+    """卖出审计:用户点击「已卖出」后写入,支持复盘与胜率统计。
+
+    并发说明:sell() 已用 conditional update(Holding.status='holding'→'sold'
+    按 id+user_id 条件)做序列化点,同一 holding 只有一次能 claim 成功,
+    因此 TradeRecord.holding_id 无需唯一约束——重复卖出在 claim 层即被拒绝。
+    Migration 注释(不要擅自改生产库):如未来要在 holding_id 上加唯一约束,
+    必须先离线核查历史脏数据(SELECT holding_id, COUNT(*) ... HAVING COUNT(*)>1),
+    先清理重复行再 ALTER TABLE 加约束;禁止直接在生产库执行 DDL。
+    """
 
     __tablename__ = "pf_trade_record"
 
@@ -138,4 +146,38 @@ class WeeklyReport(PortfolioBase):
     title: Mapped[str] = mapped_column(String(128), default="")
     content: Mapped[str] = mapped_column(Text, default="")          # markdown
     stats_json: Mapped[str] = mapped_column(Text, default="{}")     # 本周持仓/交易统计
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class Watchlist(PortfolioBase):
+    """自购三价预警(只读预警,不写止损):cost/take_profit/stop_loss/alert_pct。
+
+    三价预警=现价触及成本/止盈/止损/涨跌幅阈值;0=未设该规则。
+    与 holding_service.update_daily 互斥无冲突:本表只读不推进止损。"""
+
+    __tablename__ = "pf_watchlist"
+    __table_args__ = (UniqueConstraint("user_id", "code", name="uq_watch_user_code"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("pf_user.id"), index=True)
+    code: Mapped[str] = mapped_column(String(12), index=True)
+    name: Mapped[str] = mapped_column(String(64), default="")
+    cost_price: Mapped[float] = mapped_column(Float, default=0.0)
+    take_profit: Mapped[float] = mapped_column(Float, default=0.0)
+    stop_loss: Mapped[float] = mapped_column(Float, default=0.0)
+    alert_pct: Mapped[float] = mapped_column(Float, default=0.0)    # 涨跌幅阈值%
+    note: Mapped[str] = mapped_column(String(512), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class WatchAlertLog(PortfolioBase):
+    """自购预警去重日志:同 user+code+rule 24小时内已推送跳过(站内信先行)。"""
+
+    __tablename__ = "pf_watch_alert_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("pf_user.id"), index=True)
+    code: Mapped[str] = mapped_column(String(12), index=True)
+    rule: Mapped[str] = mapped_column(String(32), default="", index=True)
+    message: Mapped[str] = mapped_column(String(512), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

@@ -9,7 +9,7 @@
         </el-select>
       </div>
     </template>
-    <el-table :data="pagedRows" size="small" v-loading="loading" max-height="620" stripe>
+    <el-table :data="pagedRows" size="small" v-loading="loading" max-height="620" stripe border>
       <el-table-column prop="trade_date" label="日期" width="110" />
       <el-table-column prop="code" label="代码" width="90" />
       <el-table-column label="名称" width="100">
@@ -31,15 +31,22 @@
         </template>
       </el-table-column>
     </el-table>
+    <el-empty v-if="!loading && !rows.length" description="暂无技术信号" :image-size="60">
+      <template #description>
+        <p>暂无技术信号,请先在任务中心运行 signals 后可见</p>
+        <p class="muted" style="font-size:12px">收盘后 16:40 落库;周末/非交易日无新增属预期</p>
+      </template>
+    </el-empty>
     <div class="pager">
       <el-pagination layout="total, prev, pager, next" :total="rows.length" :page-size="pageSize"
                      v-model:current-page="page" />
     </div>
+    <p class="muted" style="font-size:12px;margin:6px 0 0">前端分页 · 共 {{ rows.length }} 条(服务端 limit=300 取回,切换类型即重新请求)</p>
   </el-card>
 </template>
 
 <script setup>
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import api from '../api'
 import { cleanName, fmtNum } from '../utils/fmt'
 
@@ -48,6 +55,7 @@ const sigType = ref('')
 const loading = ref(false)
 const page = ref(1)
 const pageSize = 20
+let loadSeq = 0
 const pagedRows = computed(() => rows.value.slice((page.value - 1) * pageSize, page.value * pageSize))
 const labels = {
   buy_setup: '入场组合', bottom_fractal: '底分型', red_streak: '连红',
@@ -65,16 +73,20 @@ function detailText(d) {
 }
 
 async function load() {
+  const seq = (loadSeq += 1)
   loading.value = true
   try {
-    rows.value = await api.get('/api/screener/signals',
-      { params: { signal_type: sigType.value || undefined, limit: 300 } })
+    const data = await api.get('/api/screener/signals',
+      { params: { signal_type: sigType.value || undefined, limit: 300 }, silent: true })
+    if (seq !== loadSeq) return // 竞态:切换类型时丢弃过期响应
+    rows.value = Array.isArray(data) ? data : (data?.items || data?.data || [])
     page.value = 1
   } finally {
-    loading.value = false
+    if (seq === loadSeq) loading.value = false
   }
 }
 
 watch(sigType, load)
 onMounted(load)
+onBeforeUnmount(() => { loadSeq += 1 })
 </script>

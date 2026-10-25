@@ -8,7 +8,7 @@
           <el-button v-if="canOperate" type="primary" size="small" @click="dialog = true">手动触发</el-button>
         </div>
       </template>
-      <el-table :data="pagedLogs" size="small" v-loading="loading" max-height="560" stripe>
+      <el-table :data="pagedLogs" size="small" v-loading="loading" max-height="560" stripe border>
         <el-table-column prop="id" label="#" width="70" sortable />
         <el-table-column label="任务" width="170">
           <template #default="{ row }">{{ taskDesc[row.task_name] || row.task_name }}</template>
@@ -26,10 +26,17 @@
         </el-table-column>
         <el-table-column prop="detail" label="结果" show-overflow-tooltip />
       </el-table>
+      <el-empty v-if="!loading && !logs.length" description="暂无任务日志" :image-size="60">
+        <template #description>
+          <p>暂无任务日志,按初始化顺序手动触发后可见</p>
+          <p class="muted" style="font-size:12px">建议顺序:sync_members → sync_basic → sync_tracks → backfill_history → sync_financials → 其余任务</p>
+        </template>
+      </el-empty>
       <div class="pager">
         <el-pagination layout="total, prev, pager, next" :total="logs.length" :page-size="pageSize"
                        v-model:current-page="page" />
       </div>
+      <p class="muted" style="font-size:12px;margin:6px 0 0">前端分页 · 共 {{ logs.length }} 条(服务端 limit=200 取回)</p>
     </el-card>
 
     <el-dialog v-model="dialog" title="手动触发任务" width="440">
@@ -46,7 +53,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import { fmtDT, fmtDuration } from '../utils/fmt'
@@ -62,10 +69,14 @@ const running = ref(false)
 const page = ref(1)
 const pageSize = 20
 const pagedLogs = computed(() => logs.value.slice((page.value - 1) * pageSize, page.value * pageSize))
+let pollTimer = null
+let pollToken = 0
+
 const taskDesc = {
   sync_members: '同步指数成分(候选域)',
   sync_basic: '同步股票基础信息',
   sync_tracks: '同步赛道成分',
+  tracks_backfill: '一键回填赛道成分',
   sync_quotes: '收盘快照落库(日线)',
   intraday_snapshot: '盘中快照',
   sync_valuation: '估值快照',
@@ -86,40 +97,50 @@ function statusType(s) {
 }
 
 onMounted(load)
+onBeforeUnmount(() => {
+  pollToken += 1
+  if (pollTimer) clearTimeout(pollTimer)
+})
 
 async function load() {
   loading.value = true
   try {
-    logs.value = await api.get('/api/screener/tasks', { params: { limit: 200 } })
+    const data = await api.get('/api/screener/tasks', { params: { limit: 200 }, silent: true })
+    logs.value = Array.isArray(data) ? data : (data?.items || data?.data || [])
+    page.value = Math.min(page.value, Math.max(1, Math.ceil(logs.value.length / pageSize)))
   } finally {
     loading.value = false
   }
 }
 
 async function run() {
-  if (!taskName.value) return
+  if (!taskName.value || running.value) return
   running.value = true
+  pollToken += 1
+  const token = pollToken
+  if (pollTimer) clearTimeout(pollTimer)
   try {
-    const r = await api.post(`/api/screener/tasks/${taskName.value}/run`, { years: 5 })
+    const target = taskName.value
+    const startedId = Math.max(0, ...logs.value.map((l) => Number(l.id) || 0))
+    const r = await api.post(`/api/screener/tasks/${target}/run`, { years: 5 })
     ElMessage.success(r.message || '已提交后台执行')
     dialog.value = false
-    // 后台线程执行:自动轮询日志直到出现该任务的新结果(最多 ~3 分钟)
-    const target = taskName.value
-    const startedId = logs.value[0]?.id || 0
     let tries = 0
-    const timer = setInterval(async () => {
+    const poll = async () => {
+      if (token !== pollToken) return
       tries += 1
-      await load()
-      const hit = logs.value.find((l) => l.task_name === target && l.id > startedId
-        && l.status !== 'running')
-      if (hit || tries >= 36) {
-        clearInterval(timer)
-        if (hit) {
-          ElMessage({ type: hit.status === 'success' ? 'success' : 'error',
-            message: `${taskDesc[target] || target} ${statusLabel(hit.status)}(${fmtDuration(hit.duration_ms)})` })
-        }
+      try { await load() } catch { /* 请求错误由 API 层提示 */ }
+      if (token !== pollToken) return
+      const hit = logs.value.find((l) => l.task_name === target && Number(l.id) > startedId && l.status !== 'running')
+      if (hit) {
+        ElMessage({ type: hit.status === 'success' ? 'success' : 'error', message: `${taskDesc[target] || target} ${statusLabel(hit.status)}(${fmtDuration(hit.duration_ms, '未知')})` })
+        pollTimer = null
+        return
       }
-    }, 5000)
+      if (tries < 36) pollTimer = setTimeout(poll, 5000)
+      else pollTimer = null
+    }
+    pollTimer = setTimeout(poll, 1000)
   } finally {
     running.value = false
   }

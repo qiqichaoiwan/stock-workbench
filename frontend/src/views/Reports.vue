@@ -12,7 +12,12 @@
         <el-menu @select="view" v-loading="loading">
           <el-menu-item v-for="r in list" :key="r.id" :index="String(r.id)">{{ r.title }}</el-menu-item>
         </el-menu>
-        <el-empty v-if="!loading && !list.length" description="暂无周报" :image-size="60" />
+        <el-empty v-if="!loading && !list.length" description="暂无周报" :image-size="60">
+          <template #description>
+            <p>暂无周报,点上方「生成本周报告」手动生成</p>
+            <p class="muted" style="font-size:12px">周报每周五 17:45 自动生成;周五收盘前为空属正常</p>
+          </template>
+        </el-empty>
         <el-divider>日报(即时生成)</el-divider>
         <el-button style="width:100%" @click="viewDaily">查看今日持仓日报</el-button>
       </el-card>
@@ -21,7 +26,12 @@
       <el-card class="page-card" v-loading="viewing">
         <template #header>{{ currentTitle || '报告内容' }}</template>
         <div v-if="content" class="markdown-body" v-html="rendered"></div>
-        <el-empty v-else description="选择左侧报告查看" />
+        <el-empty v-else description="选择左侧报告查看">
+          <template #description>
+            <p>选择左侧报告查看</p>
+            <p class="muted" style="font-size:12px">点左侧周报标题看周报,或点「查看今日持仓日报」即时生成日报(无持仓时先去录入持仓)</p>
+          </template>
+        </el-empty>
       </el-card>
     </el-col>
   </el-row>

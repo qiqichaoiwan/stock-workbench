@@ -8,37 +8,46 @@ from datetime import date, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..shared import data_gateway as dg
 from ..screener.models import DailyQuote, PoolPerformance, StockBasic, StockPool
 
 
 def latest_quote_date(db: Session) -> date | None:
-    row = db.execute(select(DailyQuote.trade_date).order_by(
-        DailyQuote.trade_date.desc()).limit(1)).first()
+    cutoff = dg.completed_trade_day()
+    row = db.execute(select(DailyQuote.trade_date).where(
+        DailyQuote.trade_date <= cutoff).order_by(DailyQuote.trade_date.desc()).limit(1)).first()
     return row[0] if row else None
 
 
 def latest_close(db: Session, code: str) -> tuple[date, float] | None:
+    cutoff = dg.completed_trade_day()
     row = db.execute(select(DailyQuote.trade_date, DailyQuote.close).where(
-        DailyQuote.code == code).order_by(DailyQuote.trade_date.desc()).limit(1)).first()
+        DailyQuote.code == code, DailyQuote.trade_date <= cutoff).order_by(DailyQuote.trade_date.desc()).limit(1)).first()
     return (row[0], float(row[1])) if row else None
 
 
-def quote_history(db: Session, code: str, days: int = 60) -> list[dict]:
+def quote_history(db: Session, code: str, days: int = 60,
+                  as_of: date | None = None) -> list[dict]:
+    """近 N 个交易日日线;as_of 截止 completed_trade_day,禁止偷看未来行情。"""
+    cutoff = as_of or dg.completed_trade_day()
     rows = db.execute(
         select(DailyQuote.trade_date, DailyQuote.open, DailyQuote.high,
                DailyQuote.low, DailyQuote.close, DailyQuote.volume)
         .where(DailyQuote.code == code,
-               DailyQuote.trade_date >= date.today() - timedelta(days=days * 2))
+               DailyQuote.trade_date <= cutoff,
+               DailyQuote.trade_date >= cutoff - timedelta(days=days * 2))
         .order_by(DailyQuote.trade_date)).all()
     return [{"trade_date": r[0], "open": r[1], "high": r[2], "low": r[3],
              "close": r[4], "volume": r[5]} for r in rows]
 
 
-def atr14(db: Session, code: str) -> float | None:
-    """Wilder ATR(14),用于 G03 吊灯止损。"""
+def atr14(db: Session, code: str, as_of: date | None = None) -> float | None:
+    """Wilder ATR(14),用于 G03 吊灯止损;as_of 截止,禁止偷看未来。"""
+    cutoff = as_of or dg.completed_trade_day()
     rows = db.execute(
         select(DailyQuote.trade_date, DailyQuote.high, DailyQuote.low, DailyQuote.close)
-        .where(DailyQuote.code == code).order_by(DailyQuote.trade_date.desc()).limit(30)
+        .where(DailyQuote.code == code, DailyQuote.trade_date <= cutoff)
+        .order_by(DailyQuote.trade_date.desc()).limit(30)
     ).all()
     if len(rows) < 16:
         return None

@@ -32,7 +32,7 @@ def _find_bottom_fractals(low: pd.Series) -> list[int]:
 
 def scan_signals(db: Session, trade_date: date | None = None) -> dict:
     """对候选域全量扫描,写入当日信号。返回统计。"""
-    trade_date = trade_date or dg.prev_trade_day()
+    trade_date = trade_date or dg.completed_trade_day()
     start_d = trade_date - timedelta(days=HISTORY_DAYS * 2)
 
     codes = {c for (c,) in db.execute(select(DailyQuote.code).where(
@@ -44,7 +44,8 @@ def scan_signals(db: Session, trade_date: date | None = None) -> dict:
     rows = db.execute(
         select(DailyQuote.code, DailyQuote.trade_date, DailyQuote.close,
                DailyQuote.high, DailyQuote.low, DailyQuote.volume, DailyQuote.pct_chg)
-        .where(DailyQuote.code.in_(codes), DailyQuote.trade_date >= start_d)
+        .where(DailyQuote.code.in_(codes),
+               DailyQuote.trade_date >= start_d, DailyQuote.trade_date <= trade_date)
         .order_by(DailyQuote.code, DailyQuote.trade_date)
     ).all()
     df = pd.DataFrame(rows, columns=["code", "trade_date", "close", "high", "low", "volume", "pct_chg"])
@@ -55,7 +56,9 @@ def scan_signals(db: Session, trade_date: date | None = None) -> dict:
     from .models import IndustryDaily as ID
     ind_mom: dict[str, float] = {}
     for name, mom in db.execute(select(ID.industry_name, ID.mom_20).where(
-            ID.trade_date == trade_date)).all():
+            ID.trade_date <= trade_date).order_by(
+            ID.industry_name, ID.trade_date)).all():
+        # as-of:同行业取截面日之前最新一行(不得偷看未来)
         ind_mom[name] = float(mom or 0)
 
     bench_mom = 0.0
@@ -63,6 +66,8 @@ def scan_signals(db: Session, trade_date: date | None = None) -> dict:
         bench = dg.get_index_daily("sh000985",
                                    (trade_date - timedelta(days=90)).strftime("%Y%m%d"),
                                    trade_date.strftime("%Y%m%d"))
+        # 截断到 trade_date(含)之前,防上游返回未来行
+        bench = bench[bench["trade_date"] <= trade_date]
         if len(bench) > 21:
             bench_mom = float(bench["close"].iloc[-1] / bench["close"].iloc[-21] - 1) * 100
     except Exception as exc:  # noqa: BLE001
@@ -136,9 +141,20 @@ def scan_signals(db: Session, trade_date: date | None = None) -> dict:
     return stats
 
 
+def get_signal_names(db: Session, codes: set[str] | list[str]) -> dict[str, str]:
+    """批量查股票名(供 Dashboard/策略引擎用,一次 IN 查询,避免逐行全表扫描)。"""
+    codes = list(dict.fromkeys(codes))
+    if not codes:
+        return {}
+    return dict(db.execute(
+        select(StockBasic.code, StockBasic.name).where(StockBasic.code.in_(codes))).all())
+
+
 def latest_signals(db: Session, trade_date: date | None = None,
                    signal_type: str | None = None, limit: int = 200) -> list[TechnicalSignal]:
-    q = select(TechnicalSignal).order_by(TechnicalSignal.id.desc()).limit(limit)
+    # 按 trade_date desc, id desc:同日多信号时最新落库在前;无 trade_date 时取最新截面。
+    q = select(TechnicalSignal).order_by(
+        TechnicalSignal.trade_date.desc(), TechnicalSignal.id.desc()).limit(limit)
     if trade_date is not None:
         q = q.where(TechnicalSignal.trade_date == trade_date)
     if signal_type:

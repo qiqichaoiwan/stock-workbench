@@ -14,21 +14,28 @@ from ..db import get_db
 from ..portfolio.models import User
 from ..screener import industry_monitor, market_regime, news_monitor, strategy_engine, \
     technical_signal, universe_manager
-from ..screener.models import (CommodityPrice, IndustryDaily, MarketState, NewsItem,
-                               PoolPerformance, StockPool, StrategyCard, StrategyParams,
-                               TaskLog, TechnicalSignal, Track)
 from ..shared.security import current_user_id, require_analyst
 from ..task_runner import TASKS, run_task
+from .models import (CommodityPrice, FundFlowSnapshot, IndustryDaily, LhbDaily,
+                   MarketState, MarketStat, NewsItem, PoolPerformance,
+                   StockPool, StrategyCard, StrategyParams, TaskLog, Track)
 
 router = APIRouter(prefix="/api/screener", tags=["screener"])
 
 MAX_LIMIT = 500
 
 
-def _stock_names(db: Session) -> dict[str, str]:
+def _stock_names(db: Session, codes: set[str] | list[str] | None = None) -> dict[str, str]:
+    """股票代码→名称。codes 为空时返回全表(兼容旧调用);传入集合时只查 IN 范围。"""
     from .models import StockBasic
 
-    return dict(db.execute(select(StockBasic.code, StockBasic.name)).all())
+    q = select(StockBasic.code, StockBasic.name)
+    if codes is not None:
+        codes = list(dict.fromkeys(codes))
+        if not codes:
+            return {}
+        q = q.where(StockBasic.code.in_(codes))
+    return dict(db.execute(q).all())
 
 
 # ---------- 仪表盘 ----------
@@ -40,6 +47,8 @@ def dashboard(user_id: int = Depends(current_user_id), db: Session = Depends(get
 
     avoid = industry_monitor.crowd_avoid_industries(db)
     signals = technical_signal.latest_signals(db, limit=50)
+    sig_codes = [s.code for s in signals[:20]]
+    names = _stock_names(db, sig_codes)
     return {
         "market_state": {
             "trade_date": state.trade_date.isoformat() if state else "",
@@ -50,13 +59,14 @@ def dashboard(user_id: int = Depends(current_user_id), db: Session = Depends(get
             "amount_pct_60d": state.amount_pct_60d if state else 0,
             "valuation_pct": state.valuation_pct if state else 0,
             "margin_ratio": state.margin_ratio if state else 0,
-            "note": "PM02 仓位分档为待验证草案" if state else "",
+            "note": "PM02 仓位分档为待验证草案,不作投资建议" if state else "",
+            "pm02_status": "unverified_draft" if state else "",
         } if state else None,
         "pool_perf": stock_ref.pool_perf_summary(db),
         "crowd_avoid": avoid,
         "market_wide_crowded": len(avoid) > industry_monitor.AVOID_MAX,
         "rising_commodities": industry_monitor.rising_commodities(db),
-        "signals": [{"code": s.code, "name": _stock_names(db).get(s.code, ""),
+        "signals": [{"code": s.code, "name": names.get(s.code, ""),
                      "type": s.signal_type, "strength": s.strength,
                      "trade_date": s.trade_date.isoformat()} for s in signals[:20]],
         "risk_guard": market_regime.risk_guard_active(db),
@@ -155,6 +165,33 @@ def industries(trade_date: str | None = None, user_id: int = Depends(current_use
             for r in rows]
 
 
+@router.get("/indexes")
+def indexes(codes: str | None = None,
+            user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
+    """指数条:读 scr_index_daily 每 code 最新行;codes 为空返回默认6个;无数据 [] 不 500。"""
+    from ..shared import data_gateway as dg
+
+    from .models import IndexDaily
+
+    try:
+        want = ([c.strip() for c in codes.split(",") if c.strip()] if codes
+                else [c for c, _ in dg.INDEX_DISPLAY])
+        out = []
+        for code in want:
+            r = db.execute(select(IndexDaily).where(IndexDaily.code == code)
+                           .order_by(IndexDaily.trade_date.desc()).limit(1)
+                           ).scalars().first()
+            if r is None:
+                continue
+            out.append({"code": r.code, "name": r.name,
+                        "trade_date": r.trade_date.isoformat() if r.trade_date else "",
+                        "close": r.close, "pct_chg": r.pct_chg,
+                        "amount": r.amount, "source": r.source})
+        return out
+    except Exception:  # noqa: BLE001 无数据/老库缺表一律 [] 不 500
+        return []
+
+
 @router.get("/emerging")
 def emerging(top: int = 12, user_id: int = Depends(current_user_id),
              db: Session = Depends(get_db)):
@@ -175,7 +212,131 @@ def commodities(user_id: int = Depends(current_user_id), db: Session = Depends(g
             for r in seen.values()]
 
 
+# ---------- 板块资金流与大盘统计(P1-1/P1-2:盘中快照读接口,无数据 [] / {} 不 500) ----------
+
+@router.get("/fund-flow")
+def fund_flow(board_type: str = "industry", limit: int = 20,
+              user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
+    """返回最近 snap_time 截面 [{board_name, net_inflow, snap_time, source}]。"""
+    from sqlalchemy import func
+
+    limit = min(max(limit, 1), MAX_LIMIT)
+    if board_type not in ("industry", "concept"):
+        raise HTTPException(400, "board_type 须为 industry|concept")
+    try:
+        latest = db.execute(select(func.max(FundFlowSnapshot.snap_time)).where(
+            FundFlowSnapshot.board_type == board_type)).scalar_one_or_none()
+        if latest is None:
+            return []
+        rows = db.execute(select(FundFlowSnapshot).where(
+            FundFlowSnapshot.board_type == board_type,
+            FundFlowSnapshot.snap_time == latest).order_by(
+            FundFlowSnapshot.net_inflow.desc()).limit(limit)).scalars().all()
+        return [{"board_name": r.board_name, "board_code": r.board_code,
+                 "net_inflow": r.net_inflow,
+                 "snap_time": r.snap_time.isoformat() if r.snap_time else "",
+                 "source": r.source} for r in rows]
+    except Exception:  # noqa: BLE001 无数据/老库缺表一律 [] 不 500
+        return []
+
+
+@router.get("/fund-flow/history")
+def fund_flow_history(board_name: str, board_type: str = "industry",
+                      days: int = 30, user_id: int = Depends(current_user_id),
+                      db: Session = Depends(get_db)):
+    """该板块近 N 天每日最后一条 [(snap_date, net_inflow)] 供趋势图。"""
+    from sqlalchemy import func
+
+    if board_type not in ("industry", "concept"):
+        raise HTTPException(400, "board_type 须为 industry|concept")
+    try:
+        days = min(max(days, 1), 365)
+        # 每日最后一条:按日期分组取 max(snap_time),再回查
+        sub = (select(func.date(FundFlowSnapshot.snap_time).label("d"),
+                      func.max(FundFlowSnapshot.snap_time).label("mt"))
+               .where(FundFlowSnapshot.board_type == board_type,
+                      FundFlowSnapshot.board_name == board_name)
+               .group_by(func.date(FundFlowSnapshot.snap_time))
+               .order_by(func.date(FundFlowSnapshot.snap_time).desc())
+               .limit(days).subquery())
+        rows = db.execute(select(FundFlowSnapshot).where(
+            FundFlowSnapshot.board_type == board_type,
+            FundFlowSnapshot.board_name == board_name,
+            FundFlowSnapshot.snap_time.in_(select(sub.c.mt)))
+            .order_by(FundFlowSnapshot.snap_time)).scalars().all()
+        return [{"snap_date": (r.snap_time.date().isoformat()
+                                if r.snap_time else ""),
+                 "net_inflow": r.net_inflow} for r in rows]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+@router.get("/market-stat/latest")
+def market_stat_latest(user_id: int = Depends(current_user_id),
+                       db: Session = Depends(get_db)):
+    """最近一行大盘统计;无数据 {} 不 500。"""
+    try:
+        r = db.execute(select(MarketStat).order_by(
+            MarketStat.snap_time.desc()).limit(1)).scalars().first()
+        if r is None:
+            return {}
+        return {"snap_time": r.snap_time.isoformat() if r.snap_time else "",
+                "advance": r.advance, "decline": r.decline,
+                "limit_up": r.limit_up, "limit_down": r.limit_down,
+                "amount_total": r.amount_total, "source": r.source,
+                "source_note": r.source_note}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 # ---------- 技术信号与新闻 ----------
+
+@router.get("/lhb")
+def lhb(trade_date: str | None = None, limit: int = 50,
+        user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
+    """最近交易日龙虎榜 [{code,name,close,pct_chg,lhb_net,matched_traders}];无数据 [] 不 500。"""
+    limit = min(max(limit, 1), MAX_LIMIT)
+    try:
+        q = select(LhbDaily)
+        if trade_date:
+            q = q.where(LhbDaily.trade_date == date.fromisoformat(trade_date))
+        else:
+            latest = db.execute(select(LhbDaily.trade_date).order_by(
+                LhbDaily.trade_date.desc()).limit(1)).scalar_one_or_none()
+            if latest is None:
+                return []
+            q = q.where(LhbDaily.trade_date == latest)
+        rows = db.execute(q.order_by(LhbDaily.lhb_net.desc()).limit(limit)).scalars().all()
+        return [{"code": r.code, "name": r.name, "close": r.close,
+                 "pct_chg": r.pct_chg, "lhb_net": r.lhb_net,
+                 "matched_traders": json.loads(r.matched_traders or "[]")}
+                for r in rows]
+    except Exception:  # noqa: BLE001 无数据/老库缺表一律 [] 不 500
+        return []
+
+
+@router.get("/hot-money-seats")
+def hot_money_seats(user_id: int = Depends(current_user_id),
+                    db: Session = Depends(get_db)):
+    """游资席位映射表 [{seat,trader,style,risk}]。"""
+    from ..shared import data_gateway as dg
+
+    return [{"seat": seat, **info} for seat, info in dg.load_hot_money_seats().items()]
+
+
+@router.get("/search")
+def search(q: str = "", limit: int = 20,
+           user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
+    """拼音搜股:q 匹配 code 前缀/name 包含/pinyin 前缀/initials 前缀(大小写不敏感)。
+
+    q 为空返回 [];返回 [{code,name}]。"""
+    limit = min(max(limit, 1), 100)
+    if not (q or "").strip():
+        return []
+    from ..shared import search as search_mod
+
+    return search_mod.match_search(search_mod.build_search_index(db), q, limit)
+
 
 @router.get("/signals")
 def signals(trade_date: str | None = None, signal_type: str | None = None,
@@ -185,10 +346,7 @@ def signals(trade_date: str | None = None, signal_type: str | None = None,
     d = date.fromisoformat(trade_date) if trade_date else None
     rows = technical_signal.latest_signals(db, trade_date=d, signal_type=signal_type,
                                            limit=limit)
-    from .models import StockBasic
-
-    names = dict(db.execute(
-        select(StockBasic.code, StockBasic.name)).all()) if rows else {}
+    names = _stock_names(db, [r.code for r in rows]) if rows else {}
     return [{"id": r.id, "code": r.code, "name": names.get(r.code, ""),
              "trade_date": r.trade_date.isoformat(),
              "signal_type": r.signal_type, "strength": r.strength,
@@ -231,10 +389,18 @@ def list_tracks(user_id: int = Depends(current_user_id), db: Session = Depends(g
     counts = dict(db.execute(
         select(TrackMembership.track_id, func.count(TrackMembership.id))
         .group_by(TrackMembership.track_id)).all())
-    return [{"id": t.id, "name": t.name, "concept_board": t.concept_board,
-             "industry_index": t.industry_index, "keywords": t.keywords,
-             "enabled": t.enabled, "note": t.note, "member_count": counts.get(t.id, 0)}
-            for t in rows]
+
+    def _track_dict(t) -> dict:
+        # 老库缺列(未迁移)时 getattr 兜底,不 500。
+        synced = getattr(t, "synced_at", None)
+        return {"id": t.id, "name": t.name, "concept_board": t.concept_board,
+                "industry_index": t.industry_index, "keywords": t.keywords,
+                "enabled": t.enabled, "note": t.note,
+                "member_count": counts.get(t.id, 0),
+                "member_source": getattr(t, "member_source", "") or "",
+                "synced_at": synced.isoformat() if synced else "",
+                "sync_error": getattr(t, "sync_error", "") or ""}
+    return [_track_dict(t) for t in rows]
 
 
 @router.post("/tracks")
@@ -261,15 +427,62 @@ def update_track(track_id: int, body: TrackIn, analyst: User = Depends(require_a
 @router.post("/tracks/{track_id}/sync")
 def sync_track(track_id: int, analyst: User = Depends(require_analyst),
                user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
+    """同步单赛道成分,source 中文:eastmoney 东财/sina 新浪/keyword 关键词/
+    ths 同花顺核验/local 本地展开/local_ths_verified 同花顺核验。"""
     t = db.get(Track, track_id)
     if t is None:
         raise HTTPException(404, "赛道不存在")
     try:
         n = universe_manager.sync_track_members(db, t)
-    except Exception:  # noqa: BLE001 东财概念接口被墙时的友好降级
-        raise HTTPException(502, "概念板块成分接口暂时不可达(本地网络受限),"
+        source = getattr(t, "member_source", "") or ""
+    except ConnectionError as exc:
+        # 上游网络/被墙:本地错误不冒充 502 网关错误,转 503 并标注可恢复
+        raise HTTPException(503, f"概念板块成分接口暂时不可达(本地网络受限):{exc};"
                                  "云端部署后自动恢复;已有成分不受影响")
-    return {"added": n}
+    except TimeoutError as exc:
+        raise HTTPException(503, f"概念板块成分接口超时:{exc};已有成分不受影响,稍后重试")
+    except ValueError as exc:
+        # 参数/数据错误是本地 4xx,不走 502
+        raise HTTPException(422, f"概念板块参数或数据异常:{exc}")
+    except Exception as exc:  # noqa: BLE001 未知本地错误:500,不冒充网关 502
+        raise HTTPException(500, f"赛道同步本地失败:{exc}")
+    return {"added": n, "source": source}
+
+
+@router.post("/tracks/backfill")
+def backfill_tracks(analyst: User = Depends(require_analyst),
+                    user_id: int = Depends(current_user_id),
+                    db: Session = Depends(get_db)):
+    """一键回填全部赛道成分(ensure_default_tracks + 逐 track sync)。
+
+    返回 {results: {name: {"added": n, "source": s}}, errors: [...]}。
+    同步执行(调 task_runner.task_tracks_backfill)。"""
+    from ..task_runner import task_tracks_backfill
+
+    try:
+        return task_tracks_backfill(db)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"赛道回填本地失败:{exc}")
+
+
+@router.post("/tracks/{track_id}/prune")
+def prune_track(track_id: int, analyst: User = Depends(require_analyst),
+                user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
+    """清理赛道过期成分(sync 只增不减的补位;需人工确认后调用)。"""
+    t = db.get(Track, track_id)
+    if t is None:
+        raise HTTPException(404, "赛道不存在")
+    try:
+        n = universe_manager.prune_track_members(db, t)
+    except ConnectionError as exc:
+        raise HTTPException(503, f"概念板块成分接口暂时不可达:{exc}")
+    except TimeoutError as exc:
+        raise HTTPException(503, f"概念板块成分接口超时:{exc}")
+    except ValueError as exc:
+        raise HTTPException(422, f"概念板块参数或数据异常:{exc}")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"赛道清理本地失败:{exc}")
+    return {"removed": n}
 
 
 # ---------- 策略配置与策略卡 ----------
@@ -349,8 +562,17 @@ def task_logs(limit: int = 50, user_id: int = Depends(current_user_id),
         return (dt.replace(tzinfo=timezone.utc) +
                 timedelta(hours=8)).replace(tzinfo=None).isoformat(sep=" ") if dt else ""
 
+    def _quality(detail: str) -> dict:
+        # data_quality/coverage:已是后台线程执行,日志行携带质量字段供前端区分
+        # success 且 detail 含 degraded/部分完成 → degraded;failed → failed;其余 ok
+        d = detail or ""
+        if "degraded" in d or "部分完成" in d:
+            return {"data_quality": "degraded", "coverage": {"note": d[:200]}}
+        return {"data_quality": "ok", "coverage": {}}
+
     return [{"id": r.id, "task_name": r.task_name, "run_at": _cn(r.run_at),
-             "status": r.status, "detail": r.detail, "duration_ms": r.duration_ms}
+             "status": r.status, "detail": r.detail, "duration_ms": r.duration_ms,
+             **_quality(r.detail)}
             for r in rows]
 
 

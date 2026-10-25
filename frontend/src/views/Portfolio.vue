@@ -8,7 +8,7 @@
           <el-button type="primary" size="small" @click="dialog = true">录入持仓</el-button>
         </div>
       </template>
-      <el-table :data="rows" size="small" v-loading="loading" stripe>
+      <el-table :data="rows" size="small" v-loading="loading" stripe border>
         <el-table-column prop="code" label="代码" width="85" />
         <el-table-column label="名称" min-width="100">
           <template #default="{ row }">{{ cleanName(row.name) }}</template>
@@ -60,7 +60,12 @@
           </template>
         </el-table-column>
       </el-table>
-      <el-empty v-if="!loading && !rows.length" description="暂无持仓,点击右上角「录入持仓」开始" :image-size="70" />
+      <el-empty v-if="!loading && !rows.length" description="暂无持仓,点击右上角「录入持仓」开始" :image-size="70">
+        <template #description>
+          <p>暂无持仓,点击右上角「录入持仓」开始</p>
+          <p class="muted" style="font-size:12px">现价与止损阶段由交易日 15:50 巡检推进;卖出后自动计入交易历史</p>
+        </template>
+      </el-empty>
     </el-card>
 
     <el-dialog v-model="dialog" title="录入持仓(系统自动计算保本价与止损线)" width="480">

@@ -15,3 +15,4 @@ akshare==1.18.12
 baostock==0.8.9
 efinance==0.5.7
 openai==1.109.1
+pypinyin>=0.50

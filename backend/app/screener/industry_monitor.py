@@ -34,15 +34,31 @@ def compute_ratio_score(ratios: pd.Series) -> pd.Series:
 
 
 def _add_trade_days(days_list: list, from_idx: int, n: int) -> date | None:
-    if from_idx + n < len(days_list):
+    if from_idx >= 0 and from_idx + n < len(days_list):
         return days_list[from_idx + n]
     return None
 
 
+def _cooldown_until(start: date, n: int = CROWD_COOLDOWN_TRADE_DAYS) -> date:
+    """回避到期日:优先交易日历 +n 个交易日;日历不可用时退化为 +30 自然日。
+
+    退化路径仅在上游日历接口失败时触发,调用方应在日志/卡片中标注口径。
+    """
+    try:
+        cal = dg.get_trade_calendar(start.strftime("%Y%m%d"),
+                                    (start + timedelta(days=90)).strftime("%Y%m%d"))
+        later = [d for d in cal if d > start]
+        if len(later) >= n:
+            return later[n - 1]
+    except Exception as exc:  # noqa: BLE001 日历失败则自然日兜底
+        log.warning("trade calendar unavailable, cooldown fallback +30d: %s", exc)
+    return start + timedelta(days=30)
+
+
 def sync_industry_daily(db: Session, trade_date: date | None = None,
                         board_limit: int | None = None) -> int:
-    """同步东财行业板块日度监测(收盘后任务)。trade_date 缺省为最近交易日。"""
-    trade_date = trade_date or dg.prev_trade_day()
+    """同步东财行业板块日度监测(收盘后任务)。trade_date 缺省为最近已收盘交易日。"""
+    trade_date = trade_date or dg.completed_trade_day()
     start = (trade_date - timedelta(days=240)).strftime("%Y%m%d")
 
     boards = dg.get_industry_board_list()
@@ -100,12 +116,28 @@ def sync_industry_daily(db: Session, trade_date: date | None = None,
         hist["ratio_score"] = compute_ratio_score(hist["ratio"])
         last = hist.iloc[-1]
 
-        # 回避名单:触发→20个交易日后解除;已生效则沿用
-        avoid_until = None
+        row = db.execute(select(IndustryDaily).where(
+            IndustryDaily.industry_code == board_code,
+            IndustryDaily.trade_date == trade_date)).scalar_one_or_none()
+        if row is None:
+            row = IndustryDaily(industry_code=board_code, industry_name=board_name,
+                                trade_date=trade_date)
+
+        # 回避名单:触发→20交易日后解除;已生效则沿用 max(旧值,新触发)(每日重置需继承)。
+        # 注意:旧值必须在覆盖 row.avoid_until 之前读取(同日重跑幂等,今日行即 carried)。
+        carried = (row.avoid_until if row.avoid_until and row.avoid_until >= trade_date
+                   else None)
+        avoid_until = carried
         if last["ratio_score"] > CROWD_THRESHOLD:
-            idx = trade_days_sorted.index(last["trade_date"])
-            avoid_until = _add_trade_days(trade_days_sorted, idx, CROWD_COOLDOWN_TRADE_DAYS) or \
-                (last["trade_date"] + timedelta(days=30))
+            idx = trade_days_sorted.index(last["trade_date"]) if last["trade_date"] in trade_days_sorted else -1
+            # 口径统一:优先交易日历 +20 交易日,日历缺失退化 +30 自然日(见 _cooldown_until)。
+            fresh = _add_trade_days(trade_days_sorted, idx, CROWD_COOLDOWN_TRADE_DAYS)
+            if fresh is None and idx >= 0:
+                fresh = _cooldown_until(last["trade_date"])
+            elif fresh is None:
+                fresh = trade_date + timedelta(days=30)
+            candidates = [d for d in (carried, fresh) if d is not None]
+            avoid_until = max(candidates) if candidates else None
 
         mom20 = (last["close"] / hist["close"].iloc[-21] - 1) * 100 if len(hist) > 21 else 0.0
         mom60 = (last["close"] / hist["close"].iloc[-61] - 1) * 100 if len(hist) > 61 else 0.0
@@ -116,21 +148,18 @@ def sync_industry_daily(db: Session, trade_date: date | None = None,
             IndustryDaily.trade_date < trade_date,
         ).order_by(IndustryDaily.trade_date.desc()).limit(30)).scalars().all()
         today_flow = flow_map.get(board_name, 0.0)
-        series = [(r.trade_date, r.fund_flow) for r in sorted(prev_rows)]
+        series = sorted(
+            ((r.trade_date, r.fund_flow or 0.0) for r in prev_rows),
+            key=lambda x: x[0])
+        streak = 0
         if today_flow > 0:
             streak = 1
-            for d, f in reversed(series):
+            for _d, f in reversed(series):
                 if f > 0:
                     streak += 1
                 else:
                     break
 
-        row = db.execute(select(IndustryDaily).where(
-            IndustryDaily.industry_code == board_code,
-            IndustryDaily.trade_date == trade_date)).scalar_one_or_none()
-        if row is None:
-            row = IndustryDaily(industry_code=board_code, industry_name=board_name,
-                                trade_date=trade_date)
         row.close = float(last["close"])
         row.pct_chg = float(last["pct_chg"])
         row.amount = float(last["amount"])
@@ -185,19 +214,25 @@ def _sync_industry_spot_only(db: Session, trade_date: date) -> int:
         row.ratio = round(row.amount / mkt_today * 100, 4) if mkt_today else 0.0
         row.fund_flow = 0.0
 
-        ratios = pd.Series([r.ratio for r in hist_asc])
-        if len(ratios) >= 60 and ratios.iloc[-2] == ratios.iloc[-2]:
-            ma120 = ratios.rolling(120, min_periods=60).mean().iloc[-2]
+        ratios = pd.Series([r.ratio for r in hist_asc] + [row.ratio])
+        if len(ratios) >= 60:
+            # 含当日在内的 MA120:与 full 路径同口径(分母皆为当日成交占比 RATIO)
+            ma120 = ratios.rolling(120, min_periods=60).mean().iloc[-1]
             if pd.notna(ma120) and ma120 > 0:
                 row.ratio_ma120 = round(float(ma120), 4)
                 score = (ratios.iloc[-1] - ma120) / ma120 * 100
                 row.ratio_score = round(float(score), 2)
                 if score > CROWD_THRESHOLD:
-                    row.avoid_until = trade_date + timedelta(days=30)
-        closes = [r.close for r in hist_asc]
-        if len(closes) > 21:
+                    carried = (row.avoid_until if row.avoid_until and row.avoid_until >= trade_date
+                               else None)
+                    fresh = _cooldown_until(trade_date)
+                    row.avoid_until = max([d for d in (carried, fresh) if d is not None])
+            elif pd.notna(ma120):
+                row.ratio_ma120 = round(float(ma120), 4)
+        closes = [r.close for r in hist_asc] + [row.close]
+        if len(closes) > 21 and closes[-21]:
             row.mom_20 = round((closes[-1] / closes[-21] - 1) * 100, 2)
-        if len(closes) > 61:
+        if len(closes) > 61 and closes[-61]:
             row.mom_60 = round((closes[-1] / closes[-61] - 1) * 100, 2)
         db.merge(row)
         written += 1
@@ -214,11 +249,12 @@ def _sync_industry_spot_only(db: Session, trade_date: date) -> int:
 def emerging_tracks(db: Session, top: int = 12) -> list[dict]:
     """新兴赛道发现:优先「启动期」(低位 + 动量转正 + 未拥挤),而非已经涨完的高位行业。
 
-    口径(识别而非预测,全部截面相对值):
+    口径(识别而非预测,全部截面相对值;统一 20 交易日口径,自然日仅用于新闻回看窗):
     - 启动期: mom60 低于全行业中位数(尚未大涨) 且 mom20>0(近期转强) 且未在回避名单
     - 发酵期: mom20 进入前 30%(强动量) 且未拥挤
-    - 回避:   ratio_score≥300 或已在回避名单(SC-U08 兑现期)
-    新闻突增系数 = 近3日该行业新闻数 / (前7日日均 + 1),≥2 视为显著。
+    - 回避:   ratio_score≥300 或已在回避名单(SC-U08 兑现期)——排序硬置底,不参与启动/发酵
+    - 数据缺失(如降级首日 mom 全空):不伪造动量,mom 置空并标 data_validity=low
+    新闻突增系数 = 近3日日均 / 前7日日均(等速率口径,上界截断),≥2 视为显著。
     排序分 = 0.4×阶段(启动=1,发酵=0.6) + 0.35×动量加速分位 + 0.25×min(新闻突增/4,1)。
     """
     latest = db.execute(select(IndustryDaily.trade_date).order_by(
@@ -236,11 +272,12 @@ def emerging_tracks(db: Session, top: int = 12) -> list[dict]:
         "avoid": r.avoid_until is not None and r.avoid_until >= latest,
         "pct_chg": r.pct_chg or 0.0,
     } for r in rows])
-    # 降级首日无历史动量时,用当日涨跌幅作截面 proxy(标注"首日快照"),数据积累后自动切换
+    # 降级首日无历史动量时:不伪造动量。mom 字段置空、下游标 data_validity=low,
+    # 阶段一律判 watch,待数据增厚后自动切换完整公式(原 pct_chg 冒充 mom 已删除)。
+    data_validity = "ok"
     first_day = df["mom20"].abs().sum() == 0 and df["mom60"].abs().sum() == 0
     if first_day:
-        df["mom20"] = df["pct_chg"]
-        df["mom60"] = df["pct_chg"]
+        data_validity = "low:首日快照,动量缺失"
     df["accel"] = df["mom20"] - df["mom60"]
     med60 = df["mom60"].median()
     top30 = df["mom20"].quantile(0.7)
@@ -254,6 +291,7 @@ def emerging_tracks(db: Session, top: int = 12) -> list[dict]:
     recent_from = datetime.combine(latest - timedelta(days=3), dtime.min)
     base_from = datetime.combine(latest - timedelta(days=10), dtime.min)
     base_to = datetime.combine(latest - timedelta(days=3), dtime.min)
+    # NOTE:新闻回看窗用自然日(发布时间属性,非交易信号);动量/回避统一用交易日历口径。
     news_rows = db.execute(
         select(NewsItem.related_industry, NewsItem.title, NewsItem.publish_time)
         .where(NewsItem.publish_time >= base_from)).all()
@@ -275,6 +313,8 @@ def emerging_tracks(db: Session, top: int = 12) -> list[dict]:
     def _stage(r):
         if r["avoid"] or r["ratio_score"] >= CROWD_THRESHOLD:
             return "avoid", "拥挤兑现(SC-U08 回避)"
+        if first_day:
+            return "watch", "观察·首日快照(动量缺失)"
         if r["mom60"] < med60 and r["mom20"] > 0:
             return "starting", "低位转强(启动期)"
         if r["mom20"] >= top30:
@@ -284,17 +324,18 @@ def emerging_tracks(db: Session, top: int = 12) -> list[dict]:
     out = []
     for _, r in df.iterrows():
         stage, stage_text = _stage(r)
-        if first_day and stage in ("starting", "rising"):
-            stage_text += "·首日快照"
         news3 = float(recent.get(r["name"], 0))
-        news7avg = float(base.get(r["name"], 0)) / 7.0
-        surge = (news3 + 1) / (news7avg + 1)
+        news3_rate = news3 / 3.0
+        news7 = float(base.get(r["name"], 0))  # base 窗为严格前 7 天(见 base_from/base_to)
+        news7_rate = news7 / 7.0
+        surge = min((news3_rate + 0.1) / (news7_rate + 0.1), 10.0)
         out.append({
             "code": r["code"], "name": r["name"], "stage": stage, "stage_text": stage_text,
             "mom_20": round(r["mom20"], 2), "mom_60": round(r["mom60"], 2),
             "accel": round(r["accel"], 2),
             "ratio_score": round(r["ratio_score"], 1),
             "news_3d": int(news3), "news_surge": round(surge, 2),
+            "data_validity": data_validity,
         })
     odf = pd.DataFrame(out)
     odf["accel_pct"] = odf["accel"].rank(pct=True)
@@ -302,7 +343,11 @@ def emerging_tracks(db: Session, top: int = 12) -> list[dict]:
                                        "watch": 0.2, "avoid": 0.0})
     odf["score"] = (0.4 * odf["stage_w"] + 0.35 * odf["accel_pct"]
                     + 0.25 * (odf["news_surge"] / 4).clip(upper=1.0))
-    odf = odf.sort_values("score", ascending=False).head(top)
+    # avoid 硬置底:回避行业不参与启动/发酵排序,直接沉底(权重为0不够,高动量仍会排前面)。
+    odf = odf.sort_values(["stage_w", "score"], ascending=[False, False]).head(top)
+    # 保险:若 top 截断后仍混入 avoid(极端拥挤日),将其排到末尾
+    avoid_mask = odf["stage"] == "avoid"
+    odf = pd.concat([odf[~avoid_mask], odf[avoid_mask]])
     tracked = {t.name for t in db.execute(select(Track)).scalars().all()}
     return [{"name": r["name"], "code": r["code"], "stage": r["stage"],
              "stage_text": r["stage_text"],
@@ -310,13 +355,18 @@ def emerging_tracks(db: Session, top: int = 12) -> list[dict]:
              "ratio_score": r["ratio_score"], "news_3d": r["news_3d"],
              "news_surge": r["news_surge"],
              "score": round(float(r["score"]), 3),
+             "data_validity": r["data_validity"],
              "tracked": r["name"] in tracked}
             for _, r in odf.iterrows()]
 
 
 def _apply_heat_scores(db: Session, trade_date: date) -> None:
     """景气综合评分 = 各成分当日截面分位加权(相对口径)。
-    0.35*mom60 + 0.25*mom20 + 0.2*flow_streak + 0.2*(100-pe_pct);回避名单减 20 分。"""
+    0.35*mom60 + 0.25*mom20 + 0.2*flow_streak + 0.2*(100-pe_pct);回避名单减 20 分。
+
+    返回/落库均带 data_quality 标注:degraded 首日用涨跌幅+成交占比兜底,
+    与完整公式不可比,调用方(API/看板)须展示该标记。
+    """
     rows = db.execute(select(IndustryDaily).where(
         IndustryDaily.trade_date == trade_date)).scalars().all()
     if not rows:
@@ -330,7 +380,9 @@ def _apply_heat_scores(db: Session, trade_date: date) -> None:
         # 降级首日无历史动量(截面无区分度):用当日涨跌幅+成交占比兜底,数据积累后自动切换完整公式
         df["heat"] = (0.6 * df["pct_chg"].rank(pct=True) * 100 +
                       0.4 * df["ratio"].rank(pct=True) * 100)
+        data_quality = "degraded:首日快照,heat 口径为涨跌幅+成交占比兜底,与完整公式不可比"
     else:
+        data_quality = "ok"
         for col in ("mom_20", "mom_60", "flow_streak", "pe_pct"):
             df[f"{col}_r"] = df[col].rank(pct=True) * 100
         df["heat"] = (0.35 * df["mom_60_r"] + 0.25 * df["mom_20_r"] +
@@ -339,7 +391,10 @@ def _apply_heat_scores(db: Session, trade_date: date) -> None:
     for _, r in df.iterrows():
         obj = db.get(IndustryDaily, int(r["id"]))
         obj.heat_score = round(float(r["heat"]), 2)
+        obj.news_heat = 0.0  # news_heat 字段保留兼容,当前热度即 heat_score,data_quality 见卡片 evidence
     db.commit()
+    log.info("heat scores @%s: %s", trade_date, data_quality)
+    return data_quality
 
 
 def _update_crowd_card(db: Session, rows) -> None:
@@ -350,14 +405,17 @@ def _update_crowd_card(db: Session, rows) -> None:
         card = StrategyCard(
             card_code="SC-U08", title="板块拥挤度反转(回避)",
             hypothesis="行业成交占比偏离自身MA120超300%后,该行业未来20交易日跑输,回避获相对收益",
-            status="verified",
-            source_note="Invest知识库 BT-U08, IS/OOS一致, bootstrap CI[-6.85%,-1.80%]",
+            status="unverified",
+            source_note="Invest知识库 BT-U08 草案,待回测验证;先按 unverified 执行回避",
         )
     avoid = [r.industry_name for r in rows
              if r.avoid_until is not None and r.avoid_until >= (r.trade_date)]
+    card.status = "unverified"
     card.evidence = json.dumps({
         "threshold": CROWD_THRESHOLD, "cooldown_days": CROWD_COOLDOWN_TRADE_DAYS,
         "current_avoid": avoid, "market_wide_crowded": len(avoid) > AVOID_MAX,
+        "unverified": True,
+        "note": "SC-U08 为待验证草案:回避名单照常执行,但卡片状态标 unverified,不冒充已验证",
     }, ensure_ascii=False)
     card.review_note = ("事件驱动行业(政策/商品暴涨)触发需人工剔除;全市场同时拥挤>3个行业时整体降仓。")
     db.merge(card)
@@ -366,7 +424,7 @@ def _update_crowd_card(db: Session, rows) -> None:
 
 def crowd_avoid_industries(db: Session, trade_date: date | None = None) -> list[str]:
     """当前回避行业名单(供策略引擎禁止入池)。"""
-    trade_date = trade_date or dg.prev_trade_day()
+    trade_date = trade_date or dg.completed_trade_day()
     rows = db.execute(select(IndustryDaily).where(
         IndustryDaily.trade_date == trade_date)).scalars().all()
     return [r.industry_name for r in rows
@@ -381,7 +439,7 @@ def market_wide_crowded(db: Session, trade_date: date | None = None) -> bool:
 
 def sync_commodities(db: Session, trade_date: date | None = None) -> int:
     """同步商品主力连续价格并生成涨价信号。持续≥1月(约20交易日)才算周期性启动。"""
-    trade_date = trade_date or dg.prev_trade_day()
+    trade_date = trade_date or dg.completed_trade_day()
     written = 0
     for spec in dg.DEFAULT_COMMODITY_SERIES:
         try:

@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..portfolio import account, ai_advisor, holding_service, report_service
 from ..portfolio.models import (AiAnalysis, Holding, InviteCode, TradeRecord, User,
-                                UserLlmConfig, WeeklyReport)
+                                UserLlmConfig, WatchAlertLog, Watchlist, WeeklyReport)
 from ..shared import llm_gateway
 from ..shared.security import (current_user_id, decrypt_secret, encrypt_secret,
                                hash_password, mask_secret, require_admin, verify_password)
@@ -203,7 +203,8 @@ def delete_user(user_id: int, admin: User = Depends(require_admin),
     if user.role == "admin" and _active_admin_count(db) <= 1:
         raise HTTPException(400, "不能删除最后一个启用的管理员")
     # 级联清理该租户的全部数据(持仓上下文内闭环)
-    for model in (Holding, TradeRecord, AiAnalysis, WeeklyReport, UserLlmConfig):
+    for model in (Holding, TradeRecord, AiAnalysis, WeeklyReport, UserLlmConfig,
+                  Watchlist, WatchAlertLog):
         for row in db.execute(select(model).where(model.user_id == user.id)).scalars().all():
             db.delete(row)
     db.delete(user)
@@ -307,6 +308,122 @@ def trade_stats_api(user_id: int = Depends(current_user_id), db: Session = Depen
     return holding_service.trade_stats(db, user_id)
 
 
+# ---------- 自购三价预警(P1-3:只读预警,不写止损;站内信先行) ----------
+
+def _watch_code_check(code: str) -> str:
+    code = (code or "").strip()
+    if len(code) != 6 or not code.isdigit():
+        raise HTTPException(400, "code 须为 6 位数字")
+    return code
+
+
+def _watch_dict(w, db: Session) -> dict:
+    from ..shared import stock_ref
+
+    latest = stock_ref.latest_close(db, w.code)
+    close = latest[1] if latest else None
+    pct = 0.0
+    if latest is not None:
+        hist = stock_ref.quote_history(db, w.code, days=5)
+        prev = hist[-2]["close"] if len(hist) >= 2 else None
+        pct = round((close / prev - 1) * 100, 2) if prev else 0.0
+    return {"id": w.id, "code": w.code, "name": w.name,
+            "cost_price": w.cost_price, "take_profit": w.take_profit,
+            "stop_loss": w.stop_loss, "alert_pct": w.alert_pct,
+            "note": w.note, "close": close, "pct_chg": pct,
+            "created_at": _cn(w.created_at)}
+
+
+class WatchIn(BaseModel):
+    code: str = Field(min_length=6, max_length=6)
+    name: str = ""
+    cost_price: float = 0.0
+    take_profit: float = 0.0
+    stop_loss: float = 0.0
+    alert_pct: float = 0.0
+    note: str = ""
+
+
+@router.get("/watchlist")
+def list_watchlist(user_id: int = Depends(current_user_id),
+                   db: Session = Depends(get_db)):
+    """当前用户自购列表 + 现价/涨跌幅只读(via stock_ref.latest_close)。"""
+    rows = db.execute(select(Watchlist).where(
+        Watchlist.user_id == user_id).order_by(Watchlist.id.desc())).scalars().all()
+    return [_watch_dict(w, db) for w in rows]
+
+
+@router.post("/watchlist")
+def create_watch(body: WatchIn, user_id: int = Depends(current_user_id),
+                 db: Session = Depends(get_db)):
+    code = _watch_code_check(body.code)
+    exists = db.execute(select(Watchlist).where(
+        Watchlist.user_id == user_id, Watchlist.code == code)).scalar_one_or_none()
+    if exists is not None:
+        raise HTTPException(400, "该股票已在自购列表")
+    from ..shared import stock_ref
+
+    w = Watchlist(user_id=user_id, code=code,
+                  name=body.name or stock_ref.stock_name(db, code),
+                  cost_price=body.cost_price or 0.0,
+                  take_profit=body.take_profit or 0.0,
+                  stop_loss=body.stop_loss or 0.0,
+                  alert_pct=body.alert_pct or 0.0, note=body.note or "")
+    db.add(w)
+    db.commit()
+    db.refresh(w)
+    return {"id": w.id, "code": w.code}
+
+
+@router.put("/watchlist/{watch_id}")
+def update_watch(watch_id: int, body: WatchIn,
+                 user_id: int = Depends(current_user_id),
+                 db: Session = Depends(get_db)):
+    w = db.get(Watchlist, watch_id)
+    if w is None or w.user_id != user_id:
+        raise HTTPException(404, "自购记录不存在")
+    code = _watch_code_check(body.code)
+    dup = db.execute(select(Watchlist).where(
+        Watchlist.user_id == user_id, Watchlist.code == code,
+        Watchlist.id != watch_id)).scalar_one_or_none()
+    if dup is not None:
+        raise HTTPException(400, "该股票已在自购列表")
+    from ..shared import stock_ref
+
+    w.code = code
+    w.name = body.name or stock_ref.stock_name(db, code) or w.name
+    w.cost_price = body.cost_price or 0.0
+    w.take_profit = body.take_profit or 0.0
+    w.stop_loss = body.stop_loss or 0.0
+    w.alert_pct = body.alert_pct or 0.0
+    w.note = body.note or ""
+    db.commit()
+    return {"ok": True}
+
+
+@router.delete("/watchlist/{watch_id}")
+def delete_watch(watch_id: int, user_id: int = Depends(current_user_id),
+                 db: Session = Depends(get_db)):
+    w = db.get(Watchlist, watch_id)
+    if w is None or w.user_id != user_id:
+        raise HTTPException(404, "自购记录不存在")
+    db.delete(w)
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/watchlist/alerts")
+def list_watch_alerts(limit: int = 50, user_id: int = Depends(current_user_id),
+                      db: Session = Depends(get_db)):
+    """当前用户预警记录(站内信先行,去重日志只读展示)。"""
+    limit = min(max(limit, 1), 200)
+    rows = db.execute(select(WatchAlertLog).where(
+        WatchAlertLog.user_id == user_id).order_by(
+        WatchAlertLog.id.desc()).limit(limit)).scalars().all()
+    return [{"id": r.id, "code": r.code, "rule": r.rule, "message": r.message,
+             "created_at": _cn(r.created_at)} for r in rows]
+
+
 # ---------- AI 分析(参考层) ----------
 
 @router.post("/holdings/{holding_id}/ai-analysis")
@@ -380,12 +497,18 @@ def get_llm(user_id: int = Depends(current_user_id), db: Session = Depends(get_d
 @router.put("/settings/llm")
 def save_llm(body: LlmIn, user_id: int = Depends(current_user_id),
              db: Session = Depends(get_db)):
+    # 服务端 URL 校验(复用网关守卫,allow_local=False):SSRF/内网地址直接 400,
+    # 不入库脏配置;resolve_config 兜底再次校验,双层防护。
+    try:
+        safe_url = llm_gateway._validate_base_url(body.base_url, allow_local=False)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     cfg = db.execute(select(UserLlmConfig).where(
         UserLlmConfig.user_id == user_id)).scalar_one_or_none()
     if cfg is None:
         cfg = UserLlmConfig(user_id=user_id)
         db.add(cfg)
-    cfg.base_url, cfg.model = body.base_url, body.model
+    cfg.base_url, cfg.model = safe_url, body.model
     cfg.temperature, cfg.enabled = body.temperature, body.enabled
     if body.api_key:  # 留空表示不修改密钥
         cfg.api_key_cipher = encrypt_secret(body.api_key)
@@ -397,6 +520,8 @@ def save_llm(body: LlmIn, user_id: int = Depends(current_user_id),
 @router.post("/settings/llm/test")
 def test_llm(body: LlmIn, user_id: int = Depends(current_user_id),
              db: Session = Depends(get_db)):
+    # test_config 内部先做 _validate_base_url(SSRF 拒绝),再用短超时(8s)探测,
+    # 避免探测挂起拖住请求线程;非法 URL 直接返回 ok=False,不抛 500。
     cfg = db.execute(select(UserLlmConfig).where(
         UserLlmConfig.user_id == user_id)).scalar_one_or_none()
     key = body.api_key or (decrypt_secret(cfg.api_key_cipher) if cfg else "")

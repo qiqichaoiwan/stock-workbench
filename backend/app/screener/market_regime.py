@@ -46,24 +46,31 @@ def _benchmark_daily(start: str) -> pd.DataFrame:
     raise RuntimeError("benchmark index unavailable")
 
 
-def _breadth_from_quotes(db: Session) -> float:
-    """市场宽度:候选域个股收盘价站上自身 MA200 的占比%(趋势确认项)。"""
-    latest = db.execute(select(DailyQuote.trade_date).order_by(DailyQuote.trade_date.desc())).first()
-    if latest is None:
-        return 50.0
-    latest_d = latest[0]
-    start = (latest_d - timedelta(days=400)).isoformat().replace("-", "")
+def _breadth_from_quotes(db: Session, as_of: date | None = None) -> float:
+    """市场宽度:候选域个股收盘价站上自身 MA200 的占比%(趋势确认项)。
+
+    as_of 缺省为库内最新日线日期;显式传入时只用到该日及之前数据(防未来)。
+    """
+    if as_of is None:
+        latest = db.execute(select(DailyQuote.trade_date).order_by(DailyQuote.trade_date.desc())).first()
+        if latest is None:
+            return 50.0
+        as_of = latest[0]
+    start = (as_of - timedelta(days=400)).isoformat().replace("-", "")
     rows = db.execute(
         select(DailyQuote.code, DailyQuote.trade_date, DailyQuote.close)
-        .where(DailyQuote.trade_date >= pd.Timestamp(start).date())
+        .where(DailyQuote.trade_date >= pd.Timestamp(start).date(),
+               DailyQuote.trade_date <= as_of)
     ).all()
     if not rows:
         return 50.0
     df = pd.DataFrame(rows, columns=["code", "trade_date", "close"])
     df = df.sort_values(["code", "trade_date"])
-    ma200 = df.groupby("code")["close"].rolling(200, min_periods=200).mean().reset_index(level=0, drop=True)
-    df = df.assign(ma200=ma200)
-    latest_df = df[df["trade_date"] == latest_d].dropna(subset=["ma200"])
+    # 组内 rolling:避免跨股错位(与 strategy_engine 同修)
+    ma200 = (df.groupby("code")["close"].transform(
+        lambda s: s.rolling(200, min_periods=200).mean()))
+    df = df.assign(ma200=ma200.values)
+    latest_df = df[df["trade_date"] == as_of].dropna(subset=["ma200"])
     if latest_df.empty:
         return 50.0
     above = (latest_df["close"] > latest_df["ma200"]).mean() * 100
@@ -132,20 +139,41 @@ def _decide_cycle_stage(eco_pos: bool, liq_pos: bool, val_dir_pos: bool,
     return "衰退", PM02_POSITIONS["衰退"]
 
 
+def _order_key(stage: str) -> int:
+    """仓位档位高→低排序:衰退 > 复苏 > 下行 > 过热(降风险=往低走)。"""
+    return {"过热": 0, "下行": 1, "复苏": 2, "衰退": 3}.get(stage, -1)
+
+
+def _range_lo(position_range: str) -> float:
+    try:
+        return float(str(position_range).split("-")[0].replace("%", ""))
+    except (ValueError, IndexError, AttributeError):
+        return float("nan")
+
+
 def _apply_hysteresis(prev: MarketState | None, new_stage: str, new_range: str,
-                      today_d: date) -> tuple[str, str, str, int]:
+                      today_d: date, prev_stage_start: date | None = None) -> tuple[str, str, str, int]:
     """滞回:降风险(往低仓位档)即时生效;升风险(往高仓位档)需连续2期确认+驻留期。
 
-    仓位档位高→低排序:衰退 > 复苏 > 下行 > 过热。
+    驻留起点 = 旧档位首次生效日(prev_stage_start,调用方用 trade_date 差值回推;
+    传 None 时退化为 prev.created_at,均无则视为已满足)。prev 每日一行时
+    created_at 不可用作驻留起点(永远差1天导致永不升级)。
+    同 stage 保留旧 position_range 时取 min(旧,新)下限——估值分档收紧(如过热
+    30%→10%)即时生效,不被旧宽松区间覆盖。
     返回 (生效stage, 生效range, pending_stage, pending_count)。
     """
-    order = {"过热": 0, "下行": 1, "复苏": 2, "衰退": 3}
     if prev is None:
         return new_stage, new_range, "", 0
     prev_stage = prev.cycle_stage or new_stage
+    prev_range = prev.position_range or new_range
     if new_stage == prev_stage:
-        return prev_stage, prev.position_range or new_range, "", 0
-    if order[new_stage] < order[prev_stage]:
+        # 同档:收紧(下限更低)即时生效,放松走滞回
+        try:
+            keep = new_range if _range_lo(new_range) < _range_lo(prev_range) else prev_range
+        except ValueError:
+            keep = prev_range
+        return prev_stage, keep, "", 0
+    if _order_key(new_stage) < _order_key(prev_stage):
         # 新档位仓位更低 → 降风险,立即生效
         return new_stage, new_range, "", 0
     # 升风险方向:需连续 UPGRADE_CONFIRM_N 次确认 + 最小驻留期
@@ -154,10 +182,20 @@ def _apply_hysteresis(prev: MarketState | None, new_stage: str, new_range: str,
     else:
         pending_count = 1
     if pending_count >= UPGRADE_CONFIRM_N:
-        since = prev.created_at.date() if prev.created_at else today_d
+        # 驻留起点:优先用"旧档位首次生效日"(trade_date 差值回推,见 compute_market_state);
+        # 回退 prev.created_at(旧库无回推时);均无则视为已满足。
+        since = prev_stage_start
+        if since is None:
+            since = prev.created_at.date() if getattr(prev, "created_at", None) else today_d
         if (today_d - since).days >= MIN_DWELL_DAYS:
             return new_stage, new_range, "", 0
-    return prev_stage, prev.position_range, new_stage, pending_count
+    # 升风险未确认:保持旧档,但同档内收紧(如下限更低)即时生效
+    try:
+        keep_range = (new_range if _order_key(new_stage) == _order_key(prev_stage)
+                      and _range_lo(new_range) < _range_lo(prev_range) else prev_range)
+    except ValueError:
+        keep_range = prev_range
+    return prev_stage, keep_range, new_stage, pending_count
 
 
 def compute_market_state(db: Session, trade_date: date | None = None) -> MarketState:
@@ -165,8 +203,10 @@ def compute_market_state(db: Session, trade_date: date | None = None) -> MarketS
 
     任一外部组件失败按中性值处理并记录 missing,绝不整体失败——
     状态行必须每天产出,供下游与仪表盘使用。
+    trade_date 缺省为最近已收盘交易日(不用自然 today,避免把盘中未收盘日落库);
+    score_json 额外记录 as_of 与 data_quality/coverage,供看板标注。
     """
-    trade_date = trade_date or dg.today()
+    trade_date = trade_date or dg.completed_trade_day()
     start = (trade_date - timedelta(days=500)).strftime("%Y%m%d")
     missing: list[str] = []
 
@@ -196,7 +236,7 @@ def compute_market_state(db: Session, trade_date: date | None = None) -> MarketS
         missing.append("market_amount")
         amount_dev, amount_pct_60d = 0.0, 50.0
 
-    breadth = _breadth_from_quotes(db)
+    breadth = _breadth_from_quotes(db, as_of=trade_date)
     valuation_pct = _all_a_valuation_pct()
     margin_ratio, margin_dev = _margin_dev(start)
 
@@ -231,8 +271,23 @@ def compute_market_state(db: Session, trade_date: date | None = None) -> MarketS
 
     prev = db.execute(select(MarketState).order_by(
         MarketState.trade_date.desc())).scalars().first()
+    # 驻留起点:旧档位首次生效日(prev 每日一行,created_at 不可用;用 trade_date 差值回推)
+    prev_stage_start = None
+    if prev is not None and prev.cycle_stage:
+        same_stage_rows = db.execute(select(MarketState.trade_date).where(
+            MarketState.cycle_stage == prev.cycle_stage,
+            MarketState.trade_date <= trade_date
+        ).order_by(MarketState.trade_date.desc()).limit(400)).scalars().all()
+        if same_stage_rows:
+            run = [same_stage_rows[0]]
+            for d in same_stage_rows[1:]:
+                if (run[-1] - d).days == 1:
+                    run.append(d)
+                else:
+                    break
+            prev_stage_start = min(run)
     stage, position_range, pending, pending_count = _apply_hysteresis(
-        prev, raw_stage, raw_range, trade_date)
+        prev, raw_stage, raw_range, trade_date, prev_stage_start)
 
     row = db.get(MarketState, trade_date) or MarketState(trade_date=trade_date)
     row.trend_label = trend_label
@@ -249,6 +304,10 @@ def compute_market_state(db: Session, trade_date: date | None = None) -> MarketS
         "amount_dev": round(amount_dev, 2), "margin_dev": margin_dev,
         "raw_stage": raw_stage, "raw_range": raw_range,
         "pm02_status": "unverified_draft",
+        "pm02_note": "PM02 仓位分档为待验证草案,不作投资建议",
+        "as_of": trade_date.isoformat(),
+        "data_quality": "degraded" if missing else "ok",
+        "coverage": {"missing_components": missing},
         "missing_components": missing,
     }, ensure_ascii=False)
     db.merge(row)

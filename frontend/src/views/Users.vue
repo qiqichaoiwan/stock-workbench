@@ -11,7 +11,7 @@
           <el-button type="primary" size="small" @click="createDialog = true">新建用户</el-button>
         </div>
       </template>
-      <el-table :data="users" size="small" v-loading="loading" stripe>
+      <el-table :data="users" size="small" v-loading="loading" stripe border>
         <el-table-column prop="id" label="ID" width="60" />
         <el-table-column prop="username" label="用户名" width="140" />
         <el-table-column prop="nickname" label="昵称" width="140" />
@@ -48,6 +48,12 @@
           </template>
         </el-table-column>
       </el-table>
+      <el-empty v-if="!loading && !users.length" description="暂无用户" :image-size="60">
+        <template #description>
+          <p>暂无用户,点右上「新建用户」或搜空时清空关键词</p>
+          <p class="muted" style="font-size:12px">admin=全部权限 · analyst=选股工作台操作 · user=只读看板+自己持仓</p>
+        </template>
+      </el-empty>
       <div class="pager">
         <el-pagination layout="total, prev, pager, next" :total="total" :page-size="size"
                        :current-page="page" @current-change="(p) => { page = p; load() }" />
@@ -63,7 +69,7 @@
           <el-button type="primary" size="small" :loading="creatingInvite" @click="genInvite">生成邀请码</el-button>
         </div>
       </template>
-      <el-table :data="invites" size="small" stripe>
+      <el-table :data="invites" size="small" stripe border>
         <el-table-column prop="code" label="邀请码" width="170">
           <template #default="{ row }">
             <span class="num">{{ row.code }}</span>
@@ -91,6 +97,12 @@
           </template>
         </el-table-column>
       </el-table>
+      <el-empty v-if="!invites.length" description="暂无邀请码" :image-size="60">
+        <template #description>
+          <p>暂无邀请码,设置有效天数后点「生成邀请码」</p>
+          <p class="muted" style="font-size:12px">邀请码一次性有效,凭码注册;用过即失效,不用可作废</p>
+        </template>
+      </el-empty>
     </el-card>
 
     <el-dialog v-model="createDialog" title="新建用户" width="440">

@@ -2,8 +2,8 @@
 .env
 data/.fernet.key
 
-# 运行时数据
-data/
+# 运行时数据(仅项目根 data/:生产库与密钥;backend/data 放随代码跟踪的种子数据)
+/data/
 
 # 依赖与构建产物
 node_modules/
@@ -17,3 +17,6 @@ __pycache__/
 
 # 会话工作区配置
 .zcode/
+
+# 参考项目(只读研读,不进仓库)
+tmp/

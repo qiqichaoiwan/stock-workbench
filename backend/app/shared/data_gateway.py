@@ -1,15 +1,34 @@
-"""统一数据网关:akshare(主) + baostock(备) + efinance(快照)。
+"""统一数据采集网关:akshare(主) + baostock(备) + efinance(快照)。
 
 原则:
-- 所有外部调用收敛在本模块;统一重试/限速;接口变更只改这里
+- 所有外部调用收敛在本模块;统一重试/限速/超时;接口变更只改这里
 - 股票代码统一为 6 位字符串;baostock 等源的前缀在函数内部转换
 - 任一源失败自动降级备源并返回 (data, source) 或抛出 last error 由上层记 task_log
+
+单位与复权约定(落库前统一,下游可直接使用):
+- 日线 OHLC/close: 各源均为**前复权**(akshare adjust="qfq" / baostock adjustflag="2" /
+  腾讯/新浪 adjust="qfq");除权除息导致的跳空已由源端消除,禁止二次复权。
+- volume(成交量): 统一为**股**。akshare 东财/新浪/腾讯各源返回**手**(1 手=100 股),
+  本模块统一 ×100;baostock 返回**股**,保持不变。见 _normalise_volume。
+- amount(成交额): 统一为**元**;total_mv/circ_mv 统一为**亿元**。见
+  _normalise_amount/_normalise_market_cap,量级不符直接抛错不入库。
+- pct_chg 缺失的源(sina/tx 个别版本)由同一前复权 close 推导,与源端口径一致(%)。
+
+超时与退避约定(见 backend/app/config.py):
+- 所有源调用经 resilient 装饰器统一加超时(fetch_timeout_seconds,默认 60s,线程级强制);
+  超时计为一次失败并进入指数退避重试。
+- 重试:fetch_retry_times × 指数退避(fetch_retry_wait_seconds × attempt)。
+- 源级冷却:连续失败的源按 _SOURCE_DEFAULT_COOLDOWN 暂停调用(东财日线 10 分钟,
+  其余 5 分钟),成功即清零;回填场景直走 tx/sina 不再逐股重试 akshare。
 """
+import concurrent.futures
+import json
 import logging
 import threading
 import time
 from datetime import date, datetime, timedelta
 from functools import wraps
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -34,6 +53,21 @@ def today() -> date:
 _rate_lock = threading.Lock()
 _last_request_ts = 0.0
 _source_cooldown: dict[str, float] = {}  # 源级冷却:连续失败后暂停一段时间再用
+# 各源冷却时长(秒):东财日线最严(限流重),其余默认 5 分钟;见模块 docstring
+_SOURCE_DEFAULT_COOLDOWN = 300.0
+_SOURCE_COOLDOWN_SECONDS = {
+    "daily_hist_ak": 600.0,       # 东财限流后 10 分钟不再逐股重试,回填直走 tx/sina
+    "industry_board_list": 600.0,  # 东财板块失败 10 分钟直接走新浪
+    "spot_snapshot_ak": 300.0,
+    "spot_snapshot_ef": 300.0,
+    "spot_snapshot_sina": 300.0,
+    "_index_daily_em": 300.0,
+    "_index_daily_tx": 300.0,
+    "_index_daily_sina": 300.0,
+    "index_daily_em": 300.0,
+    "index_daily_tx": 300.0,
+    "index_daily_sina": 300.0,
+}
 
 
 def _rate_limit():
@@ -51,12 +85,34 @@ def _cooldown_check(source: str) -> bool:
     return time.monotonic() < until
 
 
-def _cooldown_set(source: str, seconds: float = 300.0):
+def _cooldown_set(source: str, seconds: float | None = None):
+    if seconds is None:
+        seconds = _SOURCE_COOLDOWN_SECONDS.get(source, _SOURCE_DEFAULT_COOLDOWN)
     _source_cooldown[source] = time.monotonic() + seconds
 
 
+def _cooldown_clear(source: str) -> None:
+    """某源成功后清零冷却,下次可立即调用。"""
+    _source_cooldown.pop(source, None)
+
+
+def _run_with_timeout(fn, timeout: float, *args, **kwargs):
+    """线程级强制超时:akshare/requests 无统一 timeout 参数,用单线程池兜底。
+
+    timeout<=0 时直接调用(测试/离线场景)。超时抛 TimeoutError,计为一次失败。
+    """
+    if timeout is None or timeout <= 0:
+        return fn(*args, **kwargs)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(fn, *args, **kwargs)
+        try:
+            return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            raise TimeoutError(f"source call timed out after {timeout}s") from exc
+
+
 def resilient(name: str):
-    """统一重试装饰器:限速 + 指数退避;全部失败抛最后一次异常。"""
+    """统一重试装饰器:限速 + 强制超时 + 指数退避;全部失败抛最后一次异常。"""
 
     def deco(fn):
         @wraps(fn)
@@ -65,7 +121,8 @@ def resilient(name: str):
             for attempt in range(1, settings.fetch_retry_times + 1):
                 try:
                     _rate_limit()
-                    return fn(*args, **kwargs)
+                    return _run_with_timeout(fn, settings.fetch_timeout_seconds,
+                                            *args, **kwargs)
                 except Exception as exc:  # noqa: BLE001 采集层必须吞掉任意源错误再重试
                     last_err = exc
                     wait = settings.fetch_retry_wait_seconds * attempt
@@ -108,6 +165,65 @@ def prev_trade_day(d: date | None = None, n: int = 1) -> date:
     d = d or today()
     before = [x for x in days if x < d]
     return before[-n] if len(before) >= n else before[0] if before else d
+
+
+def completed_trade_day(at: datetime | None = None) -> date:
+    """Return the latest trading day whose close is actually available.
+
+    Before the 15:00 close (including pre-market), today's quote is not
+    complete; after close, today's quote is the completed business date.
+    """
+    now = at.astimezone(TZ) if at is not None and at.tzinfo else (at or now_tz())
+    d = now.date()
+    if is_trade_day(d) and now.time() >= datetime.strptime("15:00", "%H:%M").time():
+        return d
+    return prev_trade_day(d)
+
+
+def validate_quote_date(quote_date: date, *, allow_today_completed: bool = True) -> date:
+    """Reject dates that cannot be a completed quote date."""
+    completed = completed_trade_day()
+    if quote_date > completed or not is_trade_day(quote_date):
+        raise ValueError(f"quote date {quote_date} is not a completed trading day (latest {completed})")
+    return quote_date
+
+
+def _normalise_amount(value, source: str) -> float:
+    """All monetary amounts are stored in yuan; reject implausible units."""
+    value = pd.to_numeric(value, errors="coerce")
+    if pd.isna(value) or float(value) < 0:
+        return 0.0
+    value = float(value)
+    # Eastmoney/efinance/sina amount fields are yuan. Do not silently accept
+    # already-billion values, which would corrupt downstream ratios.
+    if 0 < value < 1_000_000 and source in {"akshare", "efinance", "sina"}:
+        raise ValueError(f"{source} amount appears not to be yuan: {value}")
+    return value
+
+
+def _normalise_market_cap(value, source: str) -> float:
+    """All market caps are stored in 亿元, while providers return yuan."""
+    value = pd.to_numeric(value, errors="coerce")
+    if pd.isna(value) or float(value) < 0:
+        return 0.0
+    value = float(value)
+    if value and value < 1_000_000:
+        raise ValueError(f"{source} market cap appears not to be yuan: {value}")
+    return value / 1e8
+
+
+def _normalise_volume(value, source: str, *, lot_source: bool = True) -> float:
+    """成交量统一为**股**。
+
+    akshare 东财/新浪/腾讯返回**手**(1 手=100 股),调用方传 lot_source=True
+    统一 ×100;baostock 返回**股**,传 lot_source=False 保持不变。
+    负值/NaN 按缺失处理返回 0.0(由 _f 兜底写库,不抛错)。
+    """
+    value = pd.to_numeric(value, errors="coerce")
+    if pd.isna(value) or float(value) < 0:
+        return 0.0
+    value = float(value)
+    return value * 100.0 if lot_source else value
 
 
 # ---------------- 股票基础信息与实时快照 ----------------
@@ -176,7 +292,16 @@ def _spot_snapshot_sina() -> pd.DataFrame:
 def get_spot_snapshot() -> pd.DataFrame:
     """全市场实时快照,三源依序降级(东财akshare → 东财efinance → 新浪)。
     列:code,name,open,high,low,price,amount,turnover,pct_chg,total_mv(亿),circ_mv(亿),pe,pe_ttm,pb。"""
+    df, _ = get_spot_snapshot_with_source()
+    return df
+
+
+def get_spot_snapshot_with_source() -> tuple[pd.DataFrame, str]:
+    """全市场实时快照 + 数据来源(向后兼容:get_spot_snapshot 只返回 DataFrame)。
+    返回 (df, source),source∈{"akshare","efinance","sina"}。三源均失败抛错。"""
     last_err: Exception | None = None
+    source_names = {"_spot_snapshot_ak": "akshare", "_spot_snapshot_ef": "efinance",
+                    "_spot_snapshot_sina": "sina"}
     for fn in (_spot_snapshot_ak, _spot_snapshot_ef, _spot_snapshot_sina):
         if _cooldown_check(fn.__name__):
             log.info("spot source %s in cooldown, skip", fn.__name__)
@@ -191,16 +316,22 @@ def get_spot_snapshot() -> pd.DataFrame:
                       "turnover", "pct_chg", "open", "high", "low"):
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
+            source_name = source_names.get(fn.__name__, "akshare")
+            if "amount" in df.columns:
+                df["amount"] = df["amount"].map(lambda x: _normalise_amount(x, source_name))
+            for c in ("total_mv", "circ_mv"):
+                if c in df.columns:
+                    df[c] = df[c].map(lambda x: _normalise_market_cap(x, source_name))
             df = df.dropna(subset=["price"])
             if len(df) > 100:
                 if "pe" in df.columns:
                     df["pe_ttm"] = df["pe"]
-                _source_cooldown.pop(fn.__name__, None)
-                return df
+                _cooldown_clear(fn.__name__)
+                return df, source_name
             last_err = RuntimeError(f"{fn.__name__}: only {len(df)} valid rows")
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-            _cooldown_set(fn.__name__, 300.0)  # 该源冷却5分钟,避免连环重试触发更严限流
+            _cooldown_set(fn.__name__)  # 该源冷却(默认5分钟),避免连环重试触发更严限流
             log.warning("spot source %s failed: %s", fn.__name__, exc)
     raise RuntimeError(f"[data_gateway] spot_snapshot 三源均失败: {last_err}")
 
@@ -275,6 +406,7 @@ def _bs_code(code: str) -> str:
 
 @resilient("daily_hist_ak")
 def _daily_hist_ak(code: str, start: str, end: str) -> pd.DataFrame:
+    """东财个股日线:akshare 返回**前复权**(adjust="qfq")、成交量**手**。"""
     import akshare as ak
 
     df = ak.stock_zh_a_hist(symbol=code, period="daily",
@@ -284,12 +416,14 @@ def _daily_hist_ak(code: str, start: str, end: str) -> pd.DataFrame:
         "成交量": "volume", "成交额": "amount", "换手率": "turnover", "涨跌幅": "pct_chg",
     })
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    df["volume"] = df["volume"].map(lambda x: _normalise_volume(x, "akshare", lot_source=True))
     return df[["trade_date", "open", "high", "low", "close", "volume", "amount",
                "turnover", "pct_chg"]]
 
 
 @resilient("daily_hist_bs")
 def _daily_hist_bs(code: str, start: str, end: str) -> pd.DataFrame:
+    """baostock 个股日线:adjustflag="2" 为**前复权**、成交量**股**(无需×100)。"""
     import baostock as bs
 
     lg = bs.login()
@@ -312,6 +446,8 @@ def _daily_hist_bs(code: str, start: str, end: str) -> pd.DataFrame:
     df = df.rename(columns={"date": "trade_date", "turn": "turnover", "pctChg": "pct_chg"})
     for c in ("open", "high", "low", "close", "volume", "amount", "turnover", "pct_chg"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    # baostock volume 已是股(保持不变);其余数值列维持元/%口径
+    df["volume"] = df["volume"].map(lambda x: _normalise_volume(x, "baostock", lot_source=False))
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
     return df
 
@@ -324,13 +460,20 @@ def _sina_symbol(code: str) -> str:
 
 @resilient("daily_hist_sina")
 def _daily_hist_sina(code: str, start: str, end: str) -> pd.DataFrame:
-    """第三源:新浪个股日线(前复权)。本机对东财限流时的主力回填源。"""
+    """第三源:新浪个股日线(**前复权**,adjust="qfq";成交量**手**→统一为股)。
+
+    本机对东财限流时的主力回填源。新浪 variants 可能缺 pct_change 列,
+    此时由同一前复权 close 推导(与源端口径一致,%)。"""
     import akshare as ak
 
     df = ak.stock_zh_a_daily(symbol=_sina_symbol(code), adjust="qfq")
     df = df.rename(columns={"date": "trade_date", "volume": "volume", "amount": "amount",
-                            "turnover": "turnover", "pct_change": "pct_chg"})
+                            "turnover": "turnover", "pct_change": "pct_chg", "涨跌幅": "pct_chg"})
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    # 新浪 variants may omit pct_change; derive it from the same adjusted close.
+    if "pct_chg" not in df.columns or df["pct_chg"].isna().all():
+        df["pct_chg"] = pd.to_numeric(df["close"], errors="coerce").pct_change().fillna(0.0) * 100
+    df["volume"] = df["volume"].map(lambda x: _normalise_volume(x, "sina", lot_source=True))
     s = datetime.strptime(start, "%Y%m%d").date()
     e = datetime.strptime(end, "%Y%m%d").date()
     df = df[(df["trade_date"] >= s) & (df["trade_date"] <= e)]
@@ -340,13 +483,15 @@ def _daily_hist_sina(code: str, start: str, end: str) -> pd.DataFrame:
 
 @resilient("daily_hist_tx")
 def _daily_hist_tx(code: str, start: str, end: str) -> pd.DataFrame:
-    """第二源:腾讯个股日线(前复权;无换手率,成交量以 amount 列近似,pct_chg 自算)。"""
+    """第二源:腾讯个股日线(**前复权**,adjust="qfq";无换手率;成交量**手**→统一为股,
+    用原 amount 列近似,pct_chg 自算)。"""
     import akshare as ak
 
     sym = ("sh" if code.startswith(("6", "5")) else "sz") + code
     df = ak.stock_zh_a_hist_tx(symbol=sym, start_date=start, end_date=end, adjust="qfq")
     df = df.rename(columns={"date": "trade_date", "amount": "volume"})
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    df["volume"] = df["volume"].map(lambda x: _normalise_volume(x, "tx", lot_source=True))
     df["amount"] = 0.0
     df["turnover"] = 0.0
     df["pct_chg"] = df["close"].astype(float).pct_change().fillna(0.0) * 100
@@ -362,11 +507,11 @@ def get_daily_history(code: str, start: str, end: str | None = None,
     if source in ("auto", "akshare") and not _cooldown_check("daily_hist_ak"):
         try:
             df = _daily_hist_ak(code, start, end)
-            _source_cooldown.pop("daily_hist_ak", None)
+            _cooldown_clear("daily_hist_ak")
             return df, "akshare"
         except Exception as exc:  # noqa: BLE001
             log.warning("daily akshare failed for %s: %s", code, exc)
-            _cooldown_set("daily_hist_ak", 600.0)  # 东财限流后10分钟内不再逐股重试
+            _cooldown_set("daily_hist_ak")  # 东财限流后冷却(见 _SOURCE_COOLDOWN_SECONDS)
     elif source == "akshare":
         raise RuntimeError("[data_gateway] daily akshare 指定源不可用(冷却中)")
     if source in ("auto", "tx"):
@@ -427,19 +572,30 @@ def _index_daily_sina(index_code: str, start: str, end: str) -> pd.DataFrame:
 
 def get_index_daily(index_code: str, start: str, end: str | None = None) -> pd.DataFrame:
     """指数日线,三源降级(东财→腾讯→新浪)。列:trade_date,open,high,low,close,amount。"""
+    df, _ = get_index_daily_with_source(index_code, start, end)
+    return df
+
+
+def get_index_daily_with_source(index_code: str, start: str,
+                                end: str | None = None) -> tuple[pd.DataFrame, str]:
+    """指数日线 + 数据来源(向后兼容:get_index_daily 只返回 DataFrame)。
+    返回 (df, source),source∈{"em","tx","sina"}。三源均失败抛错。"""
     end = end or today().strftime("%Y%m%d")
     last_err: Exception | None = None
+    source_names = {"_index_daily_em": "em", "_index_daily_tx": "tx",
+                    "_index_daily_sina": "sina"}
     for fn in (_index_daily_em, _index_daily_tx, _index_daily_sina):
         if _cooldown_check(fn.__name__):
             continue
         try:
             df = fn(index_code, start, end)
             if len(df) >= 30:
-                return df
+                _cooldown_clear(fn.__name__)
+                return df, source_names.get(fn.__name__, fn.__name__)
             last_err = RuntimeError(f"{fn.__name__}: only {len(df)} rows")
         except Exception as exc:  # noqa: BLE001
             last_err = exc
-            _cooldown_set(fn.__name__, 300.0)
+            _cooldown_set(fn.__name__)
             log.warning("index daily source %s failed: %s", fn.__name__, exc)
     raise RuntimeError(f"[data_gateway] index_daily({index_code}) 三源均失败: {last_err}")
 
@@ -460,11 +616,85 @@ def get_market_total_amount(start: str, end: str | None = None) -> pd.DataFrame:
     return total.rename("amount").reset_index()
 
 
+# ---------------- 指数模块(P0-2:仪表盘指数条) ----------------
+
+INDEX_DISPLAY: list[tuple[str, str]] = [
+    ("sh000001", "上证指数"), ("sz399001", "深证成指"), ("sz399006", "创业板指"),
+    ("sh000688", "科创50"), ("sh000300", "沪深300"), ("sh000905", "中证500"),
+]
+
+
+def get_index_spot() -> pd.DataFrame:
+    """指数实时点位兜底(ak.stock_zh_index_spot);失败返回空 df 不抛错。"""
+    try:
+        import akshare as ak
+
+        _rate_limit()
+        return ak.stock_zh_index_spot()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("index spot failed: %s", exc)
+        return pd.DataFrame()
+
+
 # ---------------- 行业板块 ----------------
 
+# 同花顺概念名单映射(本地可用,已验证 375 行):
+# 固态电池308294/存储芯片307940/PCB概念308832/共封装光学(CPO)309049/
+# 中芯国际概念308690/东数西算308828(≈AI算力)/算力租赁309068/减速器309000(≈电机)。
+# THS 无成分函数,只能做名单存在性核验+占位,真实成分由本地展开(种子/行业/关键词)。
+TRACK_THS_MAP: dict[str, str] = {
+    # 键同时收录赛道名与 concept_board 名(两者不一致的赛道都要能命中):
+    # 半导体/中芯概念→308690, 光模块/CPO概念→309049, 电机/减速器→309000,
+    # AI算力/算力概念→308828(东数西算)。
+    "固态电池": "308294",
+    "半导体": "308690", "中芯概念": "308690",
+    "PCB": "308832",
+    "光模块": "309049", "CPO概念": "309049",
+    "存储芯片": "307940",
+    "电机": "309000", "减速器": "309000",
+    "AI算力": "308828", "算力概念": "308828",
+}
+
+
+@resilient("concept_board_ths")
+def _concept_board_cons_ths(board_name: str) -> pd.DataFrame:
+    """同花顺名单核验:ak.stock_board_concept_name_ths() 名单存在即返回占位标记行。
+
+    列:code,name,ths_code;code 取 "THS:"+ths_code 特殊标记(如 "THS:308294"),
+    name 取 board_name。名单未命中抛错,由上游降级到 sina/keyword/local。
+    真实成分由 universe_manager 按 TRACK_SEED_MAP 展开,网关层只管核验。
+    """
+    import akshare as ak
+
+    names_df = ak.stock_board_concept_name_ths()
+    # 兼容列名变体:名字列含"名称"/"概念"/"板块"/"name",代码列含"代码"/"code"
+    name_col = next((c for c in names_df.columns
+                     if any(k in c for k in ("名称", "概念", "板块", "name"))), None)
+    code_col = next((c for c in names_df.columns if "代码" in c or c == "code"), None)
+    if name_col is None:
+        raise RuntimeError(f"ths concept name list columns missing: {list(names_df.columns)}")
+    names = names_df[name_col].astype(str).tolist()
+    codes = names_df[code_col].astype(str).tolist() if code_col else [""] * len(names)
+    ths_code: str | None = None
+    # ① 内置映射优先:board_name 在 TRACK_THS_MAP 且该 code 在名单内
+    mapped = TRACK_THS_MAP.get(board_name)
+    if mapped and any(mapped in str(c) for c in codes):
+        ths_code = mapped
+    else:
+        # ② 名字包含匹配(board_name 与名单名双向包含)
+        for n, c in zip(names, codes):
+            if board_name in n or n in board_name:
+                ths_code = str(c)
+                break
+    if not ths_code:
+        raise RuntimeError(f"ths concept board list misses {board_name!r}")
+    return pd.DataFrame([{"code": f"THS:{ths_code}", "name": board_name,
+                          "ths_code": ths_code}])
+
+
 @resilient("concept_board_members")
-def get_concept_board_members(board_name: str) -> pd.DataFrame:
-    """东财概念板块成分。列:code,name(供赛道成分同步;被墙时抛错由上层转友好提示)。"""
+def _concept_board_cons_em(board_name: str) -> pd.DataFrame:
+    """东财概念板块成分(主源)。列:code,name。"""
     import akshare as ak
 
     df = ak.stock_board_concept_cons_em(symbol=board_name)
@@ -472,6 +702,116 @@ def get_concept_board_members(board_name: str) -> pd.DataFrame:
         "code": df["代码"].astype(str).str.zfill(6),
         "name": df["名称"].astype(str),
     })
+
+
+@resilient("concept_board_sina")
+def _concept_board_cons_sina(board_name: str) -> pd.DataFrame:
+    """新浪降级:全概念列表名字包含匹配后,再调一次 cons_em。列:code,name。"""
+    import akshare as ak
+
+    names_df = ak.stock_board_concept_name_em()
+    name_col = next((c for c in ("板块名称", "概念名称", "名称", "板块")
+                     if c in names_df.columns), None)
+    if name_col is None:
+        raise RuntimeError("concept name list columns missing: "
+                           f"{list(names_df.columns)}")
+    candidates = names_df[name_col].astype(str).tolist()
+    matched: str | None = None
+    if board_name in candidates:
+        matched = board_name
+    else:
+        for c in candidates:
+            if board_name in c or c in board_name:
+                matched = c
+                break
+    if matched is None:
+        raise RuntimeError(f"no concept board name matches {board_name!r}")
+    df = ak.stock_board_concept_cons_em(symbol=matched)
+    return pd.DataFrame({
+        "code": df["代码"].astype(str).str.zfill(6),
+        "name": df["名称"].astype(str),
+    })
+
+
+def _concept_board_keyword(board_name: str, track=None) -> pd.DataFrame:
+    """关键词兜底:全市场快照按名称/代码包含过滤。列:code,name。
+
+    三层命中(任一即收录):① track.keywords 逗号切词逐词 name/industry 包含
+    (大小写不敏感,str.contains case=False);② track.industry_index 等值
+    (industry == industry_index);③ board_name 自身。track 为 None 时保持原
+    board_name 行为。"""
+    snap = get_spot_snapshot()
+    terms: list[str] = []
+    if track is not None and getattr(track, "keywords", None):
+        terms = [w.strip() for w in str(track.keywords).replace("，", ",")
+                 .replace("、", ",").split(",") if w.strip()]
+    ifc = snap.get("industry", pd.Series("", index=snap.index)).astype(str)
+    name_s = snap["name"].astype(str)
+    mask_kw = pd.Series(False, index=snap.index)
+    for w in terms:
+        mask_kw = (mask_kw
+                   | name_s.str.contains(w, na=False, case=False)
+                   | ifc.str.contains(w, na=False, case=False))
+    mask_ind = pd.Series(False, index=snap.index)
+    idx = getattr(track, "industry_index", "") if track is not None else ""
+    if idx:
+        mask_ind = ifc == idx
+    mask_board = (name_s.str.contains(board_name, na=False)
+                  | snap["code"].astype(str).str.contains(board_name, na=False))
+    mask = mask_kw | mask_ind | mask_board
+    out = snap.loc[mask, ["code", "name"]].drop_duplicates("code").copy()
+    if out.empty:
+        raise RuntimeError(f"keyword fallback matched nothing for {board_name!r}")
+    return out
+
+
+def get_concept_board_members_with_source(board_name: str, track=None) -> tuple[pd.DataFrame, str]:
+    """概念板块成分四源降级(东财→同花顺名单核验→新浪名字匹配→全市场关键词过滤)。
+
+    ths 源只做"名单存在性核验+占位":返回 THS: 标记行(列 code,name,ths_code),
+    真实成分由 universe_manager 按 TRACK_SEED_MAP 展开。
+    返回 (df, source),source∈{"eastmoney","ths","sina","keyword"};四源皆失败才抛错。
+    """
+    last_err: Exception | None = None
+    try:
+        df = _concept_board_cons_em(board_name)
+        if len(df) > 0:
+            return df, "eastmoney"
+        last_err = RuntimeError("_concept_board_cons_em: empty result")
+    except Exception as exc:  # noqa: BLE001
+        last_err = exc
+        log.warning("concept board eastmoney failed for %s: %s", board_name, exc)
+    try:
+        df = _concept_board_cons_ths(board_name)
+        if len(df) > 0:
+            return df, "ths"
+        last_err = RuntimeError("_concept_board_cons_ths: empty result")
+    except Exception as exc:  # noqa: BLE001
+        last_err = exc
+        log.warning("concept board ths fallback failed for %s: %s", board_name, exc)
+    try:
+        df = _concept_board_cons_sina(board_name)
+        if len(df) > 0:
+            return df, "sina"
+        last_err = RuntimeError("_concept_board_cons_sina: empty result")
+    except Exception as exc:  # noqa: BLE001
+        last_err = exc
+        log.warning("concept board sina fallback failed for %s: %s", board_name, exc)
+    try:
+        df = _concept_board_keyword(board_name, track)
+        return df, "keyword"
+    except Exception as exc:  # noqa: BLE001
+        last_err = exc
+        log.warning("concept board keyword fallback failed for %s: %s", board_name, exc)
+    raise RuntimeError(f"[data_gateway] concept_board({board_name}) 四源均失败: {last_err}")
+
+
+def get_concept_board_members(board_name: str, track=None) -> pd.DataFrame:
+    """东财概念板块成分(向后兼容:只返回 DataFrame,来源见 with_source 版本)。
+
+    列:code,name(供赛道成分同步;四源皆失败时抛错由上层转友好提示)。"""
+    df, _ = get_concept_board_members_with_source(board_name, track)
+    return df
 
 
 @resilient("industry_spot_sina")
@@ -497,13 +837,13 @@ def get_industry_board_list() -> pd.DataFrame:
             import akshare as ak
 
             df = ak.stock_board_industry_name_em()
-            _source_cooldown.pop("industry_board_list", None)
+            _cooldown_clear("industry_board_list")
             return pd.DataFrame({
                 "board_code": df["板块代码"].astype(str),
                 "board_name": df["板块名称"].astype(str),
             })
         except Exception as exc:  # noqa: BLE001
-            _cooldown_set("industry_board_list", 600.0)  # 东财失败冷却10分钟,直接走新浪
+            _cooldown_set("industry_board_list")  # 东财失败冷却,直接走新浪
             log.warning("industry board em failed, fallback to sina: %s", exc)
     spot = get_industry_spot_sina()
     return spot[["board_code", "board_name"]]
@@ -537,6 +877,83 @@ def get_industry_fund_flow() -> pd.DataFrame:
         "fund_flow": pd.to_numeric(df[col_flow], errors="coerce") / 1e8,
     })
     return out
+
+
+@resilient("concept_fund_flow")
+def get_concept_fund_flow() -> pd.DataFrame:
+    """东财概念主力资金流(今日,go-stock concept_fund_flow 思路)。
+
+    列:board_name,fund_flow(亿)[,board_code 有则带出];失败抛错由上层处理。"""
+    import akshare as ak
+
+    df = ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="概念资金流")
+    col_name = "名称" if "名称" in df.columns else "概念名称"
+    col_flow = "今日主力净流入-净额" if "今日主力净流入-净额" in df.columns else None
+    if col_flow is None:
+        raise RuntimeError("concept fund flow columns missing")
+    out = pd.DataFrame({
+        "board_name": df[col_name].astype(str),
+        "fund_flow": pd.to_numeric(df[col_flow], errors="coerce") / 1e8,
+    })
+    code_col = next((c for c in ("板块代码", "代码", "概念代码") if c in df.columns), None)
+    out["board_code"] = df[code_col].astype(str) if code_col else ""
+    return out
+
+
+@resilient("market_stat_spot")
+def get_market_stat_spot() -> dict:
+    """大盘统计实时聚合(go-stock MarketStatistic 思路):涨跌/涨跌停家数与成交额。
+
+    优先 ak.stock_market_activity_legu(),失败降级 stock_zh_a_spot() 全市场聚合;
+    字段名做兼容:含 "涨跌幅" 列时 advance=(pct>0).sum() 等;涨停用 pct>=9.9 近似
+    并标注 source_note="limit_up≈pct>=9.9"。失败抛错由上层处理。"""
+    import akshare as ak
+
+    # 首选:乐咕市场活跃度(结构化涨跌家数)
+    try:
+        _rate_limit()
+        df = ak.stock_market_activity_legu()
+        cols = list(df.columns)
+        item_col = next((c for c in cols if "项" in c or "名称" in c or "指标" in c), cols[0])
+        num_col = next((c for c in cols if "数" in c or "值" in c), cols[-1])
+        items = {str(r[0]).strip(): r[1] for r in df[[item_col, num_col]].itertuples(index=False)}
+
+        def _pick(*keys: str) -> float:
+            for k in keys:
+                for name, val in items.items():
+                    if k in name:
+                        try:
+                            return float(val)
+                        except (TypeError, ValueError):
+                            continue
+            return 0.0
+
+        advance = _pick("上涨")
+        decline = _pick("下跌")
+        limit_up = _pick("涨停")
+        limit_down = _pick("跌停")
+        amount = _pick("成交额", "成交金额")
+        if advance or decline:
+            return {"advance": int(advance), "decline": int(decline),
+                    "limit_up": int(limit_up), "limit_down": int(limit_down),
+                    "amount_total": float(amount) / 1e8 if amount > 1e6 else float(amount),
+                    "source": "legu", "source_note": ""}
+    except Exception as exc:  # noqa: BLE001 降级到全市场快照聚合
+        log.warning("market stat legu failed, fallback to spot: %s", exc)
+
+    _rate_limit()
+    df = ak.stock_zh_a_spot()
+    pct_col = next((c for c in ("涨跌幅", "涨跌幅(%)", "pct_chg") if c in df.columns), None)
+    if pct_col is None:
+        raise RuntimeError("market stat columns missing: no 涨跌幅 column")
+    pct = pd.to_numeric(df[pct_col], errors="coerce").fillna(0.0)
+    amt_col = next((c for c in ("成交额", "成交金额", "amount") if c in df.columns), None)
+    amount_total = (pd.to_numeric(df[amt_col], errors="coerce").fillna(0.0).sum() / 1e8
+                    if amt_col else 0.0)
+    return {"advance": int((pct > 0).sum()), "decline": int((pct < 0).sum()),
+            "limit_up": int((pct >= 9.9).sum()), "limit_down": int((pct <= -9.9).sum()),
+            "amount_total": float(amount_total),
+            "source": "spot", "source_note": "limit_up≈pct>=9.9"}
 
 
 # ---------------- 财务(业绩报表批量, point-in-time 公告日) ----------------
@@ -661,6 +1078,89 @@ def get_stock_news(code: str) -> pd.DataFrame:
     df = df.rename(columns={"发布时间": "publish_time", "新闻标题": "title", "新闻内容": "summary"})
     df["publish_time"] = pd.to_datetime(df["publish_time"], errors="coerce")
     return df[["publish_time", "title", "summary"]].head(20)
+
+
+# ---------------- 龙虎榜(游资席位映射) ----------------
+
+_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+
+
+def load_hot_money_seats() -> dict[str, dict]:
+    """游资席位映射表:seat(营业部全称) → {trader, style, risk}。
+
+    读 backend/data/hot_money_seats.json;缺文件返回 {} 不抛错(调用方降级为空匹配)。"""
+    path = _DATA_DIR / "hot_money_seats.json"
+    try:
+        items = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        log.warning("hot_money_seats.json missing at %s, match disabled", path)
+        return {}
+    except Exception as exc:  # noqa: BLE001 脏 JSON 同样降级不抛错
+        log.warning("hot_money_seats.json parse failed: %s", exc)
+        return {}
+    out: dict[str, dict] = {}
+    for it in items if isinstance(items, list) else []:
+        seat = str(it.get("seat", "")).strip()
+        if seat:
+            out[seat] = {"trader": str(it.get("trader", "")),
+                         "style": str(it.get("style", "")),
+                         "risk": str(it.get("risk", ""))}
+    return out
+
+
+def _coerce_trade_date_str(trade_date) -> str:
+    """ak.stock_lhb_detail_em 的日期参数:统一为 YYYYMMDD 字符串。"""
+    if trade_date is None:
+        return today().strftime("%Y%m%d")
+    if isinstance(trade_date, (datetime, date)):
+        return trade_date.strftime("%Y%m%d")
+    s = str(trade_date).strip().replace("-", "")
+    return s if len(s) == 8 and s.isdigit() else today().strftime("%Y%m%d")
+
+
+@resilient("lhb_daily")
+def get_lhb_daily(trade_date=None) -> pd.DataFrame:
+    """龙虎榜日明细(东财):列 code/name/trade_date/close/pct_chg(涨跌幅%)/lhb_net(万)/buy_seats/sell_seats。
+
+    trade_date: date/datetime/'YYYYMMDD' 均可,缺省今天。实现按该日期单日抓取
+    stock_lhb_detail_em,再逐股调 stock_lhb_stock_detail_em 取买卖前五席位。
+    失败抛错(由上层 task 记 failed)。"""
+    import akshare as ak
+
+    ds = _coerce_trade_date_str(trade_date)
+    detail = ak.stock_lhb_detail_em(start_date=ds, end_date=ds)
+    detail = detail.rename(columns={"代码": "code", "名称": "name", "收盘价": "close",
+                                    "涨跌幅": "pct_chg", "龙虎榜净买额": "lhb_net"})
+    detail["code"] = detail["code"].astype(str).str.zfill(6)
+    # 上榜日列名在不同版本为"上榜日"/"上榜日期",缺失则用请求日
+    date_col = next((c for c in ("上榜日", "上榜日期", "trade_date") if c in detail.columns), None)
+    td = pd.to_datetime(detail[date_col], errors="coerce").dt.date if date_col else None
+    rows = []
+    for _, r in detail.iterrows():
+        code = r["code"]
+        tdate = td.loc[r.name] if td is not None and pd.notna(td.loc[r.name]) \
+            else datetime.strptime(ds, "%Y%m%d").date()
+        if hasattr(tdate, "date"):
+            tdate = tdate.date()
+        buy_seats: list[str] = []
+        sell_seats: list[str] = []
+        for flag, bucket in (("买入", buy_seats), ("卖出", sell_seats)):
+            try:
+                _rate_limit()
+                seat_df = _run_with_timeout(
+                    ak.stock_lhb_stock_detail_em, settings.fetch_timeout_seconds,
+                    symbol=code, date=tdate.strftime("%Y%m%d"), flag=flag)
+                if seat_df is not None and "交易营业部名称" in seat_df.columns:
+                    bucket.extend(seat_df["交易营业部名称"].astype(str).str.strip().tolist())
+            except Exception as exc:  # noqa: BLE001 单股席位失败不拖垮整批
+                log.warning("lhb seats %s %s failed: %s", code, flag, exc)
+        rows.append({"code": code, "name": str(r.get("name", "")),
+                     "trade_date": tdate, "close": float(r.get("close") or 0.0),
+                     "pct_chg": float(r.get("pct_chg") or 0.0),
+                     "lhb_net": float(r.get("lhb_net") or 0.0) / 1e4,
+                     "buy_seats": buy_seats, "sell_seats": sell_seats})
+    return pd.DataFrame(rows, columns=["code", "name", "trade_date", "close", "pct_chg",
+                                       "lhb_net", "buy_seats", "sell_seats"])
 
 
 # ---------------- 商品期货主力连续(涨价周期跟踪) ----------------
