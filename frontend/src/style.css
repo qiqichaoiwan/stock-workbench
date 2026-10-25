@@ -1,0 +1,57 @@
+html, body, #app { height: 100%; margin: 0; }
+body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #f5f7fa; }
+
+.page-card { margin-bottom: 16px; }
+.page-card .el-card__header { font-weight: 600; }
+.stat-num { font-size: 22px; font-weight: 700; }
+.stat-sub { color: #909399; font-size: 12px; }
+
+/* A股口径:红涨绿跌 */
+.up { color: #f56c6c; }
+.down { color: #67c23a; }
+.num { font-variant-numeric: tabular-nums; }
+
+.muted { color: #909399; }
+.tag-pre { white-space: pre-wrap; font-size: 12px; }
+.el-table .cell { font-size: 13px; }
+
+/* 卡片头部操作按钮统一右侧对齐 */
+.card-head { display: flex; align-items: center; gap: 10px; }
+.card-head .grow { flex: 1; }
+
+/* 分页条 */
+.pager { display: flex; justify-content: flex-end; margin-top: 12px; }
+
+/* 空状态紧凑化 */
+.compact-empty .el-empty { padding: 18px 0; }
+
+/* 卡片头部工具行允许换行(窄屏) */
+.card-head { flex-wrap: wrap; row-gap: 8px; }
+
+/* ---------- 移动端(<=768px) ---------- */
+@media (max-width: 768px) {
+  /* 对话框不超过屏宽,内容区可滚动 */
+  .el-dialog { width: 92vw !important; max-width: 92vw !important; margin-top: 6vh !important; }
+  .el-dialog__body { max-height: 64vh; overflow-y: auto; }
+
+  /* 分页只保留翻页核心,避免溢出 */
+  .el-pagination__total, .el-pagination__sizes, .el-pagination__jump,
+  .el-pagination .el-pagination__rightwrapper { display: none !important; }
+
+  /* 消息提示不超宽 */
+  .el-message { max-width: 88vw; }
+
+  /* 抽屉菜单贴合深色侧栏 */
+  .m-drawer .el-drawer__body { padding: 0; background: #1d2530; overflow-y: auto; }
+
+  /* 主内容留白收紧 */
+  .main { padding: 10px !important; }
+  .page-card { margin-bottom: 10px; }
+  .page-card .el-card__body { padding: 10px; }
+
+  /* 头部用户昵称截断保护 */
+  .user-chip .user-name { max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* 表格横向滚动更顺滑 */
+  .el-table { -webkit-overflow-scrolling: touch; }
+}

@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  stock-workbench:
+    build: .
+    container_name: stock-workbench
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+      # 生产环境务必修改 JWT 密钥并提供 Fernet 主密钥(可用 python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())")
+      - JWT_SECRET=${JWT_SECRET:?请在 .env 或环境变量设置 JWT_SECRET(可用 openssl rand -hex 32 生成)}
+      - FERNET_KEY=${FERNET_KEY:-}
+      # 系统兜底 LLM(可选;用户可在界面自配)
+      - DEFAULT_LLM_BASE_URL=${DEFAULT_LLM_BASE_URL:-}
+      - DEFAULT_LLM_API_KEY=${DEFAULT_LLM_API_KEY:-}
+      - DEFAULT_LLM_MODEL=${DEFAULT_LLM_MODEL:-}

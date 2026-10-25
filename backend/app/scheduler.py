@@ -1,0 +1,99 @@
+"""定时任务调度(APScheduler,交易日本地时区 Asia/Shanghai)。
+
+任务链(收盘后流水线顺序依赖,各步独立容错):
+  09:35-15:05 每30分钟  盘中快照
+  11:40 / 14:40         新闻低频采集
+  15:35                 日线落库(快照口径)+ 股票基础信息
+  16:05                 估值 + 行业监测 + 商品 + 市场状态 + 技术信号
+  16:35                 财务增量
+  17:05                 策略漏斗 + 池表现
+  周五 17:45            逐用户周报
+"""
+import logging
+
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from .config import settings
+from .shared import data_gateway as dg
+from .task_runner import run_task
+
+log = logging.getLogger("scheduler")
+
+_scheduler: BackgroundScheduler | None = None
+
+
+def _guarded(name: str, **kwargs):
+    """非交易日自动跳过 + 异常吞掉(APScheduler 线程内不允许抛出)。"""
+    try:
+        if not dg.is_trade_day():
+            log.info("skip task %s: not a trade day", name)
+            return
+        result = run_task(name, **kwargs)
+        log.info("scheduled task %s -> %s", name, result)
+    except Exception as exc:  # noqa: BLE001
+        log.error("scheduled task %s failed: %s", name, exc)
+
+
+def build_scheduler() -> BackgroundScheduler:
+    sched = BackgroundScheduler(timezone=settings.tz)
+    interval = settings.intraday_interval_minutes
+
+    sched.add_job(_guarded, "cron", args=["intraday_snapshot"],
+                  day_of_week="mon-fri", hour="9-14", minute=f"*/{interval}",
+                  id="intraday_snapshot", max_instances=1, coalesce=True)
+
+    for hm in ((11, 40), (14, 40)):
+        sched.add_job(_guarded, "cron", args=["news"],
+                      day_of_week="mon-fri", hour=hm[0], minute=hm[1],
+                      id=f"news_{hm[0]}{hm[1]}", max_instances=1, coalesce=True)
+
+    sched.add_job(_guarded, "cron", args=["sync_quotes"],
+                  day_of_week="mon-fri", hour=15, minute=35,
+                  id="sync_quotes", max_instances=1, coalesce=True)
+    sched.add_job(_guarded, "cron", args=["sync_basic"],
+                  day_of_week="mon-fri", hour=15, minute=45,
+                  id="sync_basic", max_instances=1, coalesce=True)
+
+    for name, minute in (("sync_valuation", 5), ("industry_daily", 15),
+                         ("commodities", 20), ("market_state", 30), ("signals", 40)):
+        sched.add_job(_guarded, "cron", args=[name],
+                      day_of_week="mon-fri", hour=16, minute=minute,
+                      id=f"eod_{name}", max_instances=1, coalesce=True)
+
+    sched.add_job(_guarded, "cron", args=["sync_financials"],
+                  day_of_week="mon-fri", hour=16, minute=35,
+                  id="sync_financials", max_instances=1, coalesce=True)
+
+    sched.add_job(_guarded, "cron", args=["strategy"],
+                  day_of_week="mon-fri", hour=17, minute=5,
+                  id="strategy", max_instances=1, coalesce=True)
+
+    sched.add_job(_guarded, "cron", args=["weekly_reports"],
+                  day_of_week="fri", hour=17, minute=45,
+                  id="weekly_reports", max_instances=1, coalesce=True)
+
+    # 每周一 08:30 同步指数成分与赛道(低频维护)
+    sched.add_job(_guarded, "cron", args=["sync_members"],
+                  day_of_week="mon", hour=8, minute=30,
+                  id="weekly_members", max_instances=1, coalesce=True)
+    sched.add_job(_guarded, "cron", args=["sync_tracks"],
+                  day_of_week="mon", hour=8, minute=40,
+                  id="weekly_tracks", max_instances=1, coalesce=True)
+    return sched
+
+
+def start_scheduler() -> BackgroundScheduler:
+    global _scheduler
+    if _scheduler is None:
+        _scheduler = build_scheduler()
+        _scheduler.start()
+        log.info("scheduler started")
+    return _scheduler
+
+
+def stop_scheduler() -> None:
+    global _scheduler
+    if _scheduler is not None:
+        _scheduler.shutdown(wait=False)
+        _scheduler = None

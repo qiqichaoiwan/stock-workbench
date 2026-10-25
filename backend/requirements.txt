@@ -1,0 +1,17 @@
+fastapi==0.121.1
+uvicorn[standard]==0.40.0
+sqlalchemy==2.0.44
+pydantic==2.12.4
+pydantic-settings==2.13.0
+python-multipart==0.0.20
+pyjwt==2.10.1
+bcrypt==4.2.1
+cryptography==44.0.2
+httpx==0.28.1
+apscheduler==3.11.0
+pandas==2.3.3
+numpy==2.3.4
+akshare==1.18.12
+baostock==0.8.9
+efinance==0.5.7
+openai==1.109.1
