@@ -1,13 +1,16 @@
 """定时任务调度(APScheduler,交易日本地时区 Asia/Shanghai)。
 
-任务链(收盘后流水线顺序依赖,各步独立容错):
-  09:35-15:05 每30分钟  盘中快照
+任务链(收盘后流水线顺序依赖,各步独立容错;与 build_scheduler 内 cron 保持同步):
+  09:00-14:30 每30分钟  盘中快照(9:00 在集合竞价前仅作留痕,有效序列从 9:35 起)
+  09:35/10:05-13:35/14:05  fund_flow + market_stat + watch_alert(三任务各错峰 1 分钟)
   11:40 / 14:40         新闻低频采集
   15:35                 日线落库(快照口径)+ 股票基础信息
-  16:05                 估值 + 行业监测 + 商品 + 市场状态 + 技术信号
+  15:50                 持仓巡检(G03 止损推进,唯一写入口)
+  16:05-16:40           估值 + 行业监测 + 商品 + 市场状态 + 技术信号 + 指数
   16:35                 财务增量
-  17:05                 策略漏斗 + 池表现
+  17:05                 策略漏斗 + 池表现;17:10 龙虎榜
   周五 17:45            逐用户周报
+  周一 08:30/08:40      指数成分 + 赛道维护
 """
 import logging
 
@@ -46,12 +49,13 @@ def build_scheduler() -> BackgroundScheduler:
                   day_of_week="mon-fri", hour="9-14", minute=f"*/{interval}",
                   id="intraday_snapshot", max_instances=1, coalesce=True)
 
-    # P1-1/P1-2/P1-3 盘中快照性质(与 intraday 同节奏,9:35-14:05 每30分钟):
-    # fund_flow(板块概念资金流) + market_stat(大盘统计) + watch_alert(自购三价预警,
-    # 只读不写止损);单任务失败隔离,不阻塞 intraday 主快照。
-    for name in ("fund_flow", "market_stat", "watch_alert"):
+    # P1 盘中快照(9:35-14:05 每30分钟):fund_flow(板块概念资金流) +
+    # market_stat(大盘统计) + watch_alert(自购三价预警,只读不写止损)。
+    # 三任务各错峰 1 分钟(35/36/37),避免与 intraday 同分钟齐发挤占 SQLite 写锁。
+    for i, name in enumerate(("fund_flow", "market_stat", "watch_alert")):
+        m = 35 + i
         sched.add_job(_guarded, "cron", args=[name],
-                      day_of_week="mon-fri", hour=9, minute=35,
+                      day_of_week="mon-fri", hour=9, minute=m,
                       id=f"intraday_{name}_0935", max_instances=1, coalesce=True)
         sched.add_job(_guarded, "cron", args=[name],
                       day_of_week="mon-fri", hour="10-13", minute="5,35",

@@ -4,6 +4,7 @@
 ST/停牌/次新/市值过滤在策略阶段做,这里只管"范围"。
 """
 import logging
+import re
 from datetime import datetime, timezone
 from datetime import date
 
@@ -25,17 +26,26 @@ TRACK_SOURCE_MAP = {"eastmoney": "concept_board", "sina": "concept_board_sina",
                     "local": "concept_board_local",
                     "local_ths_verified": "concept_board_ths"}
 
-# 赛道代表股(库内代码,已验证有效):同一股票可属多赛道,重叠是刻意的。
+# 赛道代表股(种子为代表股,人工维护;库内代码,已验证有效):
+# 同一股票可属多赛道,重叠是刻意的。
 TRACK_SEED_MAP: dict[str, list[str]] = {
     "固态电池": ["300750", "300014", "300207", "002074", "300037"],
     "半导体": ["688981", "603986", "603501", "688012", "688008", "300223"],
     "PCB": ["002463", "002916", "600183", "002384"],
     "光模块": ["300308", "300502", "300394", "002281"],
-    "存储芯片": ["603986", "300223", "002463", "002384"],
-    "电机": ["300124", "600580", "603728"],
-    "AI算力": ["000977", "603019", "601138", "000938", "002475", "002050",
-             "300037", "002635"],
+    "存储芯片": ["603986", "300223", "002463", "002384", "301308", "688525"],
+    "电机": ["300124", "600580", "603728", "002050"],
+    "AI算力": ["000977", "603019", "601138", "000938", "002475", "002635"],
 }
+
+# 真实 A 股代码格式(6 位数字);THS:xxxx 等占位码不符合。
+_SIX_DIGIT_CODE = re.compile(r"^\d{6}$")
+
+
+class DegradedSourceError(ValueError):
+    """成分源处于降级链(ths/sina/keyword),差集清理不可信,拒绝执行。
+
+    ValueError 子类:API 层按 409 转换(区别于参数错误的 422)。"""
 
 # 赛道→行业名映射(StockBasic.industry 等值匹配用)。
 TRACK_INDUSTRY_MAP: dict[str, list[str]] = {
@@ -105,15 +115,26 @@ def sync_stock_basic(db: Session) -> int:
             "total_mv": float(r.get("total_mv") or 0), "circ_mv": float(r.get("circ_mv") or 0),
         })
     existing = {c: s for c, s in db.execute(select(StockBasic.code, StockBasic.status))}
+    seen = set()
     for r in rows:
+        seen.add(r["code"])
         obj = db.get(StockBasic, r["code"])
         if obj is None:
             db.add(StockBasic(**r))
         else:
             obj.name, obj.board, obj.is_st = r["name"], r["board"], r["is_st"]
             obj.total_mv, obj.circ_mv = r["total_mv"], r["circ_mv"]
-            if obj.status == "delisted" and r["code"] not in existing or True:
-                obj.status = "active"
+            # 快照里仍出现 → 在市(原恒真死条件,顺带恢复撤消退市的股票)
+            obj.status = "active"
+    # 消失的股票标记退市:仅当快照完整(≥3000 只)时执行,防止半截快照误伤全市场
+    if len(seen) >= 3000:
+        gone = [c for c, s in existing.items() if c not in seen and s != "delisted"]
+        for code in gone:
+            obj = db.get(StockBasic, code)
+            if obj is not None:
+                obj.status = "delisted"
+        if gone:
+            log.warning("marked %d disappeared stocks as delisted", len(gone))
     db.commit()
     return len(rows)
 
@@ -165,12 +186,15 @@ def _local_expand_track(db: Session, track: Track) -> tuple[pd.DataFrame, str]:
 
 
 def sync_track_members(db: Session, track: Track) -> int:
-    """四源降级拉取赛道成分(东财→同花顺名单核验→新浪名字匹配→关键词过滤→本地展开),只增不减。
+    """四源降级拉取赛道成分(东财→同花顺名单核验→新浪名字匹配→关键词过滤→本地展开)。
 
     ths 源只做"名单存在性核验+占位":丢弃 THS: 占位行,按 TRACK_SEED_MAP 展开为
     真实成分(列 code,name 取 StockBasic 名),source 改写为 "local_ths_verified";
     无 concept_board 的 track 直接走本地展开(source "local");
     keyword 源返回时再用 track 参数重跑一遍本地展开做并集合并去重(source 仍记 keyword)。
+    东财(source "eastmoney")拉取成功且成分非空时,落库后自动删除该赛道
+    source != "manual" 且不在本次成分集内的行(权威源差集清理,移除降级残留);
+    其他降级源只增不减(成分不完整,差集清理会误删)。
     成功写 track.member_source/synced_at 并清空 sync_error;失败写 sync_error
     后 commit 再 re-raise(由 task 记 errors)。成分名称回填 StockBasic 保留。
     """
@@ -181,8 +205,9 @@ def sync_track_members(db: Session, track: Track) -> int:
             df, source = _local_expand_track(db, track)
         else:
             try:
+                # db 传入供 keyword 兜底查 StockBasic.industry(快照无该列)
                 df, source = dg.get_concept_board_members_with_source(
-                    track.concept_board, track)
+                    track.concept_board, track, db)
             except Exception:
                 # with_source 四源皆失败 → 本地展开兜底(source "local")
                 df, source = _local_expand_track(db, track)
@@ -213,6 +238,20 @@ def sync_track_members(db: Session, track: Track) -> int:
     member_source = TRACK_SOURCE_MAP.get(source, "concept_board")
     for code in codes - known:
         db.add(TrackMembership(track_id=track.id, stock_code=code, source=member_source))
+    removed = 0
+    if source == "eastmoney" and codes:
+        # 东财为权威源:恢复后自动做差集清理,移除此前降级源(sina/keyword/local 等)
+        # 落库的残留成分;manual 人工维护不动。降级源不做清理(成分不完整,误删)。
+        stale = db.execute(select(TrackMembership).where(
+            TrackMembership.track_id == track.id,
+            TrackMembership.source != "manual",
+            ~TrackMembership.stock_code.in_(sorted(codes)))).scalars().all()
+        for m in stale:
+            db.delete(m)
+        removed = len(stale)
+        if removed:
+            log.info("track %s eastmoney recovery pruned %s stale members",
+                     track.name, removed)
     db.commit()
     _mark_track_sync(db, track, source=source, error="")
     return len(codes - known)
@@ -221,18 +260,35 @@ def sync_track_members(db: Session, track: Track) -> int:
 def prune_track_members(db: Session, track: Track, incoming: set[str] | None = None) -> int:
     """清理赛道过期成分(TrackMembership 只增不减的补位)。
 
-    默认按该赛道概念板块最新拉取结果做差集;显式传入 incoming 时按传入集合清理。
+    默认按该赛道概念板块最新拉取结果做差集;显式传入 incoming 时按传入集合清理
+    (调用方自己对该集合的权威性负责,不做来源校验)。
+    默认路径只信任东财权威源(source "eastmoney")且全部 code 为 6 位数字真实代码;
+    降级链源(ths/sina/keyword)成分不完整或含 THS: 占位码,差集会把真实成分删光,
+    因此直接抛 DegradedSourceError(ValueError),由 API 层转 409 提示待东财恢复。
     只删自动同步来源的行(non-manual),manual 人工维护的行不受影响。返回删除数。
     调用方(sync_track 定时任务/API 手动清理)应在用户确认后调用,避免接口抖动误删。
     """
     if incoming is None:
         if not track.concept_board:
             return 0
-        incoming = set(dg.get_concept_board_members(track.concept_board)["code"])
+        df, source = dg.get_concept_board_members_with_source(
+            track.concept_board, track, db)
+        if source != "eastmoney":
+            raise DegradedSourceError(
+                f"成分源降级中(当前 {source}),暂不可清理,待东财恢复后再试")
+        incoming = set(df["code"])
+        bad = [c for c in incoming if not _SIX_DIGIT_CODE.match(str(c))]
+        if bad:
+            # 含占位码/异形码(如 THS:308294):源数据不可信,拒绝差集清理
+            raise DegradedSourceError(
+                f"成分源降级中(当前 {source}),暂不可清理,待东财恢复后再试")
+    if not incoming:
+        # 空集合 ≠ 全部淘汰:源返回空/显式传空时直接返回,避免删光非 manual 成员
+        return 0
     stale = db.execute(select(TrackMembership).where(
         TrackMembership.track_id == track.id,
         TrackMembership.source != "manual",
-        ~TrackMembership.stock_code.in_(sorted(incoming)) if incoming else True,
+        ~TrackMembership.stock_code.in_(sorted(incoming)),
     )).scalars().all()
     n = len(stale)
     for m in stale:

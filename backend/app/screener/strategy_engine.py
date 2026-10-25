@@ -8,6 +8,7 @@
 """
 import json
 import logging
+import math
 from datetime import date, timedelta
 
 import pandas as pd
@@ -49,6 +50,64 @@ PARAM_DEFAULTS: dict[str, str] = {
     "track_cash_min": "0.0",          # 赛道内现金含量下限(0=只拦为负的,中游制造现金流波动大)
     "track_gm_min": "15",             # 赛道内毛利率下限(中游制造 25 太高,放宽到 15)
 }
+
+
+# 参数校验规格:key -> (类型, 下限, 上限)。类型 str 不做数值校验;
+# 数值参数写入前必须过此表,防止 "not-a-number" 入库后让每日策略任务 float()/int() 崩溃。
+PARAM_SPECS: dict[str, tuple[str, float | None, float | None]] = {
+    "pool_top_n": ("int", 1, 500),
+    "track_pool_top_n": ("int", 0, 200),
+    "min_mv_hard": ("float", 0, 1_000_000),
+    "mv_pref_low": ("float", 0, 1_000_000),
+    "mv_pref_high": ("float", 0, 1_000_000),
+    "mv_hard_high": ("float", 0, 1_000_000),
+    "min_list_years": ("float", 0, 50),
+    "board_allow": ("str", None, None),
+    "roe_ind_pct_min": ("float", 0, 100),
+    "gm_min": ("float", -100, 100),
+    "cash_min": ("float", -10, 10),
+    "debt_max": ("float", 0, 100),
+    "pe_pct_max": ("float", 0, 100),
+    "peg_max": ("float", 0, 100),
+    "turnover_low": ("float", 0, 100),
+    "turnover_high": ("float", 0, 100),
+    "mom20_max": ("float", 0, 1000),
+    "track_score_min": ("float", 0, 100),
+    "track_mom20_max": ("float", 0, 1000),
+    "track_roe_ind_pct_min": ("float", 0, 100),
+    "track_trend_required": ("int", 0, 1),
+    "track_allow_sell_to_hold": ("int", 0, 1),
+    "track_cash_min": ("float", -10, 10),
+    "track_gm_min": ("float", -100, 100),
+}
+
+
+def validate_param(key: str, value: str) -> str:
+    """校验并归一化单个策略参数;非法值抛 ValueError(未知 key 原样返回)。"""
+    raw = str(value).strip()
+    spec = PARAM_SPECS.get(key)
+    if spec is None:
+        return raw
+    kind, low, high = spec
+    if kind == "str":
+        if not raw:
+            raise ValueError(f"参数 {key} 不能为空")
+        return raw
+    try:
+        num = float(raw)
+    except ValueError:
+        raise ValueError(f"参数 {key} 须为数值,收到 {raw!r}")
+    if not math.isfinite(num):
+        raise ValueError(f"参数 {key} 须为有限数值,收到 {raw!r}")
+    if low is not None and num < low:
+        raise ValueError(f"参数 {key} 不能小于 {low}")
+    if high is not None and num > high:
+        raise ValueError(f"参数 {key} 不能大于 {high}")
+    if kind == "int":
+        if not num.is_integer():
+            raise ValueError(f"参数 {key} 须为整数,收到 {raw!r}")
+        return str(int(num))
+    return raw
 
 
 def get_params(db: Session) -> dict[str, str]:
@@ -240,6 +299,10 @@ def hard_filter(df: pd.DataFrame, params: dict[str, str],
         if track_mode else float(params["cash_min"])
     gm_min = float(params.get("track_gm_min", params["gm_min"])) \
         if track_mode else float(params["gm_min"])
+    # 赛道内允许业绩转负/缺失进入(track_allow_sell_to_hold=1 时):
+    # _rating 会判 sell,策略层再按参数降级为 hold 展示;总池口径不变(仍要求 >0)。
+    allow_neg_profit = track_mode and \
+        str(params.get("track_allow_sell_to_hold", "1")) == "1"
 
     mask = (
         ~df["is_st"].fillna(False)
@@ -251,7 +314,8 @@ def hard_filter(df: pd.DataFrame, params: dict[str, str],
               & (df["total_mv"] <= float(params["mv_hard_high"]))))
         & (df["list_date"].isna() | (df["list_date"] <= list_cut))
         & df["roe"].notna() & (df["roe"] > 0)
-        & (df["profit_yoy"] > 0)                     # 最新报告期业绩为正增长
+        # 最新报告期业绩为正增长(赛道放宽时全部放行,负值/缺失由 _rating 判 sell 后按参数降级 hold)
+        & ((df["profit_yoy"] > 0) | allow_neg_profit)
         & (df["ocf_to_profit"].isna() | (df["ocf_to_profit"] >= cash_min))
         & (df["debt_ratio"].isna() | (df["debt_ratio"] < float(params["debt_max"])))
         & (df["gross_margin"].isna() | (df["gross_margin"] >= gm_min))
@@ -374,7 +438,7 @@ def run_strategy(db: Session, trade_date: date | None = None) -> dict:
     track_n = int(params["track_pool_top_n"])
     score_min = float(params["track_score_min"]) + (10 if weak else 0)
 
-    new_entries, out_count, main_in = 0, 0, []
+    new_entries, out_count = 0, 0
     # 出池评级数据源:scored(入围)→df(全截面)→DB回查,已跌出筛选的行仍能判 sell/avoid
     exit_sigs = latest_signals(db, trade_date=trade_date, limit=5000)
     exit_sig_codes: dict[str, set[str]] = {}
@@ -420,87 +484,100 @@ def run_strategy(db: Session, trade_date: date | None = None) -> dict:
             base.insert(0, f"赛道降级候选({source})" if source else "赛道降级候选")
         return base
 
-    # ---- 总池(容量:旧池不在排序内也保留,由出池规则淘汰,不做截断式清仓) ----
+    # ---- 总池(容量严格封顶 pool_top_n,出池先行再补位) ----
     open_main = db.execute(select(StockPool).where(
         StockPool.pool_type == "main", StockPool.status == "in")).scalars().all()
-    open_codes = {p.code for p in open_main}
-
-    # 新增拦截:sell/avoid 行禁止新增(只在弱市停新不够,拥挤/转负个股随时禁入);
-    # weak(弱市)时总池整体暂停新增。
     eligible = scored[~scored.apply(
         lambda r: _rating(r)[0] in ("sell", "avoid"), axis=1)].head(top_n) if not scored.empty \
         else scored
-    if not weak:
-        for _, row in eligible.iterrows():
-            rating, rreasons = _rating(row)
-            full_reasons = reasons_of(row) + rreasons
-            if row["code"] in open_codes:
-                obj = next(p for p in open_main if p.code == row["code"])
-                obj.score, obj.rating = float(row["score"]), rating
-                obj.reasons = json.dumps(full_reasons, ensure_ascii=False)
-            else:
-                db.add(StockPool(trade_date=trade_date, pool_type="main", code=row["code"],
-                                 name=row["name"], in_price=float(row["close"]),
-                                 score=float(row["score"]), rating=rating,
-                                 reasons=json.dumps(full_reasons, ensure_ascii=False)))
-                new_entries += 1
-            main_in.append(row["code"])
-    # 出池:在池但已跌出排序或判 sell/avoid。即便该行已不在入围(scored)里,
+    eligible_codes = set(eligible["code"]) if not eligible.empty else set()
+
+    # 出池先行:在池但已跌出排序或判 sell/avoid。即便该行已不在入围(scored)里,
     # 也回查全量截面(df)或 DB 做 _rating,不能因"scored无此行"跳过。
     for p in open_main:
-        if p.code in main_in:
+        if p.code in eligible_codes:
             continue
         rating, rreasons = _exit_rating(p.code)
         if rating in ("avoid", "sell"):
             p.status, p.out_date = "out", trade_date
             p.out_reason = ";".join(rreasons)[:200]
             out_count += 1
+    survivors = [p for p in open_main if p.status == "in"]
+
+    # 容量封顶:历史存量超 pool_top_n 时按分数从低到高移出,防止池子只进不出持续膨胀
+    if len(survivors) > top_n:
+        keep_ids = {p.id for p in sorted(
+            survivors, key=lambda p: float(p.score or 0), reverse=True)[:top_n]}
+        for p in survivors:
+            if p.id in keep_ids:
+                continue
+            p.status, p.out_date = "out", trade_date
+            p.out_reason = f"超出总池容量(pool_top_n={top_n})"
+            out_count += 1
+        survivors = [p for p in survivors if p.id in keep_ids]
+
+    # 新增拦截:sell/avoid 行禁止新增(只在弱市停新不够,拥挤/转负个股随时禁入);
+    # weak(弱市)时总池整体暂停新增。名额=容量-在池数,确保新增后不超容量。
+    open_codes = {p.code for p in survivors}
+    main_in = [p.code for p in survivors]
+    if not weak:
+        new_slots = max(top_n - len(survivors), 0)
+        for _, row in eligible.iterrows():
+            rating, rreasons = _rating(row)
+            full_reasons = reasons_of(row) + rreasons
+            if row["code"] in open_codes:
+                obj = next(p for p in survivors if p.code == row["code"])
+                obj.score, obj.rating = float(row["score"]), rating
+                obj.reasons = json.dumps(full_reasons, ensure_ascii=False)
+            elif new_entries < new_slots:
+                db.add(StockPool(trade_date=trade_date, pool_type="main", code=row["code"],
+                                 name=row["name"], in_price=float(row["close"]),
+                                 score=float(row["score"]), rating=rating,
+                                 reasons=json.dumps(full_reasons, ensure_ascii=False)))
+                new_entries += 1
+                main_in.append(row["code"])
 
     # ---- 赛道池(赛道内排序口径,与总池漏斗解耦) ----
     # 总池 hard_filter 是全市场质量筛子(ROE分位70/趋势多头等),赛道成分天然带行业
     # 动量,不应再套同一漏斗(否则电机18只→0只,赛道池恒空)。赛道内用放宽口径
     # hard_filter(track_mode=True: mom放宽/ROE分位放宽/趋势可选),仍受 _rating
     # sell/avoid 硬拦截;业绩转负 sell 可降级为 hold 展示(参数 track_allow_sell_to_hold)。
-    from .universe_manager import list_tracks
+    from .universe_manager import TRACK_SEED_MAP, list_tracks
     allow_sell_hold = str(params.get("track_allow_sell_to_hold", "1")) == "1"
     for track in list_tracks(db):
         open_track = db.execute(select(StockPool).where(
             StockPool.pool_type == "track", StockPool.track_id == track.id,
             StockPool.status == "in")).scalars().all()
+        if not track.enabled:
+            # 停用赛道:不再产生新入选,存量全部出池留档(可追溯)
+            for p in open_track:
+                p.status, p.out_date, p.out_reason = "out", trade_date, "赛道已停用"
+                out_count += 1
+            continue
         open_t = {p.code for p in open_track}
         member_codes = {c for c, ts in get_track_map(db).items() if track.name in ts}
         fallback = not member_codes
         track_member_source = getattr(track, "member_source", "") or ""
-        # 赛道候选域:优先 membership ∩ 全截面 df(不过总池漏斗);
-        # membership 为空才用行业/标签近似(保持原降级语义,但基于 df)。
+        # 赛道候选域:优先 membership ∩ 全截面 df(不过总池漏斗)。
+        # membership 为空正是 fallback 成因,tracks 标签必然为空、行业等值兜底会
+        # 退化成整行业全收;fallback 时改用"种子+关键词"匹配:种子是精选代表股,
+        # keyword 是名称/行业包含(不再整行业全收)。
         if fallback:
             if df.empty:
                 track_df = df
             else:
-                mask_ind = (df["industry"] == track.industry_index) \
-                    if track.industry_index else pd.Series(False, index=df.index)
-                mask_track = df["tracks"].apply(
-                    lambda ts: isinstance(ts, list) and track.name in ts)
-                both = df[mask_ind & mask_track] \
-                    if track.industry_index else df.iloc[0:0]
-                if not both.empty:
-                    track_df = both
-                else:
-                    union = df[mask_ind | mask_track]
-                    if not union.empty:
-                        track_df = union
-                    else:
-                        # kw 默认取 keywords 首词(如"固态电池/半导体/PCB/光模块/存储/电机/算力"),
-                        # 不再用 name[:2](对"AI算力"取"AI"太泛);keywords 为空才回退 name[:2]。
-                        kw_parts = [w.strip() for w in (track.keywords or "")
-                                    .replace("，", ",").replace("、", ",").split(",")
-                                    if w.strip()]
-                        kw = kw_parts[0] if kw_parts else (
-                            track.name[:2] if track.name else "")
-                        mask_kw = df["tracks"].apply(
-                            lambda ts: isinstance(ts, list)
-                            and any(kw in t for t in ts)) if kw else mask_track
-                        track_df = df[mask_kw]
+                seed_codes = set(TRACK_SEED_MAP.get(track.name or "", []))
+                kw_terms = [w.strip() for w in (track.keywords or "")
+                            .replace("，", ",").replace("、", ",").split(",")
+                            if w.strip()]
+                name_s = df["name"].astype(str)
+                ind_s = df["industry"].astype(str)
+                mask = df["code"].isin(seed_codes)
+                for w in kw_terms:
+                    mask = (mask
+                            | name_s.str.contains(w, na=False, case=False, regex=False)
+                            | ind_s.str.contains(w, na=False, case=False, regex=False))
+                track_df = df[mask]
         else:
             track_df = df[df["code"].isin(member_codes)]
         # 赛道内放宽过滤 + 赛道内打分排序(与总池 scored 解耦)
@@ -526,9 +603,10 @@ def run_strategy(db: Session, trade_date: date | None = None) -> dict:
                     rreasons = ["业绩转负(赛道观察,降级为持有)"]
                 else:
                     continue
-            if float(row["score"]) < score_min:
-                continue
             heat_bonus = heat.get(track.name, 0) / 10
+            # 阈值用与落库一致的有效分(裸分+热度加成),前后同口径
+            if float(row["score"]) + heat_bonus < score_min:
+                continue
             if row["code"] in open_t:
                 obj = next(p for p in open_track if p.code == row["code"])
                 obj.score, obj.rating = float(row["score"]) + heat_bonus, rating
@@ -545,9 +623,22 @@ def run_strategy(db: Session, trade_date: date | None = None) -> dict:
                                      + rreasons, ensure_ascii=False)))
                 new_entries += 1
             in_codes.append(row["code"])
+        # 出池滞回(与总池弱市"停新增、存量保留"语义对齐):
+        # 存量仅在三 种情形出池——①评级转 sell/avoid;②membership 权威更新后移出赛道成分;
+        # ③赛道停用(循环开头处理)。分数低于 score_min 只是不再新增,不出清,
+        # 避免弱市全清→回暖全进、in_price 反复重置的震荡循环;数据缺失日(track_df 空)同样保留。
         for p in open_track:
-            if p.code not in in_codes:
-                p.status, p.out_date, p.out_reason = "out", trade_date, "跌出赛道池排序"
+            if p.code in in_codes:
+                continue
+            rating, rreasons = _exit_rating(p.code)
+            if rating == "sell" and allow_sell_hold and rreasons == ["最新报告期业绩转负"]:
+                rating = "hold"  # 与入池降级同口径:业绩转负在赛道内降级观察,不出池
+            if rating in ("sell", "avoid"):
+                p.status, p.out_date = "out", trade_date
+                p.out_reason = ";".join(rreasons)[:200]
+                out_count += 1
+            elif not fallback and member_codes and p.code not in member_codes:
+                p.status, p.out_date, p.out_reason = "out", trade_date, "移出赛道成分"
                 out_count += 1
 
     db.commit()

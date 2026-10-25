@@ -123,11 +123,18 @@ def sync_industry_daily(db: Session, trade_date: date | None = None,
             row = IndustryDaily(industry_code=board_code, industry_name=board_name,
                                 trade_date=trade_date)
 
-        # 回避名单:触发→20交易日后解除;已生效则沿用 max(旧值,新触发)(每日重置需继承)。
-        # 注意:旧值必须在覆盖 row.avoid_until 之前读取(同日重跑幂等,今日行即 carried)。
-        carried = (row.avoid_until if row.avoid_until and row.avoid_until >= trade_date
-                   else None)
-        avoid_until = carried
+        # 回避名单:触发→20交易日后解除;已生效则沿用 max(旧值,新触发)。
+        # 旧值必须跨日继承:新建当日行时 row.avoid_until 必为空,须回查最近一条历史行;
+        # 同日重跑则当日行已有值,两者取 max 保证幂等。
+        prev_row = db.execute(select(IndustryDaily).where(
+            IndustryDaily.industry_code == board_code,
+            IndustryDaily.trade_date < trade_date,
+        ).order_by(IndustryDaily.trade_date.desc()).limit(1)).scalar_one_or_none()
+        carried_dates = [d for d in (
+            row.avoid_until if row else None,
+            prev_row.avoid_until if prev_row else None,
+        ) if d and d >= trade_date]
+        avoid_until = max(carried_dates) if carried_dates else None
         if last["ratio_score"] > CROWD_THRESHOLD:
             idx = trade_days_sorted.index(last["trade_date"]) if last["trade_date"] in trade_days_sorted else -1
             # 口径统一:优先交易日历 +20 交易日,日历缺失退化 +30 自然日(见 _cooldown_until)。
@@ -214,6 +221,16 @@ def _sync_industry_spot_only(db: Session, trade_date: date) -> int:
         row.ratio = round(row.amount / mkt_today * 100, 4) if mkt_today else 0.0
         row.fund_flow = 0.0
 
+        # 回避名单跨日继承:新建当日行时 row.avoid_until 为空,须回查最近一条历史行;
+        # 同日重跑取当日已写值,二者取 max 保证幂等。
+        prev_row = next((r for r in hist_rows if r.trade_date < trade_date), None)
+        carried_dates = [d for d in (
+            row.avoid_until if row else None,
+            prev_row.avoid_until if prev_row else None,
+        ) if d and d >= trade_date]
+        carried = max(carried_dates) if carried_dates else None
+        row.avoid_until = carried
+
         ratios = pd.Series([r.ratio for r in hist_asc] + [row.ratio])
         if len(ratios) >= 60:
             # 含当日在内的 MA120:与 full 路径同口径(分母皆为当日成交占比 RATIO)
@@ -223,8 +240,6 @@ def _sync_industry_spot_only(db: Session, trade_date: date) -> int:
                 score = (ratios.iloc[-1] - ma120) / ma120 * 100
                 row.ratio_score = round(float(score), 2)
                 if score > CROWD_THRESHOLD:
-                    carried = (row.avoid_until if row.avoid_until and row.avoid_until >= trade_date
-                               else None)
                     fresh = _cooldown_until(trade_date)
                     row.avoid_until = max([d for d in (carried, fresh) if d is not None])
             elif pd.notna(ma120):
@@ -376,17 +391,37 @@ def _apply_heat_scores(db: Session, trade_date: date) -> None:
         "pe_pct": r.pe_pct, "pct_chg": r.pct_chg or 0.0, "ratio": r.ratio or 0.0,
         "avoid": r.avoid_until is not None and r.avoid_until >= trade_date,
     } for r in rows])
+    for col in ("mom_20", "mom_60"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if df[col].notna().any():
+            df[col] = df[col].fillna(df[col].median())
+        else:
+            df[col] = 0.0
+    df["flow_streak"] = pd.to_numeric(df["flow_streak"], errors="coerce").fillna(0)
+    df["pe_pct"] = pd.to_numeric(df["pe_pct"], errors="coerce")
     if df["mom_20"].abs().sum() == 0 and df["mom_60"].abs().sum() == 0:
         # 降级首日无历史动量(截面无区分度):用当日涨跌幅+成交占比兜底,数据积累后自动切换完整公式
         df["heat"] = (0.6 * df["pct_chg"].rank(pct=True) * 100 +
                       0.4 * df["ratio"].rank(pct=True) * 100)
         data_quality = "degraded:首日快照,heat 口径为涨跌幅+成交占比兜底,与完整公式不可比"
     else:
-        data_quality = "ok"
+        # IndustryDaily.pe_pct 当前无数据源,库里恒为默认值 0.0:
+        # 无区分度(nunique<=1)时估值维度权重归零,避免 20% 权重被常数占满,
+        # 同时防止 rank(全 NaN)传染使 heat_score 变成 NaN/None。
+        has_pe = df["pe_pct"].nunique(dropna=True) > 1
+        if has_pe:
+            df["pe_pct"] = df["pe_pct"].fillna(df["pe_pct"].median())
+        else:
+            df["pe_pct"] = 50.0
+        data_quality = "ok" if has_pe else "degraded:行业PE分位缺失,估值维度已降权"
         for col in ("mom_20", "mom_60", "flow_streak", "pe_pct"):
             df[f"{col}_r"] = df[col].rank(pct=True) * 100
-        df["heat"] = (0.35 * df["mom_60_r"] + 0.25 * df["mom_20_r"] +
-                      0.2 * df["flow_streak_r"] + 0.2 * (100 - df["pe_pct_r"]))
+        weights = {"mom60": 0.35, "mom20": 0.25, "flow": 0.2, "val": 0.2 if has_pe else 0.0}
+        total = sum(weights.values())
+        df["heat"] = (weights["mom60"] * df["mom_60_r"] + weights["mom20"] * df["mom_20_r"]
+                      + weights["flow"] * df["flow_streak_r"]
+                      + weights["val"] * (100 - df["pe_pct_r"])) / total
+        df["heat"] = df["heat"].fillna(df["heat"].median())
     df.loc[df["avoid"], "heat"] -= 20
     for _, r in df.iterrows():
         obj = db.get(IndustryDaily, int(r["id"]))

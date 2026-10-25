@@ -148,7 +148,11 @@ def industries(trade_date: str | None = None, user_id: int = Depends(current_use
                db: Session = Depends(get_db)):
     q = select(IndustryDaily)
     if trade_date:
-        q = q.where(IndustryDaily.trade_date == date.fromisoformat(trade_date))
+        try:
+            d = date.fromisoformat(trade_date)
+        except ValueError:
+            raise HTTPException(422, f"日期参数非法:{trade_date}(需 YYYY-MM-DD)")
+        q = q.where(IndustryDaily.trade_date == d)
     else:
         latest = db.execute(select(IndustryDaily.trade_date).order_by(
             IndustryDaily.trade_date.desc()).limit(1)).scalar_one_or_none()
@@ -176,6 +180,7 @@ def indexes(codes: str | None = None,
     try:
         want = ([c.strip() for c in codes.split(",") if c.strip()] if codes
                 else [c for c, _ in dg.INDEX_DISPLAY])
+        want = want[:20]  # 上限:防一次传上千 code 逐个查询
         out = []
         for code in want:
             r = db.execute(select(IndexDaily).where(IndexDaily.code == code)
@@ -241,28 +246,36 @@ def fund_flow(board_type: str = "industry", limit: int = 20,
 
 
 @router.get("/fund-flow/history")
-def fund_flow_history(board_name: str, board_type: str = "industry",
-                      days: int = 30, user_id: int = Depends(current_user_id),
+def fund_flow_history(board_name: str = "", board_type: str = "industry",
+                      board_code: str | None = None, days: int = 30,
+                      user_id: int = Depends(current_user_id),
                       db: Session = Depends(get_db)):
-    """该板块近 N 天每日最后一条 [(snap_date, net_inflow)] 供趋势图。"""
+    """该板块近 N 天每日最后一条 [(snap_date, net_inflow)] 供趋势图。
+
+    优先按 board_code 查(板块名可重复/会改名),老数据无 code 时回退按 name。
+    """
     from sqlalchemy import func
 
     if board_type not in ("industry", "concept"):
         raise HTTPException(400, "board_type 须为 industry|concept")
+    if not board_name and not board_code:
+        raise HTTPException(400, "board_name 或 board_code 至少提供一个")
     try:
         days = min(max(days, 1), 365)
+        cond = [FundFlowSnapshot.board_type == board_type]
+        if board_code:
+            cond.append(FundFlowSnapshot.board_code == board_code)
+        else:
+            cond.append(FundFlowSnapshot.board_name == board_name)
         # 每日最后一条:按日期分组取 max(snap_time),再回查
         sub = (select(func.date(FundFlowSnapshot.snap_time).label("d"),
                       func.max(FundFlowSnapshot.snap_time).label("mt"))
-               .where(FundFlowSnapshot.board_type == board_type,
-                      FundFlowSnapshot.board_name == board_name)
+               .where(*cond)
                .group_by(func.date(FundFlowSnapshot.snap_time))
                .order_by(func.date(FundFlowSnapshot.snap_time).desc())
                .limit(days).subquery())
         rows = db.execute(select(FundFlowSnapshot).where(
-            FundFlowSnapshot.board_type == board_type,
-            FundFlowSnapshot.board_name == board_name,
-            FundFlowSnapshot.snap_time.in_(select(sub.c.mt)))
+            *cond, FundFlowSnapshot.snap_time.in_(select(sub.c.mt)))
             .order_by(FundFlowSnapshot.snap_time)).scalars().all()
         return [{"snap_date": (r.snap_time.date().isoformat()
                                 if r.snap_time else ""),
@@ -296,10 +309,18 @@ def lhb(trade_date: str | None = None, limit: int = 50,
         user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
     """最近交易日龙虎榜 [{code,name,close,pct_chg,lhb_net,matched_traders}];无数据 [] 不 500。"""
     limit = min(max(limit, 1), MAX_LIMIT)
+    # 日期参数在 try 外解析:非法日期返回 422,不与被吞成空数据的查询异常混在一起
+    if trade_date:
+        try:
+            d = date.fromisoformat(trade_date)
+        except ValueError:
+            raise HTTPException(422, f"日期参数非法:{trade_date}(需 YYYY-MM-DD)")
+    else:
+        d = None
     try:
         q = select(LhbDaily)
-        if trade_date:
-            q = q.where(LhbDaily.trade_date == date.fromisoformat(trade_date))
+        if d:
+            q = q.where(LhbDaily.trade_date == d)
         else:
             latest = db.execute(select(LhbDaily.trade_date).order_by(
                 LhbDaily.trade_date.desc()).limit(1)).scalar_one_or_none()
@@ -335,7 +356,7 @@ def search(q: str = "", limit: int = 20,
         return []
     from ..shared import search as search_mod
 
-    return search_mod.match_search(search_mod.build_search_index(db), q, limit)
+    return search_mod.match_search(search_mod.get_cached_index(db), q, limit)
 
 
 @router.get("/signals")
@@ -343,7 +364,13 @@ def signals(trade_date: str | None = None, signal_type: str | None = None,
             limit: int = 100, user_id: int = Depends(current_user_id),
             db: Session = Depends(get_db)):
     limit = min(max(limit, 1), MAX_LIMIT)
-    d = date.fromisoformat(trade_date) if trade_date else None
+    if trade_date:
+        try:
+            d = date.fromisoformat(trade_date)
+        except ValueError:
+            raise HTTPException(422, f"日期参数非法:{trade_date}(需 YYYY-MM-DD)")
+    else:
+        d = None
     rows = technical_signal.latest_signals(db, trade_date=d, signal_type=signal_type,
                                            limit=limit)
     names = _stock_names(db, [r.code for r in rows]) if rows else {}
@@ -406,6 +433,9 @@ def list_tracks(user_id: int = Depends(current_user_id), db: Session = Depends(g
 @router.post("/tracks")
 def create_track(body: TrackIn, analyst: User = Depends(require_analyst),
                  user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
+    dup = db.execute(select(Track).where(Track.name == body.name)).scalar_one_or_none()
+    if dup is not None:
+        raise HTTPException(400, f"赛道名「{body.name}」已存在")
     t = Track(**body.model_dump())
     db.add(t)
     db.commit()
@@ -418,6 +448,10 @@ def update_track(track_id: int, body: TrackIn, analyst: User = Depends(require_a
     t = db.get(Track, track_id)
     if t is None:
         raise HTTPException(404, "赛道不存在")
+    dup = db.execute(select(Track).where(
+        Track.name == body.name, Track.id != track_id)).scalar_one_or_none()
+    if dup is not None:
+        raise HTTPException(400, f"赛道名「{body.name}」已存在")
     for k, v in body.model_dump().items():
         setattr(t, k, v)
     db.commit()
@@ -455,14 +489,16 @@ def backfill_tracks(analyst: User = Depends(require_analyst),
                     db: Session = Depends(get_db)):
     """一键回填全部赛道成分(ensure_default_tracks + 逐 track sync)。
 
-    返回 {results: {name: {"added": n, "source": s}}, errors: [...]}。
-    同步执行(调 task_runner.task_tracks_backfill)。"""
-    from ..task_runner import task_tracks_backfill
+    后台线程执行(7 赛道×多源×重试最坏可达分钟级,同步执行会占死请求线程,
+    且绕过任务互斥/日志):走 run_task_async 与任务中心同口径,结果看任务日志
+    (task=tracks_backfill)与赛道管理列表。已在运行返回 409。"""
+    from ..task_runner import run_task_async
 
-    try:
-        return task_tracks_backfill(db)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, f"赛道回填本地失败:{exc}")
+    started = run_task_async("tracks_backfill")
+    if not started:
+        raise HTTPException(409, "赛道回填已在运行中,请在任务日志查看进度")
+    return {"queued": True, "task": "tracks_backfill",
+            "message": "已提交后台执行,完成后赛道列表自动更新;慢网络下可能需数分钟"}
 
 
 @router.post("/tracks/{track_id}/prune")
@@ -474,6 +510,9 @@ def prune_track(track_id: int, analyst: User = Depends(require_analyst),
         raise HTTPException(404, "赛道不存在")
     try:
         n = universe_manager.prune_track_members(db, t)
+    except universe_manager.DegradedSourceError as exc:
+        # 成分源处于降级链(ths/sina/keyword):差集清理不可信,409 冲突提示稍后再试
+        raise HTTPException(409, str(exc))
     except ConnectionError as exc:
         raise HTTPException(503, f"概念板块成分接口暂时不可达:{exc}")
     except TimeoutError as exc:
@@ -504,15 +543,25 @@ class ParamsIn(BaseModel):
 def set_strategy_params(body: ParamsIn, analyst: User = Depends(require_analyst),
                         user_id: int = Depends(current_user_id),
                         db: Session = Depends(get_db)):
+    # 先全量校验再落库:任一非法值整体拒绝,避免半写入留下坏参数
+    normalized: dict[str, str] = {}
+    errors: list[str] = []
     for k, v in body.params.items():
         if k not in strategy_engine.PARAM_DEFAULTS:
             continue
+        try:
+            normalized[k] = strategy_engine.validate_param(k, v)
+        except ValueError as exc:
+            errors.append(str(exc))
+    if errors:
+        raise HTTPException(422, "; ".join(errors))
+    for k, v in normalized.items():
         row = db.get(StrategyParams, k)
         if row is None:
-            db.add(StrategyParams(key=k, value=str(v),
+            db.add(StrategyParams(key=k, value=v,
                                   note=strategy_engine.PARAM_NOTE.get(k, "")))
         else:
-            row.value = str(v)
+            row.value = v
     db.commit()
     return {"ok": True}
 
@@ -533,6 +582,17 @@ class CardIn(BaseModel):
     review_note: str | None = None
 
 
+def _evidence_empty(card: StrategyCard) -> bool:
+    """证据链是否为空:evidence 须为含非空值的 JSON 对象(空 {} 视为未填)。"""
+    try:
+        ev = json.loads(card.evidence or "{}")
+    except (TypeError, ValueError):
+        return False  # 非 JSON(历史脏数据)不当作空,避免误拦已是文本证据的卡
+    if not isinstance(ev, dict):
+        return False
+    return not any(str(v).strip() for v in ev.values())
+
+
 @router.put("/strategy-cards/{card_id}")
 def update_card(card_id: int, body: CardIn, analyst: User = Depends(require_analyst),
                 user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
@@ -542,6 +602,9 @@ def update_card(card_id: int, body: CardIn, analyst: User = Depends(require_anal
     if body.status:
         if body.status not in ("unverified", "testing", "verified", "deprecated", "reference"):
             raise HTTPException(400, "非法状态")
+        # 证据链必填:禁止无回测证据直接置 verified(README 红线)
+        if body.status == "verified" and _evidence_empty(card):
+            raise HTTPException(422, "证据链为空:置为 verified 前需先补齐回测证据(evidence)")
         card.status = body.status
     if body.review_note is not None:
         card.review_note = body.review_note
@@ -552,7 +615,7 @@ def update_card(card_id: int, body: CardIn, analyst: User = Depends(require_anal
 # ---------- 任务中心 ----------
 
 @router.get("/tasks")
-def task_logs(limit: int = 50, user_id: int = Depends(current_user_id),
+def task_logs(limit: int = 50, analyst: User = Depends(require_analyst),
               db: Session = Depends(get_db)):
     limit = min(max(limit, 1), MAX_LIMIT)
     rows = db.execute(select(TaskLog).order_by(TaskLog.id.desc()).limit(limit)).scalars().all()

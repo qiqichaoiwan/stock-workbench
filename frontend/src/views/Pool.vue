@@ -108,13 +108,14 @@
 
 <script setup>
 import { computed, onMounted, onBeforeUnmount, ref, watch, nextTick } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import { cleanName, fmtNum, fmtInt, ratingLabel, ratingType } from '../utils/fmt'
 import { useUserStore } from '../store'
 
 const store = useUserStore()
+const route = useRoute()
 const router = useRouter()
 const canOperate = computed(() => store.isAnalyst)
 
@@ -191,12 +192,18 @@ async function loadHistory() {
   } catch { history.value = [] }
 }
 
+// 全局搜股透传:Layout 通过 /pool?q=代码 跳转,这里填搜索框(不再走 localStorage + 整页刷新)
+function applyQuerySearch() {
+  const q = route.query.q
+  if (typeof q === 'string' && q) {
+    search.value = q
+    page.value = 1
+  }
+}
+watch(() => [route.query.q, route.query.t], applyQuerySearch)
+
 onMounted(async () => {
-  // 全局搜股透传:Layout header 选中后写入 localStorage,此处读取填 search 并清除
-  try {
-    const kw = localStorage.getItem('pool_search')
-    if (kw) { search.value = kw; localStorage.removeItem('pool_search') }
-  } catch { /* 忽略 */ }
+  applyQuerySearch()
   try {
     const list = await api.get('/api/screener/tracks', { silent: true })
     tracks.value = Array.isArray(list) ? list : []

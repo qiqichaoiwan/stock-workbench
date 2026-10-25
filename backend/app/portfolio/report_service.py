@@ -81,7 +81,10 @@ def daily_report(db: Session, user_id: int) -> str:
 def weekly_report(db: Session, user_id: int) -> WeeklyReport:
     """每周报告:本周交易复盘+持仓表现+市场回顾+AI 复盘(LLM 可用时)。"""
     today = date.today()
-    week_start = today - timedelta(days=today.weekday() + 7)  # 上周一
+    # 周一生成时覆盖上一整周;周二~周日覆盖本周(周五已收盘,周末可复盘)。
+    # 旧逻辑恒减 weekday+7,周中也只出上一周,导致周报永远落后一周。
+    days_back = today.weekday() or 7
+    week_start = today - timedelta(days=days_back)
     week_end = week_start + timedelta(days=4)
 
     trades = db.execute(select(TradeRecord).where(

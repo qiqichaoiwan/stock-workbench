@@ -3,7 +3,7 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -202,11 +202,16 @@ def delete_user(user_id: int, admin: User = Depends(require_admin),
         raise HTTPException(400, "不能删除自己")
     if user.role == "admin" and _active_admin_count(db) <= 1:
         raise HTTPException(400, "不能删除最后一个启用的管理员")
-    # 级联清理该租户的全部数据(持仓上下文内闭环)
-    for model in (Holding, TradeRecord, AiAnalysis, WeeklyReport, UserLlmConfig,
-                  Watchlist, WatchAlertLog):
-        for row in db.execute(select(model).where(model.user_id == user.id)).scalars().all():
-            db.delete(row)
+    # 级联清理该租户的全部数据:子表先删、父表后删。
+    # 用批量 DELETE 而非 db.delete(row):后者由 unit of work 统一 flush,
+    # 语句顺序不保证,会先发 DELETE pf_user 触发 FOREIGN KEY constraint failed。
+    for model in (TradeRecord, WatchAlertLog, AiAnalysis, WeeklyReport,
+                  UserLlmConfig, Watchlist, Holding):
+        db.execute(delete(model).where(model.user_id == user.id))
+    # 邀请码无外键:清空 used_by 防孤儿引用,同时置 active=False 防被重新使用
+    db.execute(update(InviteCode).where(InviteCode.used_by == user.id)
+               .values(used_by=None, active=False))
+    db.flush()
     db.delete(user)
     db.commit()
     return {"ok": True}
@@ -271,9 +276,12 @@ def list_holdings(user_id: int = Depends(current_user_id), db: Session = Depends
 @router.post("/holdings")
 def create_holding(body: HoldingIn, user_id: int = Depends(current_user_id),
                    db: Session = Depends(get_db)):
-    h = holding_service.init_holding(db, user_id, body.code, body.buy_price,
-                                     body.quantity, body.buy_date, body.stop_pct,
-                                     body.take_profit_price, body.note)
+    try:
+        h = holding_service.init_holding(db, user_id, body.code, body.buy_price,
+                                         body.quantity, body.buy_date, body.stop_pct,
+                                         body.take_profit_price, body.note)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return {"id": h.id, "code": h.code, "breakeven_price": h.breakeven_price,
             "initial_stop_price": h.initial_stop_price, "risk_r": h.risk_r}
 
@@ -363,6 +371,8 @@ def create_watch(body: WatchIn, user_id: int = Depends(current_user_id),
         raise HTTPException(400, "该股票已在自购列表")
     from ..shared import stock_ref
 
+    if not stock_ref.stock_exists(db, code):
+        raise HTTPException(400, f"股票代码 {code} 不存在")
     w = Watchlist(user_id=user_id, code=code,
                   name=body.name or stock_ref.stock_name(db, code),
                   cost_price=body.cost_price or 0.0,
@@ -390,6 +400,8 @@ def update_watch(watch_id: int, body: WatchIn,
         raise HTTPException(400, "该股票已在自购列表")
     from ..shared import stock_ref
 
+    if not stock_ref.stock_exists(db, code):
+        raise HTTPException(400, f"股票代码 {code} 不存在")
     w.code = code
     w.name = body.name or stock_ref.stock_name(db, code) or w.name
     w.cost_price = body.cost_price or 0.0
@@ -497,18 +509,30 @@ def get_llm(user_id: int = Depends(current_user_id), db: Session = Depends(get_d
 @router.put("/settings/llm")
 def save_llm(body: LlmIn, user_id: int = Depends(current_user_id),
              db: Session = Depends(get_db)):
-    # 服务端 URL 校验(复用网关守卫,allow_local=False):SSRF/内网地址直接 400,
-    # 不入库脏配置;resolve_config 兜底再次校验,双层防护。
-    try:
-        safe_url = llm_gateway._validate_base_url(body.base_url, allow_local=False)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
+    # 停用状态允许 URL/模型留空(前端"仅保存停用状态");启用时才要求必填。
+    # 非空 URL 仍过网关守卫:SSRF/内网地址 400,允许本机 HTTP(vLLM/Ollama)。
+    base_url = (body.base_url or "").strip()
+    model = (body.model or "").strip()
+    if body.enabled and not base_url:
+        raise HTTPException(400, "启用状态下 Base URL 不能为空")
+    if body.enabled and not model:
+        raise HTTPException(400, "启用状态下模型不能为空")
+    safe_url = ""
+    if base_url:
+        try:
+            safe_url = llm_gateway._validate_base_url(base_url, allow_local=True)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
     cfg = db.execute(select(UserLlmConfig).where(
         UserLlmConfig.user_id == user_id)).scalar_one_or_none()
     if cfg is None:
-        cfg = UserLlmConfig(user_id=user_id)
+        cfg = UserLlmConfig(user_id=user_id, base_url="", model="")
         db.add(cfg)
-    cfg.base_url, cfg.model = safe_url, body.model
+    # 停用时留空表示"保持原配置不变",避免仅切开关就清掉已有 URL/模型
+    if safe_url:
+        cfg.base_url = safe_url
+    if model:
+        cfg.model = model
     cfg.temperature, cfg.enabled = body.temperature, body.enabled
     if body.api_key:  # 留空表示不修改密钥
         cfg.api_key_cipher = encrypt_secret(body.api_key)
@@ -525,7 +549,7 @@ def test_llm(body: LlmIn, user_id: int = Depends(current_user_id),
     cfg = db.execute(select(UserLlmConfig).where(
         UserLlmConfig.user_id == user_id)).scalar_one_or_none()
     key = body.api_key or (decrypt_secret(cfg.api_key_cipher) if cfg else "")
-    ok, msg = llm_gateway.test_config(body.base_url, key, body.model)
+    ok, msg = llm_gateway.test_config(body.base_url, key, body.model, allow_local=True)
     if cfg and ok:
         cfg.last_test_ok = True
         db.commit()

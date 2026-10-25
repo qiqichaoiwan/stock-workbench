@@ -198,7 +198,8 @@ async function onFlowRow(row) {
   histLoading.value = true
   try {
     const data = await api.get('/api/screener/fund-flow/history',
-      { params: { board_name: row.board_name, board_type: boardType.value, days: 30 }, silent: true })
+      { params: { board_name: row.board_name, board_code: row.board_code || undefined,
+                  board_type: boardType.value, days: 30 }, silent: true })
       .catch(() => [])
     if (cur !== histSeq) return
     flowHist.value = Array.isArray(data) ? data : []

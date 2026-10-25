@@ -1,0 +1,29 @@
+# 构建上下文裁剪:避免把本地数据、密钥、缓存打进镜像(Dockerfile 只 COPY backend 与 frontend/dist)
+.git
+.gitignore
+.trae
+.zcode
+.pytest_cache
+tmp
+data
+.env
+.env.*
+docker-compose.yml
+README.md
+
+# Python 缓存与本地虚拟环境
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+backend/.venv
+backend/venv
+backend/data
+
+# 前端源码与依赖(镜像只需要 frontend/dist)
+frontend/node_modules
+frontend/src
+frontend/public
+frontend/index.html
+frontend/package.json
+frontend/package-lock.json
+frontend/vite.config.js

@@ -49,7 +49,7 @@ def test_ths_marker_expands_to_seeds(monkeypatch):
                             "ths_code": "308294"}])
     monkeypatch.setattr(
         universe_manager.dg, "get_concept_board_members_with_source",
-        lambda board, track=None: (marker, "ths"))
+        lambda board, track=None, db=None: (marker, "ths"))
     n = universe_manager.sync_track_members(db, track)
     codes = {c for (c,) in db.execute(
         select(TrackMembership.stock_code).where(TrackMembership.track_id == track.id))}

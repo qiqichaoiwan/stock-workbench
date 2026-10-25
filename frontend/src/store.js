@@ -1,10 +1,20 @@
 import { defineStore } from 'pinia'
 import api from './api'
 
+// localStorage.user 可能被手工改坏/旧版本残留:解析失败按未登录处理,避免整页白屏
+function readStoredUser() {
+  try {
+    return JSON.parse(localStorage.getItem('user') || 'null')
+  } catch {
+    localStorage.removeItem('user')
+    return null
+  }
+}
+
 export const useUserStore = defineStore('user', {
   state: () => ({
     token: localStorage.getItem('token') || '',
-    user: JSON.parse(localStorage.getItem('user') || 'null'),
+    user: readStoredUser(),
   }),
   getters: {
     isLoggedIn: (s) => !!s.token,

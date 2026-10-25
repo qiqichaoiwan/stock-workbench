@@ -170,6 +170,12 @@ function openEdit(row) {
 async function save() {
   try { await formRef.value?.validate() } catch { return }
   if (!/^\d{6}$/.test(form.code || '')) return ElMessage.warning('代码必须为 6 位数字')
+  // 止盈止损交叉校验(两者都填时;0/空 = 不设)
+  const tp = Number(form.take_profit) || 0
+  const sl = Number(form.stop_loss) || 0
+  if (tp > 0 && sl > 0 && tp <= sl) {
+    return ElMessage.warning('止盈价应高于止损价(两者都填时)')
+  }
   saving.value = true
   try {
     const payload = {
@@ -182,7 +188,11 @@ async function save() {
     ElMessage.success('已保存')
     dlg.value = false
     await load()
-  } catch { /* silent 请求由调用方兜底:保存失败保持对话框,不抛全局 */ } finally {
+  } catch (err) {
+    // 保存失败保持对话框并显式提示(silent 只是不走全局拦截器,这里必须自己报)
+    const msg = err?.response?.data?.detail || err?.message || '保存失败'
+    ElMessage.error(typeof msg === 'string' ? msg : JSON.stringify(msg))
+  } finally {
     saving.value = false
   }
 }
@@ -192,7 +202,10 @@ async function remove(row) {
     await api.delete(`/api/watchlist/${row.id}`, { silent: true })
     ElMessage.success('已删除')
     await load()
-  } catch { /* silent:失败静默 */ }
+  } catch (err) {
+    const msg = err?.response?.data?.detail || err?.message || '删除失败'
+    ElMessage.error(typeof msg === 'string' ? msg : JSON.stringify(msg))
+  }
 }
 </script>
 

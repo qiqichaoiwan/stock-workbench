@@ -340,14 +340,26 @@ async function sync(row) {
 async function backfill() {
   backfilling.value = true
   try {
+    // 后端已改后台线程执行(7 赛道×多源×重试最坏分钟级):接口立即返回 queued,
+    // 结果看任务日志(tracks_backfill)与赛道列表,这里延迟刷新两轮
     const r = await api.post('/api/screener/tracks/backfill')
-    const results = r?.results || {}
-    const names = Object.keys(results)
-    const total = names.reduce((s, k) => s + Number(results[k]?.added || 0), 0)
-    const errs = r?.errors || []
-    if (errs.length) ElMessage.warning(`回填完成：${names.length} 赛道新增 ${total} 只，部分失败：${errs.slice(0, 2).join('；')}`)
-    else ElMessage.success(`回填完成：${names.length} 赛道新增 ${total} 只`)
-    await load()
+    if (r?.queued) {
+      ElMessage.success(r.message || '已提交后台执行')
+      syncTimers.forEach(clearTimeout)
+      syncTimers = [
+        setTimeout(() => { load() }, 15000),
+        setTimeout(() => { load() }, 45000),
+      ]
+    } else {
+      // 兼容旧同步返回结构
+      const results = r?.results || {}
+      const names = Object.keys(results)
+      const total = names.reduce((s, k) => s + Number(results[k]?.added || 0), 0)
+      const errs = r?.errors || []
+      if (errs.length) ElMessage.warning(`回填完成：${names.length} 赛道新增 ${total} 只，部分失败：${errs.slice(0, 2).join('；')}`)
+      else ElMessage.success(`回填完成：${names.length} 赛道新增 ${total} 只`)
+      await load()
+    }
   } catch (err) {
     const msg = err?.response?.data?.detail || err?.message || '回填失败'
     ElMessage.error(typeof msg === 'string' ? msg : JSON.stringify(msg))

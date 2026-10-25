@@ -4,6 +4,7 @@
 定位:低频采集(每日2次)+ 关键词规则打标 + 噪声过滤,服务「赛道确认与热度」,
 不追求时效、不作入场依据。大V言论不采集。
 """
+import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -72,7 +73,8 @@ def sync_news(db: Session, limit: int = 300) -> dict:
         text = title + " " + summary
         publish = row["publish_time"]
         if publish is not None and getattr(publish, "tzinfo", None) is not None:
-            publish = publish.replace(tzinfo=None)
+            # 统一换算到本系统时区(Asia/Shanghai)再存 naive,不是直接丢掉 tzinfo
+            publish = publish.astimezone(dg.TZ).replace(tzinfo=None)
         if publish is not None and publish < cutoff:
             continue
 
@@ -105,9 +107,10 @@ def sync_news(db: Session, limit: int = 300) -> dict:
             category=related_track or ("基本面" if has_sustain else "其他"),
             sentiment=sentiment, related_industry=related_track,
             related_codes=",".join(re.findall(r"\b(\d{6})\b", text))[:60],
-            heat=float(max(heat, 0)), rule_hits=str({
+            # json.dumps 保证合法 JSON(旧 str(dict).replace 会产出 True/False 非法字面量)
+            heat=float(max(heat, 0)), rule_hits=json.dumps({
                 "bull": bull, "bear": bear, "noise": noise, "sustain": has_sustain,
-            }).replace("'", '"'),
+            }, ensure_ascii=False),
             screened=screened,
         ))
         stored += 1

@@ -36,7 +36,12 @@ router.beforeEach((to) => {
   if (!to.meta.public && !token) return '/login'
   // 角色路由守卫(菜单已过滤,这里防手输 URL)
   if (to.meta.roles?.length) {
-    const user = JSON.parse(localStorage.getItem('user') || 'null')
+    let user = null
+    try {
+      user = JSON.parse(localStorage.getItem('user') || 'null')
+    } catch {
+      localStorage.removeItem('user') // 脏数据不能让路由守卫抛错导致白屏
+    }
     const role = user?.role || 'user'
     if (!to.meta.roles.includes(role)) return '/dashboard'
   }

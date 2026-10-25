@@ -24,6 +24,7 @@ PM02_POSITIONS = {
 }
 MIN_DWELL_DAYS = 60      # 最小驻留期(约一个季度,升级需满足)
 UPGRADE_CONFIRM_N = 2    # 升级(加风险)需连续确认次数
+STAGE_GAP_TOLERANCE_DAYS = 10   # 容忍周末+最长假期(春节/国庆约9天)的日历断档
 
 
 def _pct_rank(series: pd.Series, value: float) -> float:
@@ -281,7 +282,10 @@ def compute_market_state(db: Session, trade_date: date | None = None) -> MarketS
         if same_stage_rows:
             run = [same_stage_rows[0]]
             for d in same_stage_rows[1:]:
-                if (run[-1] - d).days == 1:
+                # MarketState 只在交易日写入,周末/长假必然断档;
+                # 用容忍值而非"必须相邻1天",否则驻留起点永远被截断到本自然周,
+                # MIN_DWELL_DAYS 无法满足,升档方向永不生效。
+                if (run[-1] - d).days <= STAGE_GAP_TOLERANCE_DAYS:
                     run.append(d)
                 else:
                     break

@@ -570,21 +570,23 @@ def task_fund_flow_snapshot(db: Session):
                         "board_name": name,
                         "net_inflow": _f(r.get("fund_flow")),
                         "snap_time": snap_time, "source": "akshare"}
-                if db.bind and db.bind.dialect.name == "sqlite":
-                    stmt = sqlite_insert(FundFlowSnapshot).values(**vals)
-                    stmt = stmt.on_conflict_do_nothing(
-                        index_elements=["board_type", "board_code", "snap_time"])
-                    db.execute(stmt)
-                else:
-                    exists = db.execute(select(FundFlowSnapshot).where(
-                        FundFlowSnapshot.board_type == board_type,
-                        FundFlowSnapshot.board_code == code,
-                        FundFlowSnapshot.snap_time == snap_time)).scalar_one_or_none()
-                    if exists is None:
-                        db.add(FundFlowSnapshot(**vals))
+                # 逐行 savepoint:单行失败只回滚本行,不再用 db.rollback()
+                # (那会把本循环已积累的未提交行整批回滚,计数虚高)。
+                with db.begin_nested():
+                    if db.bind and db.bind.dialect.name == "sqlite":
+                        stmt = sqlite_insert(FundFlowSnapshot).values(**vals)
+                        stmt = stmt.on_conflict_do_nothing(
+                            index_elements=["board_type", "board_code", "snap_time"])
+                        db.execute(stmt)
+                    else:
+                        exists = db.execute(select(FundFlowSnapshot).where(
+                            FundFlowSnapshot.board_type == board_type,
+                            FundFlowSnapshot.board_code == code,
+                            FundFlowSnapshot.snap_time == snap_time)).scalar_one_or_none()
+                        if exists is None:
+                            db.add(FundFlowSnapshot(**vals))
                 rows += 1
-            except Exception as exc:  # noqa: BLE001 单行失败不污染整批
-                db.rollback()
+            except Exception as exc:  # noqa: BLE001 单行失败不污染整批(savepoint 已回滚本行)
                 errors.append(f"{board_type}/{name}: {exc}"[:200])
     db.commit()
     out: dict = {"rows": rows, "time": snap_time.isoformat()}
@@ -625,44 +627,48 @@ def task_watch_alert(db: Session):
     触及 cost_price±1%;去重:同 user+code+rule 24h 内已推送跳过
     (查 WatchAlertLog,只按时间查,无唯一约束)。
     返回 {"alerts": n, "errors": [...]}。"""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
 
     from .portfolio.models import WatchAlertLog, Watchlist
     from .shared import stock_ref
 
     watches = db.execute(select(Watchlist)).scalars().all()
     alerts, errors = 0, []
-    since = datetime.now() - timedelta(hours=WATCH_ALERT_WINDOW_HOURS)
+    # WatchAlertLog.created_at 默认存 naive UTC(_now());去重窗口必须同口径,
+    # 用本地时(datetime.now())在非 UTC 容器里会错位 8h。
+    since = datetime.now(timezone.utc).replace(tzinfo=None) \
+        - timedelta(hours=WATCH_ALERT_WINDOW_HOURS)
     for w in watches:
         try:
-            latest = stock_ref.latest_close(db, w.code)
-            if latest is None:
-                continue
-            _qd, close = latest
-            hist = stock_ref.quote_history(db, w.code, days=5)
-            prev = hist[-2]["close"] if len(hist) >= 2 else None
-            pct = ((close / prev - 1) * 100) if prev else 0.0
-            hits: list[tuple[str, str]] = []
-            if w.take_profit and close >= w.take_profit:
-                hits.append(("take_profit", f"{w.code} 现价 {close} 已达止盈位 {w.take_profit}"))
-            if w.stop_loss and close <= w.stop_loss:
-                hits.append(("stop_loss", f"{w.code} 现价 {close} 已触止损位 {w.stop_loss}"))
-            if w.alert_pct and abs(pct) >= w.alert_pct:
-                hits.append(("alert_pct", f"{w.code} 涨跌幅 {pct:.2f}% 触阈值 ±{w.alert_pct}%"))
-            if w.cost_price and abs(close / w.cost_price - 1) <= 0.01:
-                hits.append(("cost_touch", f"{w.code} 现价 {close} 触及成本 {w.cost_price}±1%"))
-            for rule, message in hits:
-                dup = db.execute(select(WatchAlertLog.id).where(
-                    WatchAlertLog.user_id == w.user_id, WatchAlertLog.code == w.code,
-                    WatchAlertLog.rule == rule,
-                    WatchAlertLog.created_at >= since)).first()
-                if dup:
-                    continue  # 24h 内已推送,去重跳过
-                db.add(WatchAlertLog(user_id=w.user_id, code=w.code,
-                                     rule=rule, message=message))
-                alerts += 1
-        except Exception as exc:  # noqa: BLE001 单行异常隔离
-            db.rollback()
+            # 逐自选 savepoint:单条失败只回滚本条,不整批回滚
+            with db.begin_nested():
+                latest = stock_ref.latest_close(db, w.code)
+                if latest is None:
+                    continue
+                _qd, close = latest
+                hist = stock_ref.quote_history(db, w.code, days=5)
+                prev = hist[-2]["close"] if len(hist) >= 2 else None
+                pct = ((close / prev - 1) * 100) if prev else 0.0
+                hits: list[tuple[str, str]] = []
+                if w.take_profit and close >= w.take_profit:
+                    hits.append(("take_profit", f"{w.code} 现价 {close} 已达止盈位 {w.take_profit}"))
+                if w.stop_loss and close <= w.stop_loss:
+                    hits.append(("stop_loss", f"{w.code} 现价 {close} 已触止损位 {w.stop_loss}"))
+                if w.alert_pct and abs(pct) >= w.alert_pct:
+                    hits.append(("alert_pct", f"{w.code} 涨跌幅 {pct:.2f}% 触阈值 ±{w.alert_pct}%"))
+                if w.cost_price and abs(close / w.cost_price - 1) <= 0.01:
+                    hits.append(("cost_touch", f"{w.code} 现价 {close} 触及成本 {w.cost_price}±1%"))
+                for rule, message in hits:
+                    dup = db.execute(select(WatchAlertLog.id).where(
+                        WatchAlertLog.user_id == w.user_id, WatchAlertLog.code == w.code,
+                        WatchAlertLog.rule == rule,
+                        WatchAlertLog.created_at >= since)).first()
+                    if dup:
+                        continue  # 24h 内已推送,去重跳过
+                    db.add(WatchAlertLog(user_id=w.user_id, code=w.code,
+                                         rule=rule, message=message))
+                    alerts += 1
+        except Exception as exc:  # noqa: BLE001 单行异常隔离(savepoint 已回滚本条)
             errors.append(f"{w.code}: {exc}"[:200])
             log.warning("watch alert %s failed: %s", w.code, exc)
     db.commit()

@@ -43,18 +43,18 @@ const saving = ref(false)
 const testResult = ref(null)
 
 // 本机环回:允许 http(本地 vLLM 调试);远程 http 由服务端拒绝,这里只做提示不拦截保存
-function isLoopbackHttp(url) {
+// 统一解析一次 URL,host 判定只写一份(避免环回/远程两套逻辑漂移)
+function parseHttpUrl(url) {
   try {
     const u = new URL(String(url || '').trim())
-    return u.protocol === 'http:' && ['localhost', '127.0.0.1', '::1'].includes(u.hostname)
-  } catch { return false }
+    if (u.protocol !== 'http:') return null
+    return { loopback: ['localhost', '127.0.0.1', '::1'].includes(u.hostname) }
+  } catch { return null }
 }
-const localHttpHint = computed(() => isLoopbackHttp(form.value.base_url))
+const localHttpHint = computed(() => !!parseHttpUrl(form.value.base_url)?.loopback)
 function isRemoteHttp(url) {
-  try {
-    const u = new URL(String(url || '').trim())
-    return u.protocol === 'http:' && !['localhost', '127.0.0.1', '::1'].includes(u.hostname)
-  } catch { return false }
+  const parsed = parseHttpUrl(url)
+  return !!parsed && !parsed.loopback
 }
 
 const rules = {
@@ -89,13 +89,13 @@ async function save() {
   }
 }
 
-// 停用状态单保存:不校验 URL/模型(后端 enabled=false 时不要求必填),只下发 enabled=false
+// 停用状态单保存:后端 enabled=false 时不要求 URL/模型必填,留空则保留原配置
 async function saveDisabled() {
   saving.value = true
   try {
     await api.put('/api/settings/llm', { ...form.value, enabled: false })
     form.value.enabled = false
-    ElMessage.success('已保存为停用状态(URL/模型未校验)')
+    ElMessage.success('已保存为停用状态(启用时才要求 URL/模型)')
   } finally {
     saving.value = false
   }

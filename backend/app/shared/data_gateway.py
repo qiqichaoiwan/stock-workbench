@@ -58,6 +58,8 @@ _SOURCE_DEFAULT_COOLDOWN = 300.0
 _SOURCE_COOLDOWN_SECONDS = {
     "daily_hist_ak": 600.0,       # 东财限流后 10 分钟不再逐股重试,回填直走 tx/sina
     "industry_board_list": 600.0,  # 东财板块失败 10 分钟直接走新浪
+    "concept_em": 600.0,     # 东财概念成分失败 10 分钟,直接走降级链(ths/sina/keyword)
+    "concept_sina": 600.0,   # 新浪概念源失败同理,冷却期内跳过
     "spot_snapshot_ak": 300.0,
     "spot_snapshot_ef": 300.0,
     "spot_snapshot_sina": 300.0,
@@ -655,15 +657,21 @@ TRACK_THS_MAP: dict[str, str] = {
     "AI算力": "308828", "算力概念": "308828",
 }
 
+# 同花顺概念名单缓存(P2:东财被墙时逐赛道 sync 都要拉名单,TTL 内只拉一次)
+_ths_cache_lock = threading.Lock()
+_THS_LIST_CACHE: tuple[float, list[str], list[str]] | None = None  # (ts, names, codes)
+_THS_LIST_TTL = 3600.0
 
-@resilient("concept_board_ths")
-def _concept_board_cons_ths(board_name: str) -> pd.DataFrame:
-    """同花顺名单核验:ak.stock_board_concept_name_ths() 名单存在即返回占位标记行。
 
-    列:code,name,ths_code;code 取 "THS:"+ths_code 特殊标记(如 "THS:308294"),
-    name 取 board_name。名单未命中抛错,由上游降级到 sina/keyword/local。
-    真实成分由 universe_manager 按 TRACK_SEED_MAP 展开,网关层只管核验。
-    """
+def _ths_concept_list() -> tuple[list[str], list[str]]:
+    """同花顺全量概念名单 → (names, codes),模块级缓存 TTL 3600s。
+
+    名单拉取失败不缓存,异常上抛由 resilient 重试/降级。"""
+    global _THS_LIST_CACHE
+    with _ths_cache_lock:
+        if _THS_LIST_CACHE is not None and \
+                time.monotonic() - _THS_LIST_CACHE[0] < _THS_LIST_TTL:
+            return _THS_LIST_CACHE[1], _THS_LIST_CACHE[2]
     import akshare as ak
 
     names_df = ak.stock_board_concept_name_ths()
@@ -675,6 +683,21 @@ def _concept_board_cons_ths(board_name: str) -> pd.DataFrame:
         raise RuntimeError(f"ths concept name list columns missing: {list(names_df.columns)}")
     names = names_df[name_col].astype(str).tolist()
     codes = names_df[code_col].astype(str).tolist() if code_col else [""] * len(names)
+    with _ths_cache_lock:
+        _THS_LIST_CACHE = (time.monotonic(), names, codes)
+    return names, codes
+
+
+@resilient("concept_board_ths")
+def _concept_board_cons_ths(board_name: str) -> pd.DataFrame:
+    """同花顺名单核验:ak.stock_board_concept_name_ths() 名单存在即返回占位标记行。
+
+    列:code,name,ths_code;code 取 "THS:"+ths_code 特殊标记(如 "THS:308294"),
+    name 取 board_name。名单未命中抛错,由上游降级到 sina/keyword/local。
+    真实成分由 universe_manager 按 TRACK_SEED_MAP 展开,网关层只管核验。
+    名单拉取带模块级 3600s 缓存(见 _ths_concept_list),东财被墙批量同步时只拉一次。
+    """
+    names, codes = _ths_concept_list()
     ths_code: str | None = None
     # ① 内置映射优先:board_name 在 TRACK_THS_MAP 且该 code 在名单内
     mapped = TRACK_THS_MAP.get(board_name)
@@ -733,31 +756,61 @@ def _concept_board_cons_sina(board_name: str) -> pd.DataFrame:
     })
 
 
-def _concept_board_keyword(board_name: str, track=None) -> pd.DataFrame:
+# 关键词兜底用的全市场快照缓存(P2:批量赛道逐个 sync 时复用,避免重复全市场拉取)
+_snap_cache_lock = threading.Lock()
+_SNAP_CACHE: tuple[float, pd.DataFrame] | None = None  # (monotonic_ts, df)
+_SNAP_CACHE_TTL = 120.0
+
+
+def _cached_spot_snapshot() -> pd.DataFrame:
+    """get_spot_snapshot 模块级 120s 缓存:concept keyword 兜底批量复用。"""
+    global _SNAP_CACHE
+    with _snap_cache_lock:
+        if _SNAP_CACHE is not None and time.monotonic() - _SNAP_CACHE[0] < _SNAP_CACHE_TTL:
+            return _SNAP_CACHE[1]
+    df = get_spot_snapshot()
+    with _snap_cache_lock:
+        _SNAP_CACHE = (time.monotonic(), df)
+    return df
+
+
+def _concept_board_keyword(board_name: str, track=None, db=None) -> pd.DataFrame:
     """关键词兜底:全市场快照按名称/代码包含过滤。列:code,name。
 
     三层命中(任一即收录):① track.keywords 逗号切词逐词 name/industry 包含
-    (大小写不敏感,str.contains case=False);② track.industry_index 等值
-    (industry == industry_index);③ board_name 自身。track 为 None 时保持原
-    board_name 行为。"""
-    snap = get_spot_snapshot()
+    (大小写不敏感,str.contains case=False regex=False);② track.industry_index
+    等值(industry == industry_index);③ board_name 自身。track 为 None 时保持原
+    board_name 行为。
+    快照本身无 industry 列:传入 db 时查 StockBasic 构建 code→industry 映射
+    (import 放函数内避免循环依赖);无 db 时按空行业降级(行业匹配不生效)。"""
+    snap = _cached_spot_snapshot()
     terms: list[str] = []
     if track is not None and getattr(track, "keywords", None):
         terms = [w.strip() for w in str(track.keywords).replace("，", ",")
                  .replace("、", ",").split(",") if w.strip()]
-    ifc = snap.get("industry", pd.Series("", index=snap.index)).astype(str)
+    if db is not None:
+        from ..screener.models import StockBasic  # 函数内 import 避免循环依赖
+        from sqlalchemy import select as _sa_select
+
+        mapping = {c: (ind or "") for c, ind in db.execute(
+            _sa_select(StockBasic.code, StockBasic.industry)).all()}
+        ifc = snap["code"].map(mapping).fillna("")
+    else:
+        ifc = snap.get("industry", pd.Series("", index=snap.index))
+    ifc = ifc.astype(str)
     name_s = snap["name"].astype(str)
     mask_kw = pd.Series(False, index=snap.index)
     for w in terms:
         mask_kw = (mask_kw
-                   | name_s.str.contains(w, na=False, case=False)
-                   | ifc.str.contains(w, na=False, case=False))
+                   | name_s.str.contains(w, na=False, case=False, regex=False)
+                   | ifc.str.contains(w, na=False, case=False, regex=False))
     mask_ind = pd.Series(False, index=snap.index)
     idx = getattr(track, "industry_index", "") if track is not None else ""
     if idx:
         mask_ind = ifc == idx
-    mask_board = (name_s.str.contains(board_name, na=False)
-                  | snap["code"].astype(str).str.contains(board_name, na=False))
+    mask_board = (name_s.str.contains(board_name, na=False, regex=False)
+                  | snap["code"].astype(str).str.contains(board_name, na=False,
+                                                          regex=False))
     mask = mask_kw | mask_ind | mask_board
     out = snap.loc[mask, ["code", "name"]].drop_duplicates("code").copy()
     if out.empty:
@@ -765,22 +818,31 @@ def _concept_board_keyword(board_name: str, track=None) -> pd.DataFrame:
     return out
 
 
-def get_concept_board_members_with_source(board_name: str, track=None) -> tuple[pd.DataFrame, str]:
+def get_concept_board_members_with_source(board_name: str, track=None,
+                                          db=None) -> tuple[pd.DataFrame, str]:
     """概念板块成分四源降级(东财→同花顺名单核验→新浪名字匹配→全市场关键词过滤)。
 
     ths 源只做"名单存在性核验+占位":返回 THS: 标记行(列 code,name,ths_code),
     真实成分由 universe_manager 按 TRACK_SEED_MAP 展开。
+    东财/新浪源带源级冷却("concept_em"/"concept_sina",600s):失败进入冷却,
+    冷却期内直接跳过该源走降级链,避免东财被墙时逐板块连环重试。
+    db 透传给 keyword 兜底(查 StockBasic.industry,快照本身无该列)。
     返回 (df, source),source∈{"eastmoney","ths","sina","keyword"};四源皆失败才抛错。
     """
     last_err: Exception | None = None
-    try:
-        df = _concept_board_cons_em(board_name)
-        if len(df) > 0:
-            return df, "eastmoney"
-        last_err = RuntimeError("_concept_board_cons_em: empty result")
-    except Exception as exc:  # noqa: BLE001
-        last_err = exc
-        log.warning("concept board eastmoney failed for %s: %s", board_name, exc)
+    if _cooldown_check("concept_em"):
+        log.info("concept source eastmoney in cooldown, skip for %s", board_name)
+    else:
+        try:
+            df = _concept_board_cons_em(board_name)
+            if len(df) > 0:
+                _cooldown_clear("concept_em")
+                return df, "eastmoney"
+            last_err = RuntimeError("_concept_board_cons_em: empty result")
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            _cooldown_set("concept_em")
+            log.warning("concept board eastmoney failed for %s: %s", board_name, exc)
     try:
         df = _concept_board_cons_ths(board_name)
         if len(df) > 0:
@@ -789,16 +851,21 @@ def get_concept_board_members_with_source(board_name: str, track=None) -> tuple[
     except Exception as exc:  # noqa: BLE001
         last_err = exc
         log.warning("concept board ths fallback failed for %s: %s", board_name, exc)
+    if _cooldown_check("concept_sina"):
+        log.info("concept source sina in cooldown, skip for %s", board_name)
+    else:
+        try:
+            df = _concept_board_cons_sina(board_name)
+            if len(df) > 0:
+                _cooldown_clear("concept_sina")
+                return df, "sina"
+            last_err = RuntimeError("_concept_board_cons_sina: empty result")
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            _cooldown_set("concept_sina")
+            log.warning("concept board sina fallback failed for %s: %s", board_name, exc)
     try:
-        df = _concept_board_cons_sina(board_name)
-        if len(df) > 0:
-            return df, "sina"
-        last_err = RuntimeError("_concept_board_cons_sina: empty result")
-    except Exception as exc:  # noqa: BLE001
-        last_err = exc
-        log.warning("concept board sina fallback failed for %s: %s", board_name, exc)
-    try:
-        df = _concept_board_keyword(board_name, track)
+        df = _concept_board_keyword(board_name, track, db)
         return df, "keyword"
     except Exception as exc:  # noqa: BLE001
         last_err = exc
@@ -806,11 +873,11 @@ def get_concept_board_members_with_source(board_name: str, track=None) -> tuple[
     raise RuntimeError(f"[data_gateway] concept_board({board_name}) 四源均失败: {last_err}")
 
 
-def get_concept_board_members(board_name: str, track=None) -> pd.DataFrame:
+def get_concept_board_members(board_name: str, track=None, db=None) -> pd.DataFrame:
     """东财概念板块成分(向后兼容:只返回 DataFrame,来源见 with_source 版本)。
 
     列:code,name(供赛道成分同步;四源皆失败时抛错由上层转友好提示)。"""
-    df, _ = get_concept_board_members_with_source(board_name, track)
+    df, _ = get_concept_board_members_with_source(board_name, track, db)
     return df
 
 
@@ -1118,13 +1185,13 @@ def _coerce_trade_date_str(trade_date) -> str:
     return s if len(s) == 8 and s.isdigit() else today().strftime("%Y%m%d")
 
 
-@resilient("lhb_daily")
-def get_lhb_daily(trade_date=None) -> pd.DataFrame:
-    """龙虎榜日明细(东财):列 code/name/trade_date/close/pct_chg(涨跌幅%)/lhb_net(万)/buy_seats/sell_seats。
+@resilient("lhb_bill")
+def get_lhb_bill(trade_date=None) -> pd.DataFrame:
+    """龙虎榜榜单(东财,单次请求,轻量):列 code/name/trade_date/close/pct_chg/lhb_net(万)。
 
-    trade_date: date/datetime/'YYYYMMDD' 均可,缺省今天。实现按该日期单日抓取
-    stock_lhb_detail_em,再逐股调 stock_lhb_stock_detail_em 取买卖前五席位。
-    失败抛错(由上层 task 记 failed)。"""
+    与席位明细拆层:榜单一次拉全,席位逐股调 get_lhb_seats——不再把
+    "逐股×买卖 2 次"套进同一个 @resilient 60s 线程超时(上榜股 ≥30 只时
+    整体必超时,3 次重试全废)。失败抛错由上层处理。"""
     import akshare as ak
 
     ds = _coerce_trade_date_str(trade_date)
@@ -1137,28 +1204,49 @@ def get_lhb_daily(trade_date=None) -> pd.DataFrame:
     td = pd.to_datetime(detail[date_col], errors="coerce").dt.date if date_col else None
     rows = []
     for _, r in detail.iterrows():
-        code = r["code"]
         tdate = td.loc[r.name] if td is not None and pd.notna(td.loc[r.name]) \
             else datetime.strptime(ds, "%Y%m%d").date()
         if hasattr(tdate, "date"):
             tdate = tdate.date()
+        rows.append({"code": r["code"], "name": str(r.get("name", "")),
+                     "trade_date": tdate, "close": float(r.get("close") or 0.0),
+                     "pct_chg": float(r.get("pct_chg") or 0.0),
+                     "lhb_net": float(r.get("lhb_net") or 0.0) / 1e4})
+    return pd.DataFrame(rows, columns=["code", "name", "trade_date", "close",
+                                       "pct_chg", "lhb_net"])
+
+
+def get_lhb_seats(code: str, trade_date, flag: str = "买入") -> list[str]:
+    """单股席位明细(东财,逐股调用,不套外层 resilient 整体超时)。
+
+    flag: "买入"/"卖出"。失败抛错,调用方逐股 try/except 隔离。"""
+    import akshare as ak
+
+    _rate_limit()
+    seat_df = _run_with_timeout(
+        ak.stock_lhb_stock_detail_em, settings.fetch_timeout_seconds,
+        symbol=code, date=_coerce_trade_date_str(trade_date), flag=flag)
+    if seat_df is not None and "交易营业部名称" in seat_df.columns:
+        return seat_df["交易营业部名称"].astype(str).str.strip().tolist()
+    return []
+
+
+def get_lhb_daily(trade_date=None) -> pd.DataFrame:
+    """龙虎榜日明细 = 榜单(get_lhb_bill) + 逐股席位(get_lhb_seats)。
+
+    逐股席位失败只留空列表不拖垮整批;整体不包 @resilient(60s 超时
+    覆盖逐股循环在繁忙交易日必超时,是结构性缺陷,见审计 P1#7)。"""
+    detail = get_lhb_bill(trade_date)
+    rows = []
+    for _, r in detail.iterrows():
         buy_seats: list[str] = []
         sell_seats: list[str] = []
         for flag, bucket in (("买入", buy_seats), ("卖出", sell_seats)):
             try:
-                _rate_limit()
-                seat_df = _run_with_timeout(
-                    ak.stock_lhb_stock_detail_em, settings.fetch_timeout_seconds,
-                    symbol=code, date=tdate.strftime("%Y%m%d"), flag=flag)
-                if seat_df is not None and "交易营业部名称" in seat_df.columns:
-                    bucket.extend(seat_df["交易营业部名称"].astype(str).str.strip().tolist())
+                bucket.extend(get_lhb_seats(r["code"], r["trade_date"], flag))
             except Exception as exc:  # noqa: BLE001 单股席位失败不拖垮整批
-                log.warning("lhb seats %s %s failed: %s", code, flag, exc)
-        rows.append({"code": code, "name": str(r.get("name", "")),
-                     "trade_date": tdate, "close": float(r.get("close") or 0.0),
-                     "pct_chg": float(r.get("pct_chg") or 0.0),
-                     "lhb_net": float(r.get("lhb_net") or 0.0) / 1e4,
-                     "buy_seats": buy_seats, "sell_seats": sell_seats})
+                log.warning("lhb seats %s %s failed: %s", r["code"], flag, exc)
+        rows.append({**r.to_dict(), "buy_seats": buy_seats, "sell_seats": sell_seats})
     return pd.DataFrame(rows, columns=["code", "name", "trade_date", "close", "pct_chg",
                                        "lhb_net", "buy_seats", "sell_seats"])
 

@@ -166,24 +166,31 @@ onMounted(() => { userStore.fetchMe() })
 
 // 全局搜股:选中后跳 /pool + localStorage 透传,Pool.onMounted 读取填 search
 const stockQ = ref('')
-async function fetchStocks(q, cb) {
+// 防抖 300ms:避免每敲一个字符就打一次 /search(后端拼音索引有缓存但仍省请求)
+let _searchTimer = null
+function fetchStocks(q, cb) {
+  if (_searchTimer) clearTimeout(_searchTimer)
   if (!q?.trim()) return cb([])
-  try {
-    const data = await api.get('/api/screener/search',
-      { params: { q: q.trim(), limit: 20 }, silent: true }).catch(() => [])
-    const list = (Array.isArray(data) ? data : []).map((s) => ({
-      ...s, label: `${s.code} ${s.name || ''}`.trim(), value: `${s.code} ${s.name || ''}`.trim(),
-    }))
-    cb(list)
-  } catch { cb([]) }
+  _searchTimer = setTimeout(async () => {
+    try {
+      const data = await api.get('/api/screener/search',
+        { params: { q: q.trim(), limit: 20 }, silent: true }).catch(() => [])
+      const list = (Array.isArray(data) ? data : []).map((s) => ({
+        ...s, label: `${s.code} ${s.name || ''}`.trim(), value: `${s.code} ${s.name || ''}`.trim(),
+      }))
+      cb(list)
+    } catch { cb([]) }
+  }, 300)
 }
 function onPickStock(item) {
   if (!item?.code) return
-  try { localStorage.setItem('pool_search', item.code) } catch { /* 忽略 */ }
   stockQ.value = ''
   ElMessage.success(`已定位 ${item.code} ${item.name || ''}`.trim())
-  if (route.path === '/pool') location.reload()
-  else router.push('/pool')
+  // 用路由 query 透传,避免 location.reload() 整页刷新丢失其它页面状态
+  const query = { q: item.code }
+  // 已在池页且是同一代码时补时间戳,让 Pool 的 query 监听重新触发定位
+  if (route.path === '/pool' && route.query.q === item.code) query.t = String(Date.now())
+  router.push({ path: '/pool', query })
 }
 
 function onCommand(cmd) {
@@ -206,8 +213,12 @@ async function savePassword() {
       old_password: pwdForm.old_password,
       new_password: pwdForm.new_password,
     })
-    ElMessage.success('密码已修改')
+    // 改密后后端 credential_fingerprint 立即失效旧 token,主动清登录态并跳登录页,
+    // 避免下一次任意请求 401 才被动踢出(像"改密把账号搞坏了")
+    ElMessage.success('密码已修改,请重新登录')
     pwdDialog.value = false
+    userStore.logout()
+    router.push('/login')
   } finally {
     pwdSaving.value = false
   }

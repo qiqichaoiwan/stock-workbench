@@ -47,6 +47,7 @@ onMounted(async () => {
 function validateRow(row) {
   const v = String(row.value).trim()
   if (v === '') return true
+  if (row.key === 'board_allow') return true // 字符串参数(板块白名单),不做数值校验
   const ok = /^-?\d+(\.\d+)?$/.test(v)
   if (!ok) {
     ElMessage.warning(`参数 ${row.key} 需为数值`)

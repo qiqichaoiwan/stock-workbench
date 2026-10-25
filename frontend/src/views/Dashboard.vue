@@ -1,13 +1,14 @@
 <template>
   <div v-loading="loading">
-    <el-card v-if="indexes.length" class="page-card" style="margin-bottom:16px">
-      <div style="display:flex;gap:16px;overflow-x:auto">
+    <el-card class="page-card" style="margin-bottom:16px">
+      <div v-if="indexes.length" style="display:flex;gap:16px;overflow-x:auto">
         <div v-for="ix in indexes" :key="ix.code" style="min-width:140px">
           <div class="muted" style="font-size:12px">{{ ix.name }}</div>
           <div style="font-size:18px;font-weight:700">{{ fmtNum(ix.close) }}</div>
           <div :class="upDownClass(ix.pct_chg)" style="font-size:12px">{{ fmtPct(ix.pct_chg) }} · {{ ix.trade_date }}</div>
         </div>
       </div>
+      <div v-else class="muted" style="font-size:12px">暂无指数数据,请在任务中心运行 indexes 任务采集</div>
     </el-card>
     <el-row :gutter="16">
       <el-col :xs="24" :sm="24" :md="8">
@@ -82,17 +83,17 @@
         <el-card class="page-card state-card">
           <template #header>今日技术信号<span v-if="signalDate" class="muted" style="font-size:12px;margin-left:8px">{{ signalDate }}</span></template>
           <el-table :data="d.signals" size="small" max-height="240" stripe border>
-            <el-table-column prop="code" label="代码" width="85" />
-          <el-table-column label="名称" min-width="90">
-            <template #default="{ row }">{{ nameOrCode(row) }}</template>
-          </el-table-column>
-            <el-table-column label="信号" width="120">
+            <el-table-column prop="code" label="代码" width="72" />
+            <el-table-column label="名称" min-width="80">
+              <template #default="{ row }">{{ nameOrCode(row) }}</template>
+            </el-table-column>
+            <el-table-column label="信号" width="96">
               <template #default="{ row }">
                 <el-tag :type="row.type === 'buy_setup' ? 'danger' : row.type === 'rs_weak' ? 'warning' : 'info'"
                         size="small">{{ typeLabel(row.type) }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="强度" align="right">
+            <el-table-column label="强度" width="60" align="right">
               <template #default="{ row }">{{ fmtNum(row.strength, 1) }}</template>
             </el-table-column>
           </el-table>

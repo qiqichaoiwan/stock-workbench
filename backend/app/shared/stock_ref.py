@@ -5,7 +5,7 @@
 """
 from datetime import date, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..shared import data_gateway as dg
@@ -19,8 +19,9 @@ def latest_quote_date(db: Session) -> date | None:
     return row[0] if row else None
 
 
-def latest_close(db: Session, code: str) -> tuple[date, float] | None:
-    cutoff = dg.completed_trade_day()
+def latest_close(db: Session, code: str, as_of: date | None = None) -> tuple[date, float] | None:
+    """该股截至 as_of(默认已完成交易日)的最新收盘,回填/巡检不偷看未来。"""
+    cutoff = as_of or dg.completed_trade_day()
     row = db.execute(select(DailyQuote.trade_date, DailyQuote.close).where(
         DailyQuote.code == code, DailyQuote.trade_date <= cutoff).order_by(DailyQuote.trade_date.desc()).limit(1)).first()
     return (row[0], float(row[1])) if row else None
@@ -39,6 +40,17 @@ def quote_history(db: Session, code: str, days: int = 60,
         .order_by(DailyQuote.trade_date)).all()
     return [{"trade_date": r[0], "open": r[1], "high": r[2], "low": r[3],
              "close": r[4], "volume": r[5]} for r in rows]
+
+
+def max_high_since(db: Session, code: str, start: date,
+                   as_of: date | None = None) -> float | None:
+    """建仓日(含)以来的最高价;as_of 截止,禁止偷看未来行情。"""
+    cutoff = as_of or dg.completed_trade_day()
+    v = db.execute(select(func.max(DailyQuote.high)).where(
+        DailyQuote.code == code,
+        DailyQuote.trade_date >= start,
+        DailyQuote.trade_date <= cutoff)).scalar()
+    return float(v) if v is not None else None
 
 
 def atr14(db: Session, code: str, as_of: date | None = None) -> float | None:
@@ -63,6 +75,19 @@ def atr14(db: Session, code: str, as_of: date | None = None) -> float | None:
     for tr in trs[14:]:
         atr = (atr * 13 + tr) / 14
     return round(atr, 4)
+
+
+def stock_exists(db: Session, code: str) -> bool:
+    """代码是否真实存在:查基础表或行情表。
+
+    部分代码(如北交所/新上市)只落了行情未落 StockBasic,故两表都可作为依据;
+    纯占位代码(999999)两表皆无 → False。
+    """
+    if db.execute(select(StockBasic.code).where(
+            StockBasic.code == code).limit(1)).first() is not None:
+        return True
+    return db.execute(select(DailyQuote.code).where(
+        DailyQuote.code == code).limit(1)).first() is not None
 
 
 def stock_name(db: Session, code: str) -> str:

@@ -80,7 +80,10 @@ def current_user_id(
     if credentials is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "未登录")
     payload = decode_token(credentials.credentials)
-    user_id = int(payload["sub"])
+    try:
+        user_id = int(payload["sub"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "无效凭证")
     from ..portfolio.models import User  # 局部导入避免模型加载顺序问题
 
     user = db.get(User, user_id)

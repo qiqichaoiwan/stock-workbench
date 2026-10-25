@@ -28,6 +28,7 @@ _login_lock = threading.Lock()
 
 
 def _check_login_rate(client_ip: str) -> None:
+    """只检查窗口,不计数:成功登录不应消耗失败配额(旧实现把成功也计入)。"""
     now = time.time()
     with _login_lock:
         q = _login_attempts[client_ip]
@@ -35,11 +36,16 @@ def _check_login_rate(client_ip: str) -> None:
             q.popleft()
         if len(q) >= _LOGIN_MAX_ATTEMPTS:
             raise HTTPException(429, "尝试过于频繁,请 1 分钟后再试")
-        q.append(now)
 
 
 def _record_login_fail(client_ip: str) -> None:
-    pass  # 失败尝试已在 _check_login_rate 计入窗口
+    """仅失败尝试计入滑动窗口。"""
+    now = time.time()
+    with _login_lock:
+        q = _login_attempts[client_ip]
+        while q and now - q[0] > _LOGIN_WINDOW_SECONDS:
+            q.popleft()
+        q.append(now)
 
 
 # ---------- 注册(凭邀请码) ----------
@@ -58,18 +64,19 @@ def generate_invite(db: Session, created_by: int, note: str = "",
 def register(db: Session, username: str, password: str, nickname: str = "",
              invite_code: str = "") -> User:
     """凭一次性邀请码注册;校验存在/未用/未过期/未作废,用后即焚。"""
+    # 邀请码问题属请求参数校验失败,用 400 而非 403(403 表示已认证但无权访问)
     if not invite_code or not invite_code.strip():
-        raise HTTPException(403, "注册需要邀请码,请联系管理员获取")
+        raise HTTPException(400, "注册需要邀请码,请联系管理员获取")
     inv = db.execute(select(InviteCode).where(
         InviteCode.code == invite_code.strip().upper())).scalar_one_or_none()
     if inv is None or not inv.active:
-        raise HTTPException(403, "邀请码无效")
+        raise HTTPException(400, "邀请码无效")
     if inv.used_by is not None:
-        raise HTTPException(403, "邀请码已被使用")
+        raise HTTPException(400, "邀请码已被使用")
     # SQLite DateTime 读回为 naive,统一按 UTC 处理再比较
     exp = inv.expires_at.replace(tzinfo=timezone.utc) if inv.expires_at else None
     if exp is not None and exp < datetime.now(timezone.utc):
-        raise HTTPException(403, "邀请码已过期")
+        raise HTTPException(400, "邀请码已过期")
 
     exists = db.execute(select(User).where(User.username == username)).scalar_one_or_none()
     if exists:
@@ -86,7 +93,7 @@ def register(db: Session, username: str, password: str, nickname: str = "",
     ).rowcount
     if not claimed:
         db.rollback()
-        raise HTTPException(403, "邀请码已被使用")
+        raise HTTPException(400, "邀请码已被使用")
     db.commit()
     db.refresh(user)
     log.info("新用户注册: %s(邀请码 %s)", username, inv.code)
@@ -96,9 +103,11 @@ def register(db: Session, username: str, password: str, nickname: str = "",
 # ---------- 登录 ----------
 
 def login(db: Session, username: str, password: str, client_ip: str = "") -> dict:
-    _check_login_rate(client_ip or "unknown")
+    client_ip = client_ip or "unknown"
+    _check_login_rate(client_ip)
     user = db.execute(select(User).where(User.username == username)).scalar_one_or_none()
     if user is None or not verify_password(password, user.password_hash):
+        _record_login_fail(client_ip)
         raise HTTPException(401, "用户名或密码错误")
     if not user.is_active:
         raise HTTPException(403, "账号已停用,请联系管理员")

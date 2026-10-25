@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     # 系统级兜底 LLM(OpenAI 兼容协议);用户自配优先。
     # 默认空 = 无兜底:llm_gateway.resolve_config 返回 source="none"/enabled=False,
     # 上层降级为纯规则输出,绝不静默伪造 AI 内容。生产如需启用,三项必须全配。
-    default_llm_base_url: str = "https://api.deepseek.com/v1"
+    default_llm_base_url: str = ""
     default_llm_api_key: str = ""
     default_llm_model: str = "deepseek-chat"
 

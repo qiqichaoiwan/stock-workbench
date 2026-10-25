@@ -1,6 +1,6 @@
 """权限体系与邀请码注册的 API 级测试(独立临时库,不碰生产数据)。
 
-覆盖:邀请码一次性、无码拒绝、禁用用户 401、角色分级(user 403 / analyst 200)、
+覆盖:邀请码一次性、无码拒绝(400)、禁用用户 401、角色分级(user 403 / analyst 200)、
 最后一个管理员保护、修改密码、用户管理仅 admin 可见。
 """
 import os
@@ -63,7 +63,8 @@ def setup_function(_):
 def test_register_without_invite_rejected():
     r = client.post("/api/auth/register",
                     json={"username": "nobody", "password": "whatever-123"})
-    assert r.status_code == 403
+    # 邀请码缺失属请求参数校验失败 → 400(403 表示已认证但无权访问)
+    assert r.status_code == 400
     assert "邀请码" in r.json()["detail"]
 
 
@@ -79,18 +80,18 @@ def test_invite_one_time_use():
                           "invite_code": code})
     assert r.status_code == 200 and r.json()["role"] == "user"
 
-    # 复用同一邀请码 → 拒绝
+    # 复用同一邀请码 → 拒绝(参数校验失败 → 400)
     r = client.post("/api/auth/register",
                     json={"username": "newbie2", "password": "newbie-pass-123",
                           "invite_code": code})
-    assert r.status_code == 403
+    assert r.status_code == 400
 
 
 def test_invalid_invite_rejected():
     r = client.post("/api/auth/register",
                     json={"username": "newbie3", "password": "newbie-pass-123",
                           "invite_code": "INV-NOTEXIST"})
-    assert r.status_code == 403
+    assert r.status_code == 400
 
 
 def test_inactive_user_token_rejected():

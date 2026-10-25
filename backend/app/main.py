@@ -1,6 +1,8 @@
 """FastAPI 应用入口。"""
 import logging
 import os
+import re
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,12 +22,20 @@ def _is_production() -> bool:
     return os.environ.get("APP_ENV", os.environ.get("ENV", "")).lower() == "production"
 
 
+def _low_entropy(secret: str) -> bool:
+    """朴素熵检查:字符种类过少,或整串只是某个短片段循环重复(如 aaaa…/abcabc…)。"""
+    if len(set(secret)) < 8:
+        return True
+    return re.fullmatch(r"(.{1,16}?)\1+", secret) is not None
+
+
 def _require_strong_jwt() -> None:
     """JWT 无强密钥直接拒绝启动(防默认密钥上线)。
 
     - 默认值/空:任何环境直接抛错(开发机也必须显式设置 JWT_SECRET,
       与 docker-compose 的 `${JWT_SECRET:?...}` 强制要求一致)。
     - 非默认但长度 <32:生产拒绝启动;开发/测试仅警告(兼容现有测试密钥)。
+    - 生产额外拒绝低熵密钥(长度够但字符种类极少/循环重复)。
     """
     if settings.is_using_default_jwt:
         raise RuntimeError(
@@ -38,44 +48,31 @@ def _require_strong_jwt() -> None:
             raise RuntimeError("拒绝启动:生产 JWT_SECRET 长度不足 32 字符,请换强随机值。")
         logging.getLogger("startup").warning(
             "JWT_SECRET 长度不足 32 字符,仅开发/测试允许;生产部署请换强随机值。")
+    elif _is_production() and _low_entropy(settings.jwt_secret):
+        raise RuntimeError(
+            "拒绝启动:生产 JWT_SECRET 熵过低(字符种类少或循环重复),请用 openssl rand -hex 32 重新生成。")
 
 
 _require_strong_jwt()
 
-app = FastAPI(title=settings.app_name, version="0.1.0")
 
-# CORS(默认同源,显式配置才放行):
-# - 前后端同源部署(后端托管 dist)时无需跨域,此处仅放行 vite dev(5173)与本机调试。
-# - 生产前后端分离部署必须显式配置 CORS_ORIGINS=https://app.example.com(逗号分隔),
-#   为空则默认同源(不放行任意外域);allow_credentials=True 下不使用通配符。
-_extra_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
-if _is_production() and not _extra_origins:
-    logging.getLogger("startup").info(
-        "CORS:生产同源部署,不额外放行外域(如需分离部署请配置 CORS_ORIGINS)。")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"] + _extra_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _startup() -> None:
+    """启动自检:库可用性 → 补建缺表 → 清理僵尸任务 → 默认策略参数 → 调度器。
 
-
-@app.on_event("startup")
-def on_startup():
-    # 缺表检查先行:只告警不静默重建——生产缺表多为备份/挂载问题,先告警再人工处理。
-    # 自检→ 备份(data/selectmoney.db 每日 sqlite3 .backup,保留 7 天,恢复前停容器)
-    #   → 确认无误后由运维手动补表/跑迁移脚本,不要自动 create_all 覆盖。
+    create_all 只新建 metadata 中缺失的表,不会修改已存在表的列/索引,
+    因此不能替代迁移;生产缺表仍会先告警(多为挂载/备份问题),由运维确认后补表。
+    """
+    log = logging.getLogger("startup")
     try:
         missing = missing_tables()
     except Exception as exc:  # noqa: BLE001 库文件不可读等情况同样告警
-        logging.getLogger("startup").error(
+        log.error(
             "数据库自检失败(可能 data 卷未挂载):%s。请先检查备份再启动,不要空库覆盖生产数据。", exc)
         missing = []
     if missing:
-        logging.getLogger("startup").warning(
-            "检测到缺失表 %s:已存在的表不会被改动;请先备份 data/selectmoney.db "
-            "(sqlite3 .backup),再补表/跑迁移,详见 config.py 备份指引。", missing)
+        log.warning(
+            "检测到缺失表 %s:create_all 将补建空表,已存在表的结构不会改动;"
+            "请先备份 data/selectmoney.db(sqlite3 .backup),生产缺表建议人工核对后再启动。", missing)
     create_all()
     from .task_runner import cleanup_zombie_tasks
 
@@ -90,6 +87,33 @@ def on_startup():
     from .scheduler import start_scheduler
 
     start_scheduler()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    _startup()
+    yield
+
+
+app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+
+# CORS(默认同源,显式配置才放行):
+# - 前后端同源部署(后端托管 dist)时无需跨域,此处仅放行 vite dev(5173)与本机调试。
+# - 生产前后端分离部署必须显式配置 CORS_ORIGINS=https://app.example.com(逗号分隔),
+#   为空则默认同源(不放行任意外域);allow_credentials=True 下不使用通配符。
+# - 5173 仅开发期需要(非生产才放行),生产不放行任何本机来源。
+_extra_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+_dev_origins = [] if _is_production() else ["http://localhost:5173", "http://127.0.0.1:5173"]
+if _is_production() and not _extra_origins:
+    logging.getLogger("startup").info(
+        "CORS:生产同源部署,不额外放行外域(如需分离部署请配置 CORS_ORIGINS)。")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_dev_origins + _extra_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/api/health")

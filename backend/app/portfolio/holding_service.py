@@ -53,6 +53,12 @@ def init_holding(db: Session, user_id: int, code: str, buy_price: float, quantit
                  buy_date: date, stop_pct: float = INITIAL_STOP_PCT,
                  take_profit_price: float = 0.0, note: str = "") -> Holding:
     """录入持仓:计算保本价/初始止损/风险R。"""
+    if not code.isdigit():
+        raise ValueError("股票代码须为 6 位数字")
+    if not stock_ref.stock_exists(db, code):
+        raise ValueError(f"股票代码 {code} 不存在")
+    if buy_date > date.today():
+        raise ValueError(f"买入日期 {buy_date} 不能晚于今天")
     name = stock_ref.stock_name(db, code)
     be = breakeven_price(buy_price)
     initial_stop = round(buy_price * (1 - stop_pct / 100), 4)
@@ -96,15 +102,16 @@ def update_daily(db: Session, user_id: int | None = None,
         q = q.where(Holding.user_id == user_id)
     holdings = db.execute(q).scalars().all()
     for h in holdings:
-        latest = stock_ref.latest_close(db, h.code)
+        latest = stock_ref.latest_close(db, h.code, as_of=trade_date)
         if latest is None:
             continue
         qd, close = latest
         if qd < trade_date - timedelta(days=5):
             continue  # 长期停牌:无有效收盘,跳过不推进止损,避免脏数据误触发
-        hist = stock_ref.quote_history(db, h.code, days=30, as_of=trade_date)
-        high_recent = max((q["high"] or q["close"]) for q in hist) if hist else close
-        h.highest_price = max(h.highest_price or h.buy_price, high_recent, close)
+        # 持仓期最高价只统计建仓日(含)以来的行情:若把买入前的前高算进来,
+        # B/C 阶段的 trail 止损可能高于现价,导致"建仓即触发止损"的误报。
+        since_buy = stock_ref.max_high_since(db, h.code, h.buy_date, as_of=trade_date)
+        h.highest_price = max(h.buy_price, since_buy or 0.0, close)
 
         # 阶段A:止损保持初始价不动(禁上移/禁放宽);达标才晋升 B。
         if h.stop_stage == "A" and _stage_b_reached(close, h):
@@ -157,6 +164,13 @@ def sell(db: Session, user_id: int, holding_id: int, sell_price: float,
     if h is None:
         db.rollback()
         raise ValueError("持仓不存在")
+    # 业务日期必须落在 [买入日, 今天]:否则收益/持有天数会算出荒谬值
+    if sell_date < h.buy_date:
+        db.rollback()
+        raise ValueError(f"卖出日期 {sell_date} 早于买入日期 {h.buy_date}")
+    if sell_date > date.today():
+        db.rollback()
+        raise ValueError(f"卖出日期 {sell_date} 不能晚于今天")
     net_buy = h.buy_price * h.quantity * (1 + BUY_COMMISSION + TRANSFER_FEE)
     net_sell = sell_price * h.quantity * (1 - SELL_COMMISSION - STAMP_TAX)
     pnl = net_sell - net_buy

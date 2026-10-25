@@ -1,9 +1,8 @@
-version: "3.8"
-
 # 部署约束(必读,与 app/config.py + app/task_runner.py 对应):
-# - 单 scheduler/单写进程:deploy.replicas=1 固定,不要扩副本。SQLite(WAL)只允许
-#   单写进程,多副本会 WAL 双写冲突 → database is locked / 数据损坏。
-#   横向扩展前必须先切 MySQL/Postgres(DATABASE_URL)+DB advisory 锁,再放开 replicas。
+# - 单 scheduler/单写进程:本文件只定义 1 个副本,不要用 docker compose up --scale 扩副本。
+#   SQLite(WAL)只允许单写进程,多副本会 WAL 双写冲突 → database is locked / 数据损坏。
+#   横向扩展前必须先切 MySQL/Postgres(DATABASE_URL)+DB advisory 锁,再放开副本数。
+#   (注:deploy.replicas 仅在 Swarm 下生效,compose 普通模式忽略,故此处不写,靠注释约束)
 # - 数据备份:data/selectmoney.db(+ -wal/-shm)在 ./data 卷。建议宿主机 cron 每日:
 #     sqlite3 ./data/selectmoney.db ".backup './data/backup-$(date +%F).db'"
 #   保留 7 天;恢复前先停容器(docker compose stop)再整体拷回,不要热覆盖。
@@ -14,10 +13,6 @@ services:
     build: .
     container_name: stock-workbench
     restart: unless-stopped
-    deploy:
-      replicas: 1  # 单 scheduler 守卫:禁止扩副本(见顶部约束)
-      restart_policy:
-        condition: on-failure
     ports:
       - "8000:8000"
     volumes:
