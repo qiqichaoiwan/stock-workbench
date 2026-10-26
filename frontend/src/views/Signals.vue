@@ -33,7 +33,7 @@
     </el-table>
     <el-empty v-if="!loading && !rows.length" description="暂无技术信号" :image-size="60">
       <template #description>
-        <p>暂无技术信号,请先在任务中心运行 signals 后可见</p>
+        <p>暂无技术信号,请先在任务中心运行「{{ taskName('signals') }}」后可见</p>
         <p class="muted" style="font-size:12px">收盘后 16:40 落库;周末/非交易日无新增属预期</p>
       </template>
     </el-empty>
@@ -49,6 +49,7 @@
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import api from '../api'
 import { cleanName, fmtNum } from '../utils/fmt'
+import { taskName } from '../utils/tasks'
 
 const rows = ref([])
 const sigType = ref('')

@@ -41,6 +41,16 @@ TRACK_SEED_MAP: dict[str, list[str]] = {
 # 真实 A 股代码格式(6 位数字);THS:xxxx 等占位码不符合。
 _SIX_DIGIT_CODE = re.compile(r"^\d{6}$")
 
+# 选股/信号/推荐统一排除的板块:科创板(688/689 开头,含科创 CDR)。
+EXCLUDED_BOARD_PREFIXES: tuple[str, ...] = ("68",)
+EXCLUDED_CODE_LIKE = f"{EXCLUDED_BOARD_PREFIXES[0]}%"
+EXCLUDED_BOARD_REASON = "科创板不参与选股"
+
+
+def is_excluded_stock(code: str) -> bool:
+    """该代码是否属于选股/信号/推荐排除板块。"""
+    return str(code or "").startswith(EXCLUDED_BOARD_PREFIXES)
+
 
 class DegradedSourceError(ValueError):
     """成分源处于降级链(ths/sina/keyword),差集清理不可信,拒绝执行。
@@ -299,7 +309,7 @@ def prune_track_members(db: Session, track: Track, incoming: set[str] | None = N
 
 
 def candidate_universe(db: Session) -> list[str]:
-    """当前候选域:在册指数成分 + 启用赛道成分(去重)。"""
+    """当前候选域:在册指数成分 + 启用赛道成分(去重,排除科创板)。"""
     codes: set[str] = set()
     codes |= {c for (c,) in db.execute(select(IndexMembership.stock_code).where(
         IndexMembership.out_date.is_(None)))}
@@ -307,7 +317,7 @@ def candidate_universe(db: Session) -> list[str]:
     if track_ids:
         codes |= {c for (c,) in db.execute(select(TrackMembership.stock_code).where(
             TrackMembership.track_id.in_(track_ids)))}
-    return sorted(codes)
+    return sorted(c for c in codes if not is_excluded_stock(c))
 
 
 def get_track_map(db: Session) -> dict[str, list[str]]:

@@ -20,7 +20,8 @@ from .models import (DailyQuote, FinancialIndicator, IndustryDaily, MarketState,
                      StockBasic, StockPool, StrategyCard, StrategyParams, Valuation)
 from .news_monitor import track_news_heat
 from .technical_signal import latest_signals
-from .universe_manager import get_track_map
+from .universe_manager import (EXCLUDED_BOARD_PREFIXES, EXCLUDED_BOARD_REASON,
+                               get_track_map, is_excluded_stock)
 
 log = logging.getLogger("strategy_engine")
 
@@ -32,7 +33,7 @@ PARAM_DEFAULTS: dict[str, str] = {
     "mv_pref_high": "800",            # 优先区间上限
     "mv_hard_high": "1500",           # 超过则剔除(千亿留观上限,可调)
     "min_list_years": "2",            # 次新过滤
-    "board_allow": "主板,创业板,科创板",
+    "board_allow": "主板,创业板",
     "roe_ind_pct_min": "70",          # ROE 行业内分位下限
     "gm_min": "25",                   # 毛利率绝对下限(参考H01:30%,放宽给中游制造)
     "cash_min": "0.7",                # 现金含量下限
@@ -260,8 +261,9 @@ def build_candidates(db: Session, trade_date: date | None = None) -> pd.DataFram
     df["roe_ind_pct"] = df.groupby("industry")["roe"].transform(lambda s: _ind_pct(s))
     df["gm_ind_pct"] = df.groupby("industry")["gross_margin"].transform(lambda s: _ind_pct(s))
 
-    # 技术信号(今日 buy_setup / rs_weak)
-    sig = latest_signals(db, trade_date=trade_date, limit=5000)
+    # 技术信号(今日 buy_setup / rs_weak / rs_strong):必须取当日完整截面,
+    # 不能设上限截断,否则超量时参与打分的股票子集随机(见 P1-9)。
+    sig = latest_signals(db, trade_date=trade_date, limit=None)
     df["buy_setup"] = df["code"].isin({s.code for s in sig if s.signal_type == "buy_setup"})
     df["rs_weak"] = df["code"].isin({s.code for s in sig if s.signal_type == "rs_weak"})
     df["rs_strong"] = df["code"].isin({s.code for s in sig if s.signal_type == "rs_strong"})
@@ -307,6 +309,8 @@ def hard_filter(df: pd.DataFrame, params: dict[str, str],
     mask = (
         ~df["is_st"].fillna(False)
         & df["board"].isin(allow_boards)
+        # 科创板统一排除(即使旧配置的 board_allow 仍含科创板也不放行)
+        & ~df["code"].astype(str).str.startswith(EXCLUDED_BOARD_PREFIXES)
         & df["close"].notna() & (df["close"] > 0)
         # 市值:未知(=0,数据源缺字段)时不拦截,仅在有值时执行区间过滤(优雅降级)
         & ((df["total_mv"] <= 0)
@@ -404,11 +408,13 @@ def _rating(row: pd.Series) -> tuple[str, list[str]]:
     if row.get("crowd_avoid"):
         return "avoid", ["SC-U08拥挤度回避行业"]
     if row.get("profit_yoy") is not None and row["profit_yoy"] < 0:
-        return "sell", ["最新报告期业绩转负"]
+        reasons.append("最新报告期业绩转负")
     if row.get("pe_pct_5y") is not None and row["pe_pct_5y"] > 80:
-        return "sell", ["估值升至5年80%分位以上"]
+        reasons.append("估值升至5年80%分位以上")
     if row.get("rs_weak"):
-        return "sell", ["跑输所属行业(相对强弱弱势)"]
+        reasons.append("跑输所属行业(相对强弱弱势)")
+    if reasons:
+        return "sell", reasons
     if row.get("buy_setup"):
         return "buy", ["底分型+连红+量能放大"]
     if row.get("rs_strong"):
@@ -439,8 +445,18 @@ def run_strategy(db: Session, trade_date: date | None = None) -> dict:
     score_min = float(params["track_score_min"]) + (10 if weak else 0)
 
     new_entries, out_count = 0, 0
+    # 科创板统一排除:历史在池存量也置出(留档),释放总池/赛道池名额。
+    stale_excluded = db.execute(select(StockPool).where(
+        StockPool.status == "in")).scalars().all()
+    for p in stale_excluded:
+        if is_excluded_stock(p.code):
+            p.status, p.out_date = "out", trade_date
+            p.out_reason = EXCLUDED_BOARD_REASON
+            out_count += 1
+    db.flush()
     # 出池评级数据源:scored(入围)→df(全截面)→DB回查,已跌出筛选的行仍能判 sell/avoid
-    exit_sigs = latest_signals(db, trade_date=trade_date, limit=5000)
+    # limit=None:取当日全部信号(不按 id 截断),与 build_candidates 的完整截面口径一致。
+    exit_sigs = latest_signals(db, trade_date=trade_date, limit=None)
     exit_sig_codes: dict[str, set[str]] = {}
     for _s in exit_sigs:
         exit_sig_codes.setdefault(_s.code, set()).add(_s.signal_type)
@@ -665,28 +681,35 @@ def update_pool_performance(db: Session, trade_date: date | None = None) -> int:
     open_pools = db.execute(select(StockPool).where(StockPool.status == "in")).scalars().all()
     if not open_pools:
         return 0
-    codes = {p.code for p in open_pools}
-    entry_dates = {p.code: (p.in_date if hasattr(p, "in_date") else p.trade_date) for p in open_pools}
+    entries = {(p.code, p.trade_date) for p in open_pools if p.trade_date <= trade_date}
+    if not entries:
+        return 0
+    codes = {code for code, entry in entries}
+    start_date = min(entry for code, entry in entries)
 
     bench = None
     try:
-        bench = dg.get_index_daily("sh000985",
-                                   (trade_date - timedelta(days=400)).strftime("%Y%m%d"))
-        bench = bench.set_index("trade_date")["close"].astype(float)
+        bench = dg.get_index_daily("sh000985", start_date.strftime("%Y%m%d"),
+                                   trade_date.strftime("%Y%m%d"))
+        bench = bench.set_index("trade_date")["close"].astype(float).sort_index()
+        bench = bench[bench.index <= trade_date]
     except Exception as exc:  # noqa: BLE001 基准不可用时只记绝对收益,超额留0
+        bench = None
         log.warning("benchmark unavailable for pool perf: %s", exc)
 
     rows = db.execute(select(DailyQuote.code, DailyQuote.trade_date, DailyQuote.close).where(
-        DailyQuote.code.in_(codes), DailyQuote.trade_date >= trade_date - timedelta(days=400))
+        DailyQuote.code.in_(codes), DailyQuote.trade_date >= start_date,
+        DailyQuote.trade_date <= trade_date)
     ).all()
     q = pd.DataFrame(rows, columns=["code", "trade_date", "close"])
+    quotes = {code: grp.sort_values("trade_date") for code, grp in q.groupby("code")}
 
     written = 0
-    for code, grp in q.groupby("code"):
-        entry = entry_dates.get(code)
-        if entry is None:
+    for code, entry in sorted(entries):
+        grp = quotes.get(code)
+        if grp is None:
             continue
-        base = grp[grp["trade_date"] >= entry].sort_values("trade_date")
+        base = grp[grp["trade_date"] >= entry]
         if base.empty:
             continue
         last = base.iloc[-1]
@@ -697,7 +720,7 @@ def update_pool_performance(db: Session, trade_date: date | None = None) -> int:
         bench_cum = 0.0
         if bench is not None:
             b0 = bench[bench.index >= entry]
-            bench_cum = (float(bench.iloc[-1]) / float(b0.iloc[0]) - 1) * 100 \
+            bench_cum = (float(b0.iloc[-1]) / float(b0.iloc[0]) - 1) * 100 \
                 if not b0.empty else 0.0
         exists = db.execute(select(PoolPerformance).where(
             PoolPerformance.code == code, PoolPerformance.pool_entry_date == entry,

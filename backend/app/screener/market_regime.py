@@ -270,14 +270,15 @@ def compute_market_state(db: Session, trade_date: date | None = None) -> MarketS
     val_dir_pos = valuation_pct >= 30  # 估值方向代理:分位上/下半区
     raw_stage, raw_range = _decide_cycle_stage(eco_pos, liq_pos, val_dir_pos, valuation_pct)
 
-    prev = db.execute(select(MarketState).order_by(
+    prev = db.execute(select(MarketState).where(
+        MarketState.trade_date < trade_date).order_by(
         MarketState.trade_date.desc())).scalars().first()
     # 驻留起点:旧档位首次生效日(prev 每日一行,created_at 不可用;用 trade_date 差值回推)
     prev_stage_start = None
     if prev is not None and prev.cycle_stage:
         same_stage_rows = db.execute(select(MarketState.trade_date).where(
             MarketState.cycle_stage == prev.cycle_stage,
-            MarketState.trade_date <= trade_date
+            MarketState.trade_date < trade_date
         ).order_by(MarketState.trade_date.desc()).limit(400)).scalars().all()
         if same_stage_rows:
             run = [same_stage_rows[0]]

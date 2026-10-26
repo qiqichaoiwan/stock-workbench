@@ -143,7 +143,7 @@ def sync_industry_daily(db: Session, trade_date: date | None = None,
                 fresh = _cooldown_until(last["trade_date"])
             elif fresh is None:
                 fresh = trade_date + timedelta(days=30)
-            candidates = [d for d in (carried, fresh) if d is not None]
+            candidates = [d for d in (avoid_until, fresh) if d is not None]
             avoid_until = max(candidates) if candidates else None
 
         mom20 = (last["close"] / hist["close"].iloc[-21] - 1) * 100 if len(hist) > 21 else 0.0

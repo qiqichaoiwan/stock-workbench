@@ -10,8 +10,8 @@
       </template>
       <el-table :data="pagedLogs" size="small" v-loading="loading" max-height="560" stripe border>
         <el-table-column prop="id" label="#" width="70" sortable />
-        <el-table-column label="任务" width="170">
-          <template #default="{ row }">{{ taskDesc[row.task_name] || row.task_name }}</template>
+        <el-table-column label="任务" min-width="190" show-overflow-tooltip>
+          <template #default="{ row }">{{ taskLabel(row.task_name) }}</template>
         </el-table-column>
         <el-table-column label="时间" width="150">
           <template #default="{ row }">{{ fmtDT(row.run_at) }}</template>
@@ -29,7 +29,7 @@
       <el-empty v-if="!loading && !logs.length" description="暂无任务日志" :image-size="60">
         <template #description>
           <p>暂无任务日志,按初始化顺序手动触发后可见</p>
-          <p class="muted" style="font-size:12px">建议顺序:sync_members → sync_basic → sync_tracks → backfill_history → sync_financials → 其余任务</p>
+          <p class="muted" style="font-size:12px">建议顺序:{{ INIT_ORDER_TEXT }}</p>
         </template>
       </el-empty>
       <div class="pager">
@@ -41,9 +41,9 @@
 
     <el-dialog v-model="dialog" title="手动触发任务" width="440">
       <el-select v-model="taskName" placeholder="选择任务" style="width:100%">
-        <el-option v-for="(t, name) in taskDesc" :key="name" :label="t" :value="name" />
+        <el-option v-for="(t, name) in TASK_NAMES" :key="name" :label="t" :value="name" />
       </el-select>
-      <p class="muted" style="font-size:12px">首次初始化建议顺序:sync_members → sync_basic → sync_tracks → backfill_history → sync_financials → 其余任务</p>
+      <p class="muted" style="font-size:12px">首次初始化建议顺序:{{ INIT_ORDER_TEXT }}</p>
       <template #footer>
         <el-button @click="dialog = false">取消</el-button>
         <el-button type="primary" :loading="running" @click="run">执行(后台任务可能耗时数分钟)</el-button>
@@ -57,6 +57,7 @@ import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import { fmtDT, fmtDuration } from '../utils/fmt'
+import { INIT_ORDER_TEXT, TASK_NAMES, taskName as taskLabel } from '../utils/tasks'
 import { useUserStore } from '../store'
 
 const store = useUserStore()
@@ -72,24 +73,6 @@ const pagedLogs = computed(() => logs.value.slice((page.value - 1) * pageSize, p
 let pollTimer = null
 let pollToken = 0
 
-const taskDesc = {
-  sync_members: '同步指数成分(候选域)',
-  sync_basic: '同步股票基础信息',
-  sync_tracks: '同步赛道成分',
-  tracks_backfill: '一键回填赛道成分',
-  sync_quotes: '收盘快照落库(日线)',
-  intraday_snapshot: '盘中快照',
-  sync_valuation: '估值快照',
-  industry_daily: '行业日度监测+拥挤度',
-  commodities: '商品涨价跟踪',
-  market_state: '市场状态计算',
-  signals: '技术信号扫描',
-  sync_financials: '财务增量(业绩报表)',
-  strategy: '策略筛选+入池出池',
-  news: '新闻采集甄别',
-  weekly_reports: '生成周报(全体用户)',
-  backfill_history: '历史日线回填(慢,数十年)',
-}
 const statusLabels = { success: '成功', failed: '失败', running: '运行中', skipped: '跳过' }
 function statusLabel(s) { return statusLabels[s] || s }
 function statusType(s) {
@@ -133,7 +116,7 @@ async function run() {
       if (token !== pollToken) return
       const hit = logs.value.find((l) => l.task_name === target && Number(l.id) > startedId && l.status !== 'running')
       if (hit) {
-        ElMessage({ type: hit.status === 'success' ? 'success' : 'error', message: `${taskDesc[target] || target} ${statusLabel(hit.status)}(${fmtDuration(hit.duration_ms, '未知')})` })
+        ElMessage({ type: hit.status === 'success' ? 'success' : 'error', message: `${taskLabel(target)} ${statusLabel(hit.status)}(${fmtDuration(hit.duration_ms, '未知')})` })
         pollTimer = null
         return
       }

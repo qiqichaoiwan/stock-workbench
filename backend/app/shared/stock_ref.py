@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..shared import data_gateway as dg
 from ..screener.models import DailyQuote, PoolPerformance, StockBasic, StockPool
+from ..screener.universe_manager import EXCLUDED_CODE_LIKE
 
 
 def latest_quote_date(db: Session) -> date | None:
@@ -110,7 +111,8 @@ def pool_perf_summary(db: Session) -> dict:
     """池内整体表现摘要(只读)。"""
     from datetime import datetime
 
-    rows = db.execute(select(PoolPerformance).order_by(
+    rows = db.execute(select(PoolPerformance).where(
+        PoolPerformance.code.not_like(EXCLUDED_CODE_LIKE)).order_by(
         PoolPerformance.trade_date.desc()).limit(500)).scalars().all()
     if not rows:
         return {}

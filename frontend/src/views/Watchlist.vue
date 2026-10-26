@@ -16,7 +16,7 @@
       <el-empty v-else description="暂无命中提醒" :image-size="60">
         <template #description>
           <p>暂无命中提醒,价格触及三价或涨跌幅阈值后自动出现</p>
-          <p class="muted" style="font-size:12px">由盘中 watch_alert 任务每 30 分钟扫描;提醒只读不改止损,仅提示</p>
+          <p class="muted" style="font-size:12px">由盘中「{{ taskName('watch_alert') }}」任务每 30 分钟扫描;提醒只读不改止损,仅提示</p>
         </template>
       </el-empty>
     </el-card>
@@ -108,6 +108,7 @@ import { onMounted, onBeforeUnmount, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import { fmtNum, fmtPct, upDownClass } from '../utils/fmt'
+import { taskName } from '../utils/tasks'
 
 const rows = ref([])
 const alerts = ref([])

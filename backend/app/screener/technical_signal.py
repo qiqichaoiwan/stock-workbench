@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from ..shared import data_gateway as dg
 from .models import DailyQuote, StockBasic, TechnicalSignal
+from .universe_manager import EXCLUDED_CODE_LIKE, is_excluded_stock
 
 log = logging.getLogger("technical_signal")
 
@@ -37,6 +38,7 @@ def scan_signals(db: Session, trade_date: date | None = None) -> dict:
 
     codes = {c for (c,) in db.execute(select(DailyQuote.code).where(
         DailyQuote.trade_date == trade_date))}
+    codes = {c for c in codes if not is_excluded_stock(c)}
     if not codes:
         log.warning("no quotes for %s", trade_date)
         return {"scanned": 0}
@@ -151,12 +153,20 @@ def get_signal_names(db: Session, codes: set[str] | list[str]) -> dict[str, str]
 
 
 def latest_signals(db: Session, trade_date: date | None = None,
-                   signal_type: str | None = None, limit: int = 200) -> list[TechnicalSignal]:
-    # 按 trade_date desc, id desc:同日多信号时最新落库在前;无 trade_date 时取最新截面。
-    q = select(TechnicalSignal).order_by(
-        TechnicalSignal.trade_date.desc(), TechnicalSignal.id.desc()).limit(limit)
+                   signal_type: str | None = None, limit: int | None = 200) -> list[TechnicalSignal]:
+    """按 trade_date desc, id desc 取信号;同日多信号时最新落库在前。
+
+    limit=None 表示不截断:策略引擎等需要"当日完整截面"的调用方必须显式传 None,
+    否则信号数超过上限时只能拿到 id 最大的一部分,参与打分的子集随落库顺序漂移,
+    与信号页展示口径不一致。API 层按分页需求显式传 limit。
+    """
+    q = select(TechnicalSignal).where(
+        TechnicalSignal.code.not_like(EXCLUDED_CODE_LIKE)).order_by(
+        TechnicalSignal.trade_date.desc(), TechnicalSignal.id.desc())
     if trade_date is not None:
         q = q.where(TechnicalSignal.trade_date == trade_date)
     if signal_type:
         q = q.where(TechnicalSignal.signal_type == signal_type)
+    if limit is not None:
+        q = q.limit(limit)
     return list(db.execute(q).scalars())

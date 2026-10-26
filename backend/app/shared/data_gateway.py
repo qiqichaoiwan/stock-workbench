@@ -15,8 +15,10 @@
 - pct_chg 缺失的源(sina/tx 个别版本)由同一前复权 close 推导,与源端口径一致(%)。
 
 超时与退避约定(见 backend/app/config.py):
-- 所有源调用经 resilient 装饰器统一加超时(fetch_timeout_seconds,默认 60s,线程级强制);
-  超时计为一次失败并进入指数退避重试。
+- resilient 源调用限制单次等待时间(fetch_timeout_seconds,默认 60s);
+  超时计为一次失败并进入退避重试,不能终止底层调用或撤销其副作用。
+- 每进程最多 8 个 daemon 工作线程,遗留调用占用容量直到结束,满时立即失败;
+  嵌套调用在当前工作线程内执行,仅受外层等待期限约束,不再创建线程。
 - 重试:fetch_retry_times × 指数退避(fetch_retry_wait_seconds × attempt)。
 - 源级冷却:连续失败的源按 _SOURCE_DEFAULT_COOLDOWN 暂停调用(东财日线 10 分钟,
   其余 5 分钟),成功即清零;回填场景直走 tx/sina 不再逐股重试 akshare。
@@ -98,23 +100,55 @@ def _cooldown_clear(source: str) -> None:
     _source_cooldown.pop(source, None)
 
 
-def _run_with_timeout(fn, timeout: float, *args, **kwargs):
-    """线程级强制超时:akshare/requests 无统一 timeout 参数,用单线程池兜底。
+_TIMEOUT_MAX_WORKERS = 8
+_timeout_slots = threading.BoundedSemaphore(_TIMEOUT_MAX_WORKERS)
+_timeout_context = threading.local()
 
-    timeout<=0 时直接调用(测试/离线场景)。超时抛 TimeoutError,计为一次失败。
+
+def _run_with_timeout(fn, timeout: float, *args, **kwargs):
+    """Bound the caller's wait, not the underlying source operation.
+
+    Timed-out calls retain their slot until completion; capacity exhaustion
+    fails immediately without queuing. Daemon threads do not delay process
+    exit. Nested calls run inline under the outer wait limit to avoid deadlock;
+    their own timeout is not independently enforced. None/<=0 disables timeout.
     """
-    if timeout is None or timeout <= 0:
+    if timeout is None or timeout <= 0 or getattr(_timeout_context, "active", False):
         return fn(*args, **kwargs)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        fut = pool.submit(fn, *args, **kwargs)
+    slots = _timeout_slots
+    if not slots.acquire(blocking=False):
+        raise RuntimeError("source timeout worker capacity exhausted")
+    fut = concurrent.futures.Future()
+
+    def run():
+        _timeout_context.active = True
         try:
-            return fut.result(timeout=timeout)
-        except concurrent.futures.TimeoutError as exc:
-            raise TimeoutError(f"source call timed out after {timeout}s") from exc
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                fut.set_exception(exc)
+            else:
+                fut.set_result(result)
+        finally:
+            _timeout_context.active = False
+            slots.release()
+
+    try:
+        worker = threading.Thread(target=run, name="data-gateway-timeout", daemon=True)
+        worker.start()
+    except BaseException:
+        slots.release()
+        raise
+    try:
+        return fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError as exc:
+        if fut.done():
+            return fut.result()
+        raise TimeoutError(f"source call timed out after {timeout}s; underlying call continues") from exc
 
 
 def resilient(name: str):
-    """统一重试装饰器:限速 + 强制超时 + 指数退避;全部失败抛最后一次异常。"""
+    """统一重试装饰器:限速 + 有界等待超时 + 指数退避;全部失败抛最后一次异常。"""
 
     def deco(fn):
         @wraps(fn)
@@ -929,42 +963,49 @@ def get_industry_hist(board_name: str, start: str, end: str | None = None) -> pd
     return df[["trade_date", "close", "pct_chg", "amount"]]
 
 
+def _board_fund_flow(kind: str) -> pd.DataFrame:
+    """官网排行图同源接口，f62 为今日主力净流入(元)，不是普通净流入。"""
+    import requests
+
+    code = {"industry": "m:90+s:4", "concept": "m:90+t:3"}[kind]
+    response = requests.get(
+        "https://data.eastmoney.com/dataapi/bkzj/getbkzj",
+        params={"key": "f62", "code": code},
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com/bkzj/hy.html"},
+        timeout=(3, 8),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data") or {}
+    rows = data.get("diff")
+    if payload.get("rc") != 0 or not isinstance(rows, list) or not rows:
+        raise ValueError("empty Eastmoney board fund flow")
+    if len(rows) != int(data.get("total", -1)):
+        raise ValueError("incomplete Eastmoney board fund flow")
+    frame = pd.DataFrame(rows)
+    if not {"f12", "f14", "f62"}.issubset(frame.columns):
+        raise ValueError("Eastmoney fund flow columns missing")
+    amounts = pd.to_numeric(frame["f62"], errors="coerce")
+    if (amounts.isna() | amounts.isin([float("inf"), float("-inf")])).any():
+        raise ValueError("invalid Eastmoney fund flow amounts")
+    out = pd.DataFrame({"board_code": frame["f12"].astype(str),
+                        "board_name": frame["f14"].astype(str),
+                        "fund_flow": amounts / 1e8})
+    if frame["f14"].isna().any() or out["board_name"].str.strip().eq("").any() or out["board_code"].duplicated().any():
+        raise ValueError("invalid Eastmoney board identities")
+    return out.sort_values("fund_flow", ascending=False).reset_index(drop=True)
+
+
 @resilient("industry_fund_flow")
 def get_industry_fund_flow() -> pd.DataFrame:
-    """东财行业主力资金流(今日)。列:board_name,fund_flow(亿)。"""
-    import akshare as ak
-
-    df = ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="行业资金流")
-    col_name = "名称" if "名称" in df.columns else "行业名称"
-    col_flow = "今日主力净流入-净额" if "今日主力净流入-净额" in df.columns else None
-    if col_flow is None:
-        raise RuntimeError("fund flow columns missing")
-    out = pd.DataFrame({
-        "board_name": df[col_name].astype(str),
-        "fund_flow": pd.to_numeric(df[col_flow], errors="coerce") / 1e8,
-    })
-    return out
+    """东财行业主力资金流(今日)。列:board_name,board_code,fund_flow(亿)。"""
+    return _board_fund_flow("industry")
 
 
 @resilient("concept_fund_flow")
 def get_concept_fund_flow() -> pd.DataFrame:
-    """东财概念主力资金流(今日,go-stock concept_fund_flow 思路)。
-
-    列:board_name,fund_flow(亿)[,board_code 有则带出];失败抛错由上层处理。"""
-    import akshare as ak
-
-    df = ak.stock_sector_fund_flow_rank(indicator="今日", sector_type="概念资金流")
-    col_name = "名称" if "名称" in df.columns else "概念名称"
-    col_flow = "今日主力净流入-净额" if "今日主力净流入-净额" in df.columns else None
-    if col_flow is None:
-        raise RuntimeError("concept fund flow columns missing")
-    out = pd.DataFrame({
-        "board_name": df[col_name].astype(str),
-        "fund_flow": pd.to_numeric(df[col_flow], errors="coerce") / 1e8,
-    })
-    code_col = next((c for c in ("板块代码", "代码", "概念代码") if c in df.columns), None)
-    out["board_code"] = df[code_col].astype(str) if code_col else ""
-    return out
+    """东财概念主力资金流(今日)。列:board_name,board_code,fund_flow(亿)。"""
+    return _board_fund_flow("concept")
 
 
 @resilient("market_stat_spot")

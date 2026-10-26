@@ -569,7 +569,7 @@ def task_fund_flow_snapshot(db: Session):
                 vals = {"board_type": board_type, "board_code": code,
                         "board_name": name,
                         "net_inflow": _f(r.get("fund_flow")),
-                        "snap_time": snap_time, "source": "akshare"}
+                        "snap_time": snap_time, "source": "eastmoney"}
                 # 逐行 savepoint:单行失败只回滚本行,不再用 db.rollback()
                 # (那会把本循环已积累的未提交行整批回滚,计数虚高)。
                 with db.begin_nested():

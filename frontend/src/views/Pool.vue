@@ -82,7 +82,7 @@
                        :page-sizes="[20, 50, 100]" v-model:page-size="pageSize"
                        v-model:current-page="page" />
       </div>
-      <p v-if="!allTrackEmpty" class="muted" style="font-size:12px;margin:6px 0 0">前端分页 · 共 {{ filteredRows.length }} 只(服务端全量取回,已按评分全局排序)（行情来源见任务日志 sync_quotes 首字段）</p>
+      <p v-if="!allTrackEmpty" class="muted" style="font-size:12px;margin:6px 0 0">前端分页 · 共 {{ filteredRows.length }} 只(服务端全量取回,已按评分全局排序)（行情来源见任务日志「{{ taskName('sync_quotes') }}」首字段）</p>
     </el-card>
 
     <el-card class="page-card">
@@ -112,6 +112,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import { cleanName, fmtNum, fmtInt, ratingLabel, ratingType } from '../utils/fmt'
+import { taskName } from '../utils/tasks'
 import { useUserStore } from '../store'
 
 const store = useUserStore()

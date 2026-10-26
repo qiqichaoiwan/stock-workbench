@@ -36,7 +36,7 @@
     </el-table>
     <el-empty v-if="!loading && !rows.length" description="暂无新闻" :image-size="60">
       <template #description>
-        <p>暂无新闻,请先在任务中心运行 news 后可见</p>
+        <p>暂无新闻,请先在任务中心运行「{{ taskName('news') }}」后可见</p>
         <p class="muted" style="font-size:12px">交易日 11:40 / 14:40 低频采集;若开启「仅甄别通过」仍为空,可关掉开关确认是否连噪声也没有</p>
       </template>
     </el-empty>
@@ -52,6 +52,7 @@
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import api from '../api'
 import { fmtDT, fmtInt } from '../utils/fmt'
+import { taskName } from '../utils/tasks'
 
 const rows = ref([])
 const screenedOnly = ref(true)

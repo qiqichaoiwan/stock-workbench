@@ -3,6 +3,7 @@
 权限分级:GET 看板=登录即可;写操作(任务/参数/策略卡/赛道/池)=admin 或 analyst。
 """
 import json
+import logging
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -19,6 +20,9 @@ from ..task_runner import TASKS, run_task
 from .models import (CommodityPrice, FundFlowSnapshot, IndustryDaily, LhbDaily,
                    MarketState, MarketStat, NewsItem, PoolPerformance,
                    StockPool, StrategyCard, StrategyParams, TaskLog, Track)
+from .universe_manager import EXCLUDED_CODE_LIKE
+
+log = logging.getLogger("screener.api")
 
 router = APIRouter(prefix="/api/screener", tags=["screener"])
 
@@ -36,6 +40,22 @@ def _stock_names(db: Session, codes: set[str] | list[str] | None = None) -> dict
             return {}
         q = q.where(StockBasic.code.in_(codes))
     return dict(db.execute(q).all())
+
+
+# ---------- 驾驶舱（独立实时缓存，不写数据库） ----------
+
+@router.get("/cockpit/market")
+def cockpit_market(user_id: int = Depends(current_user_id)):
+    from . import cockpit
+
+    return cockpit.market()
+
+
+@router.get("/cockpit/news")
+def cockpit_news(user_id: int = Depends(current_user_id)):
+    from . import cockpit
+
+    return cockpit.news()
 
 
 # ---------- 仪表盘 ----------
@@ -92,7 +112,8 @@ def market_states(limit: int = 60, user_id: int = Depends(current_user_id),
 def pool(pool_type: str = "main", track_id: int | None = None,
          user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
     q = select(StockPool).where(StockPool.status == "in",
-                                StockPool.pool_type == pool_type)
+                                StockPool.pool_type == pool_type,
+                                StockPool.code.not_like(EXCLUDED_CODE_LIKE))
     if pool_type == "track" and track_id is not None:
         q = q.where(StockPool.track_id == track_id)
     rows = db.execute(q.order_by(StockPool.score.desc())).scalars().all()
@@ -107,8 +128,9 @@ def pool(pool_type: str = "main", track_id: int | None = None,
 def pool_history(status: str = "out", limit: int = 100,
                  user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
     limit = min(max(limit, 1), MAX_LIMIT)
-    rows = db.execute(select(StockPool).where(StockPool.status == status)
-                      .order_by(StockPool.id.desc()).limit(limit)).scalars().all()
+    rows = db.execute(select(StockPool).where(
+        StockPool.status == status, StockPool.code.not_like(EXCLUDED_CODE_LIKE))
+        .order_by(StockPool.id.desc()).limit(limit)).scalars().all()
     return [{"id": r.id, "code": r.code, "name": r.name, "pool_type": r.pool_type,
              "in_price": r.in_price, "trade_date": r.trade_date.isoformat(),
              "out_date": r.out_date.isoformat() if r.out_date else "",
@@ -119,7 +141,8 @@ def pool_history(status: str = "out", limit: int = 100,
 def pool_perf(user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
     from ..shared import stock_ref
 
-    rows = db.execute(select(PoolPerformance).order_by(
+    rows = db.execute(select(PoolPerformance).where(
+        PoolPerformance.code.not_like(EXCLUDED_CODE_LIKE)).order_by(
         PoolPerformance.trade_date.desc()).limit(1000)).scalars().all()
     by_date: dict[str, list[float]] = {}
     for r in rows:
@@ -193,8 +216,9 @@ def indexes(codes: str | None = None,
                         "close": r.close, "pct_chg": r.pct_chg,
                         "amount": r.amount, "source": r.source})
         return out
-    except Exception:  # noqa: BLE001 无数据/老库缺表一律 [] 不 500
-        return []
+    except Exception as exc:  # noqa: BLE001
+        log.exception("indexes query failed")
+        raise HTTPException(503, "指数数据查询失败，数据库服务暂时不可用，请稍后重试") from exc
 
 
 @router.get("/emerging")
@@ -241,8 +265,9 @@ def fund_flow(board_type: str = "industry", limit: int = 20,
                  "net_inflow": r.net_inflow,
                  "snap_time": r.snap_time.isoformat() if r.snap_time else "",
                  "source": r.source} for r in rows]
-    except Exception:  # noqa: BLE001 无数据/老库缺表一律 [] 不 500
-        return []
+    except Exception as exc:  # noqa: BLE001
+        log.exception("fund flow query failed")
+        raise HTTPException(503, "板块资金流查询失败，数据库服务暂时不可用，请稍后重试") from exc
 
 
 @router.get("/fund-flow/history")
@@ -280,8 +305,9 @@ def fund_flow_history(board_name: str = "", board_type: str = "industry",
         return [{"snap_date": (r.snap_time.date().isoformat()
                                 if r.snap_time else ""),
                  "net_inflow": r.net_inflow} for r in rows]
-    except Exception:  # noqa: BLE001
-        return []
+    except Exception as exc:  # noqa: BLE001
+        log.exception("fund flow history query failed")
+        raise HTTPException(503, "板块资金流历史查询失败，数据库服务暂时不可用，请稍后重试") from exc
 
 
 @router.get("/market-stat/latest")
@@ -298,8 +324,9 @@ def market_stat_latest(user_id: int = Depends(current_user_id),
                 "limit_up": r.limit_up, "limit_down": r.limit_down,
                 "amount_total": r.amount_total, "source": r.source,
                 "source_note": r.source_note}
-    except Exception:  # noqa: BLE001
-        return {}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("market stat query failed")
+        raise HTTPException(503, "大盘统计查询失败，数据库服务暂时不可用，请稍后重试") from exc
 
 
 # ---------- 技术信号与新闻 ----------

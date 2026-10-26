@@ -34,8 +34,8 @@
       </div>
       <el-empty v-if="!lhbLoading && !lhb.length" description="暂无龙虎榜数据" :image-size="60">
         <template #description>
-          <p>暂无龙虎榜数据,收盘后 17:10 lhb_sync 落库后可见</p>
-          <p class="muted" style="font-size:12px">周末/非交易日无数据属预期;交易日晚间仍空请去任务中心手动运行 lhb_sync</p>
+          <p>暂无龙虎榜数据,收盘后 17:10「{{ taskName('lhb_sync') }}」落库后可见</p>
+          <p class="muted" style="font-size:12px">周末/非交易日无数据属预期;交易日晚间仍空请去任务中心手动运行「{{ taskName('lhb_sync') }}」</p>
         </template>
       </el-empty>
     </el-card>
@@ -63,6 +63,7 @@
 import { onMounted, onBeforeUnmount, ref } from 'vue'
 import api from '../api'
 import { fmtNum, fmtPct, upDownClass } from '../utils/fmt'
+import { taskName } from '../utils/tasks'
 
 const lhb = ref([])
 const seats = ref([])

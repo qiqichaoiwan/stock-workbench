@@ -1,6 +1,12 @@
 <template>
   <div>
-    <!-- 市场总览卡(无数据隐藏) -->
+    <div class="card-head" style="margin-bottom:12px">
+      <span class="muted">收盘指数与盘中资金快照以各自数据日期为准</span>
+      <span class="grow" />
+      <el-button size="small" :loading="ixLoading || cmdLoading || flowLoading" @click="load">刷新数据</el-button>
+    </div>
+    <el-alert v-if="statError" :title="statError" type="error" :closable="false" show-icon />
+    <el-alert v-else-if="!statLoading && !hasStat" :title="`暂无市场总览数据，请在任务中心运行「${taskName('market_stat')}」`" type="info" :closable="false" />
     <el-card v-if="hasStat" class="page-card">
       <template #header>
         <div class="card-head">
@@ -23,7 +29,7 @@
         <div class="card-head">
           <span>主要指数</span>
           <span class="grow" />
-          <span class="muted" style="font-size:12px">收盘后 16:45 sync_indexes 落库 · 无数据不报错</span>
+          <span class="muted" style="font-size:12px">交易日收盘后 16:45 更新 · 非实时行情</span>
         </div>
       </template>
       <div class="table-scroll">
@@ -45,10 +51,11 @@
         <el-table-column prop="source" label="来源" width="90" />
       </el-table>
       </div>
-      <el-empty v-if="!ixLoading && !indexes.length" description="暂无指数数据,请先在任务中心运行 sync_indexes" :image-size="60">
+      <el-alert v-if="ixError" :title="ixError" type="error" :closable="false" show-icon />
+      <el-empty v-if="!ixLoading && !ixError && !indexes.length" :description="`暂无指数数据,请先在任务中心运行「${taskName('sync_indexes')}」`" :image-size="60">
         <template #description>
-          <p>暂无指数数据,请先在任务中心运行 sync_indexes 后可见</p>
-          <p class="muted" style="font-size:12px">指数收盘后 16:45 落库,盘中为空属正常;周末/非交易日无新增属预期</p>
+          <p>暂无指数数据,请先在任务中心运行「{{ taskName('sync_indexes') }}」后可见</p>
+          <p class="muted" style="font-size:12px">指数在交易日收盘后 16:45 落库；盘中展示最近一次收盘数据，周末及非交易日无新增</p>
         </template>
       </el-empty>
     </el-card>
@@ -69,7 +76,7 @@
       <el-table :data="flows" size="small" v-loading="flowLoading" stripe border
                 highlight-current-row @row-click="onFlowRow">
         <el-table-column prop="board_name" label="板块" min-width="130" show-overflow-tooltip />
-        <el-table-column label="净流入(亿)" width="130" align="right">
+        <el-table-column label="主力净流入(亿)" width="130" align="right">
           <template #default="{ row }">
             <span :class="upDownClass(row.net_inflow)">{{ fmtNum(row.net_inflow) }}</span>
           </template>
@@ -78,9 +85,10 @@
         <el-table-column prop="source" label="来源" width="90" />
       </el-table>
       </div>
-      <el-empty v-if="!flowLoading && !flows.length" description="暂无板块资金数据" :image-size="60">
+      <el-alert v-if="flowError" :title="flowError" type="error" :closable="false" show-icon />
+      <el-empty v-if="!flowLoading && !flowError && !flows.length" description="暂无板块资金数据" :image-size="60">
         <template #description>
-          <p>暂无板块资金数据,请先在任务中心运行 fund_flow 后可见</p>
+          <p>暂无板块资金数据,请先在任务中心运行「{{ taskName('fund_flow') }}」后可见</p>
           <p class="muted" style="font-size:12px">盘中快照 9:35 起每 30 分钟更新;点击表格行可看该板块近 30 日净流入趋势</p>
         </template>
       </el-empty>
@@ -91,17 +99,19 @@
           <b>{{ flowSel }}</b>
           <span class="muted" style="font-size:12px">近30日净流入(亿,点击上方行切换)</span>
           <span class="grow" />
-          <el-button size="small" link @click="flowSel = ''; flowHist = []">收起</el-button>
+          <el-button size="small" link @click="clearHistory">收起</el-button>
         </div>
-        <div v-loading="histLoading">
-          <div class="mini-bars">
+        <div v-loading="histLoading" style="min-height:80px">
+          <el-alert v-if="histError" :title="histError" type="error" :closable="false" show-icon />
+          <el-empty v-else-if="!histLoading && !flowHist.length" description="该板块暂无历史资金数据" :image-size="40" />
+          <div v-if="flowHist.length" class="mini-bars">
             <el-tooltip v-for="h in flowHist" :key="h.snap_date"
                         :content="`${h.snap_date}: ${fmtNum(h.net_inflow)}`" placement="top">
               <div class="mini-bar" :class="Number(h.net_inflow) >= 0 ? 'pos' : 'neg'"
                    :style="{ height: barH(h.net_inflow) + 'px' }" />
             </el-tooltip>
           </div>
-          <div class="table-scroll" style="margin-top:8px">
+          <div v-if="flowHist.length" class="table-scroll" style="margin-top:8px">
             <table class="native-mini">
               <tr><th>日期</th><th style="text-align:right">净流入(亿)</th></tr>
               <tr v-for="h in flowHist" :key="h.snap_date">
@@ -134,9 +144,10 @@
         <el-table-column prop="trade_date" label="日期" width="110" />
       </el-table>
       </div>
-      <el-empty v-if="!cmdLoading && !commodities.length" description="暂无商品数据" :image-size="60">
+      <el-alert v-if="cmdError" :title="cmdError" type="error" :closable="false" show-icon />
+      <el-empty v-if="!cmdLoading && !cmdError && !commodities.length" description="暂无商品数据" :image-size="60">
         <template #description>
-          <p>暂无商品数据,请先在任务中心运行 commodities 后可见</p>
+          <p>暂无商品数据,请先在任务中心运行「{{ taskName('commodities') }}」后可见</p>
           <p class="muted" style="font-size:12px">商品周期 16:20 落库;仅作赛道确认参考,不作入场依据</p>
         </template>
       </el-empty>
@@ -148,11 +159,18 @@
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import api from '../api'
 import { fmtNum, fmtPct, upDownClass } from '../utils/fmt'
+import { taskName } from '../utils/tasks'
 
 const indexes = ref([])
 const commodities = ref([])
 const ixLoading = ref(false)
 const cmdLoading = ref(false)
+const statLoading = ref(true)
+const ixError = ref('')
+const cmdError = ref('')
+const statError = ref('')
+const flowError = ref('')
+const histError = ref('')
 
 // 市场总览
 const stat = ref({})
@@ -160,7 +178,7 @@ const hasStat = computed(() => stat.value && Object.keys(stat.value).length > 0
   && (stat.value.advance != null || stat.value.amount_total != null))
 const limitText = computed(() => `${stat.value.limit_up ?? '-'} / ${stat.value.limit_down ?? '-'}`)
 const amountText = computed(() => stat.value.amount_total != null
-  ? fmtNum(Number(stat.value.amount_total) / 1e8) : '-')
+  ? fmtNum(Number(stat.value.amount_total)) : '-')
 
 // 板块资金
 const boardType = ref('industry')
@@ -179,20 +197,34 @@ function barH(v) {
   return 4 + Math.round((Math.abs(Number(v) || 0) / mx) * 56)
 }
 
+function clearHistory() {
+  histSeq += 1
+  flowSel.value = ''
+  flowHist.value = []
+  histError.value = ''
+  histLoading.value = false
+}
+
 async function loadFlow() {
   const cur = (flowSeq += 1)
+  clearHistory()
+  flows.value = []
+  flowError.value = ''
   flowLoading.value = true
   try {
     const data = await api.get('/api/screener/fund-flow',
-      { params: { board_type: boardType.value, limit: 20 }, silent: true }).catch(() => [])
+      { params: { board_type: boardType.value, limit: 20 }, silent: true })
     if (cur !== flowSeq) return
     flows.value = Array.isArray(data) ? data : []
+  } catch {
+    if (cur === flowSeq) flowError.value = '板块资金加载失败，请点击刷新数据重试'
   } finally {
     if (cur === flowSeq) flowLoading.value = false
   }
 }
 
 async function onFlowRow(row) {
+  clearHistory()
   flowSel.value = row.board_name
   const cur = (histSeq += 1)
   histLoading.value = true
@@ -200,9 +232,10 @@ async function onFlowRow(row) {
     const data = await api.get('/api/screener/fund-flow/history',
       { params: { board_name: row.board_name, board_code: row.board_code || undefined,
                   board_type: boardType.value, days: 30 }, silent: true })
-      .catch(() => [])
     if (cur !== histSeq) return
     flowHist.value = Array.isArray(data) ? data : []
+  } catch {
+    if (cur === histSeq) histError.value = '资金历史加载失败，请重新点击板块重试'
   } finally {
     if (cur === histSeq) histLoading.value = false
   }
@@ -213,21 +246,27 @@ onBeforeUnmount(() => { seq += 1; flowSeq += 1; histSeq += 1 })
 
 async function load() {
   const cur = (seq += 1)
-  ixLoading.value = cmdLoading.value = true
+  ixLoading.value = cmdLoading.value = statLoading.value = true
+  ixError.value = cmdError.value = statError.value = ''
+  const flowPromise = loadFlow()
   try {
-    const [ix, cmd, ms] = await Promise.all([
-      api.get('/api/screener/indexes', { silent: true }).catch(() => []),
-      api.get('/api/screener/commodities', { silent: true }).catch(() => []),
-      api.get('/api/screener/market-stat/latest', { silent: true }).catch(() => ({})),
+    const [ix, cmd, ms] = await Promise.allSettled([
+      api.get('/api/screener/indexes', { silent: true }),
+      api.get('/api/screener/commodities', { silent: true }),
+      api.get('/api/screener/market-stat/latest', { silent: true }),
     ])
     if (cur !== seq) return // 竞态:丢弃过期响应
-    indexes.value = Array.isArray(ix) ? ix : []
-    commodities.value = Array.isArray(cmd) ? cmd : []
-    stat.value = (ms && typeof ms === 'object' && !Array.isArray(ms)) ? ms : {}
+    indexes.value = ix.status === 'fulfilled' && Array.isArray(ix.value) ? ix.value : []
+    commodities.value = cmd.status === 'fulfilled' && Array.isArray(cmd.value) ? cmd.value : []
+    stat.value = ms.status === 'fulfilled' && ms.value && typeof ms.value === 'object'
+      && !Array.isArray(ms.value) ? ms.value : {}
+    if (ix.status === 'rejected') ixError.value = '指数加载失败，请点击刷新数据重试'
+    if (cmd.status === 'rejected') cmdError.value = '商品周期加载失败，请点击刷新数据重试'
+    if (ms.status === 'rejected') statError.value = '市场总览加载失败，请点击刷新数据重试'
   } finally {
-    if (cur === seq) ixLoading.value = cmdLoading.value = false
+    if (cur === seq) ixLoading.value = cmdLoading.value = statLoading.value = false
   }
-  await loadFlow()
+  await flowPromise
 }
 </script>
 

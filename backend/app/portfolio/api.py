@@ -1,8 +1,11 @@
 """Portfolio REST API:账户/用户管理/持仓/交易/报告/LLM设置(全部 user_id 隔离)。"""
 from datetime import date
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
+from pydantic import AfterValidator, BaseModel, Field
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
@@ -12,9 +15,33 @@ from ..portfolio.models import (AiAnalysis, Holding, InviteCode, TradeRecord, Us
                                 UserLlmConfig, WatchAlertLog, Watchlist, WeeklyReport)
 from ..shared import llm_gateway
 from ..shared.security import (current_user_id, decrypt_secret, encrypt_secret,
-                               hash_password, mask_secret, require_admin, verify_password)
+                               hash_password, mask_secret, require_admin, verify_password,
+                               validate_password_bytes)
 
-router = APIRouter(prefix="/api", tags=["portfolio"])
+Password = Annotated[str, AfterValidator(validate_password_bytes)]
+
+class _PasswordSafeRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def safe_handler(request):
+            try:
+                return await handler(request)
+            except RequestValidationError as exc:
+                errors = []
+                for error in exc.errors():
+                    clean = dict(error)
+                    if any("password" in str(part) for part in clean.get("loc", ())):
+                        clean.pop("input", None)
+                        clean.pop("ctx", None)
+                    errors.append(clean)
+                # 不保留含密码的原始请求 body。
+                raise RequestValidationError(errors) from None
+
+        return safe_handler
+
+
+router = APIRouter(prefix="/api", tags=["portfolio"], route_class=_PasswordSafeRoute)
 
 
 def _cn(dt):
@@ -38,7 +65,7 @@ def _me(db: Session, user_id: int) -> User:
 
 class RegisterIn(BaseModel):
     username: str = Field(min_length=3, max_length=64)
-    password: str = Field(min_length=8, max_length=64)
+    password: Password = Field(min_length=8, max_length=72)
     nickname: str = ""
     invite_code: str = Field(default="", max_length=32)
 
@@ -52,7 +79,7 @@ def register(body: RegisterIn, db: Session = Depends(get_db)):
 
 class LoginIn(BaseModel):
     username: str
-    password: str
+    password: Password
 
 
 @router.post("/auth/login")
@@ -74,8 +101,8 @@ def me(user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
 
 
 class ChangePasswordIn(BaseModel):
-    old_password: str
-    new_password: str = Field(min_length=8, max_length=64)
+    old_password: Password
+    new_password: Password = Field(min_length=8, max_length=72)
 
 
 @router.patch("/auth/me")
@@ -96,7 +123,7 @@ VALID_ROLES = ("admin", "analyst", "user")
 
 class UserCreateIn(BaseModel):
     username: str = Field(min_length=3, max_length=64)
-    password: str = Field(min_length=8, max_length=64)
+    password: Password = Field(min_length=8, max_length=72)
     nickname: str = ""
     role: str = "user"
 
@@ -108,7 +135,7 @@ class UserPatchIn(BaseModel):
 
 
 class ResetPasswordIn(BaseModel):
-    new_password: str = Field(min_length=8, max_length=64)
+    new_password: Password = Field(min_length=8, max_length=72)
 
 
 def _active_admin_count(db: Session) -> int:
@@ -510,7 +537,7 @@ def get_llm(user_id: int = Depends(current_user_id), db: Session = Depends(get_d
 def save_llm(body: LlmIn, user_id: int = Depends(current_user_id),
              db: Session = Depends(get_db)):
     # 停用状态允许 URL/模型留空(前端"仅保存停用状态");启用时才要求必填。
-    # 非空 URL 仍过网关守卫:SSRF/内网地址 400,允许本机 HTTP(vLLM/Ollama)。
+    # 保存、测试和运行共用端点策略;本机端点须精确匹配管理员白名单。
     base_url = (body.base_url or "").strip()
     model = (body.model or "").strip()
     if body.enabled and not base_url:
@@ -520,7 +547,7 @@ def save_llm(body: LlmIn, user_id: int = Depends(current_user_id),
     safe_url = ""
     if base_url:
         try:
-            safe_url = llm_gateway._validate_base_url(base_url, allow_local=True)
+            safe_url = llm_gateway._validate_base_url(base_url)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
     cfg = db.execute(select(UserLlmConfig).where(
@@ -549,7 +576,7 @@ def test_llm(body: LlmIn, user_id: int = Depends(current_user_id),
     cfg = db.execute(select(UserLlmConfig).where(
         UserLlmConfig.user_id == user_id)).scalar_one_or_none()
     key = body.api_key or (decrypt_secret(cfg.api_key_cipher) if cfg else "")
-    ok, msg = llm_gateway.test_config(body.base_url, key, body.model, allow_local=True)
+    ok, msg = llm_gateway.test_config(body.base_url, key, body.model)
     if cfg and ok:
         cfg.last_test_ok = True
         db.commit()

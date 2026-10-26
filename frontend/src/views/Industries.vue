@@ -59,7 +59,7 @@
       <el-empty v-if="!radarLoading && !radar.length" description="暂无雷达数据">
         <template #description>
           <p>暂无雷达数据</p>
-          <p class="muted" style="font-size:12px">先运行行业监测任务(industry_daily)生成行业截面后可见</p>
+          <p class="muted" style="font-size:12px">先运行「{{ taskName('industry_daily') }}」任务生成行业截面后可见</p>
         </template>
       </el-empty>
     </el-card>
@@ -130,7 +130,7 @@
         <template #description>
           <p>暂无行业景气数据</p>
           <p class="muted" style="font-size:12px;line-height:1.6">
-            行业数据来自每日 16:00 定时任务(industry_daily);<br />
+            行业数据来自每日 16:00「{{ taskName('industry_daily') }}」任务;<br />
             若本地网络无法访问东方财富接口,当前环境暂无数据属预期内的功能降级,不影响已有持仓与选股池展示。
           </p>
         </template>
@@ -201,6 +201,7 @@ import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import { fmtInt, fmtNum, fmtPct, upDownClass } from '../utils/fmt'
+import { taskName } from '../utils/tasks'
 import { useUserStore } from '../store'
 
 const store = useUserStore()

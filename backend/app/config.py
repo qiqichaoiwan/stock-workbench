@@ -4,8 +4,10 @@
 本文件只管基础设施,不承载策略逻辑。
 
 采集超时/退避约定(与 shared/data_gateway.resilient 对应):
-- fetch_timeout_seconds:单次源调用强制超时(秒),线程级强制,默认 60s;
-  超时计为一次失败并进入指数退避。设为 0 可关闭(仅测试)。
+- fetch_timeout_seconds:单次源调用的等待上限(秒),默认 60s;
+  超时不能终止底层线程或撤销副作用,计为一次失败并进入退避。设为 0 可关闭(仅测试)。
+  每进程最多 8 个 daemon 工作线程,超时调用结束才释放容量,满时立即失败;
+  嵌套调用在当前工作线程执行,仅受外层等待期限约束,不单独计时。
 - fetch_retry_times × fetch_retry_wait_seconds×attempt:指数退避,
   如 3 次 × 5s×attempt(5s/10s/15s)。
 - fetch_rate_limit_seconds:相邻外部请求最小间隔,默认 0.6s,防限流。
@@ -54,13 +56,16 @@ class Settings(BaseSettings):
     # 系统级兜底 LLM(OpenAI 兼容协议);用户自配优先。
     # 默认空 = 无兜底:llm_gateway.resolve_config 返回 source="none"/enabled=False,
     # 上层降级为纯规则输出,绝不静默伪造 AI 内容。生产如需启用,三项必须全配。
+    # 仅部署管理员可配置;环境变量 LLM_LOCAL_BASE_URLS='["http://127.0.0.1:11434/v1"]'。
+    # 精确匹配规范化后的完整端点,仅对环回 IP 放宽,不允许私网或特殊地址。
+    llm_local_base_urls: list[str] = []
     default_llm_base_url: str = ""
     default_llm_api_key: str = ""
     default_llm_model: str = "deepseek-chat"
 
     # 数据采集(超时/重试/限速,见模块 docstring)
     intraday_interval_minutes: int = 30   # 盘中半小时快照
-    fetch_timeout_seconds: float = 60.0   # 单次源调用强制超时(秒);0=关闭(仅测试)
+    fetch_timeout_seconds: float = 60.0   # 单次等待上限,不终止底层调用;0=关闭(仅测试)
     fetch_retry_times: int = 3
     fetch_retry_wait_seconds: int = 5
     fetch_rate_limit_seconds: float = 0.6  # 相邻外部请求最小间隔

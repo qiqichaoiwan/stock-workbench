@@ -82,7 +82,7 @@ def test_track_exit_hysteresis_keeps_incumbent_below_line(db, monkeypatch):
     import datetime
 
     from app.screener import strategy_engine as se
-    _mk_pool_row(db, 1, "688981")
+    _mk_pool_row(db, 1, "600001")
     # market 弱势 → score_min = 60 + 10 = 70,存量 61 分应保留。
     # run_strategy 内部是函数内 import,须 patch 源模块 market_regime。
     monkeypatch.setattr("app.screener.market_regime.risk_guard_active",
@@ -90,8 +90,8 @@ def test_track_exit_hysteresis_keeps_incumbent_below_line(db, monkeypatch):
     monkeypatch.setattr("app.screener.market_regime.latest_state",
                         lambda d: None)
     monkeypatch.setattr(se, "build_candidates", lambda d, td=None: pd.DataFrame([
-        {"code": "688981", "name": "中芯国际", "industry": "半导体",
-         "is_st": False, "board": "科创板", "close": 50.0, "total_mv": 300.0,
+        {"code": "600001", "name": "测试主板股", "industry": "半导体",
+         "is_st": False, "board": "主板", "close": 50.0, "total_mv": 300.0,
          "list_date": None, "roe": 5.0, "profit_yoy": 10.0,
          "ocf_to_profit": float("nan"), "debt_ratio": float("nan"),
          "gross_margin": 30.0,
@@ -104,7 +104,7 @@ def test_track_exit_hysteresis_keeps_incumbent_below_line(db, monkeypatch):
     monkeypatch.setattr(se, "track_news_heat", lambda d: {})
     monkeypatch.setattr(se, "latest_signals", lambda d, **kw: [])
     out = se.run_strategy(db, datetime.date(2026, 10, 23))
-    row = db.query(StockPool).filter_by(code="688981").one()
+    row = db.query(StockPool).filter_by(code="600001").one()
     assert row.status == "in"  # 滞回:低分存量不出池
     assert out["outs"] == 0
 
@@ -116,11 +116,11 @@ def test_track_disabled_exits_pool(db, monkeypatch):
     from app.screener import strategy_engine as se
     db.get(Track, 1).enabled = False
     db.commit()
-    _mk_pool_row(db, 1, "688981")
+    _mk_pool_row(db, 1, "600001")
     # df 非空才能走到赛道循环(空 df 会提前 return error)
     monkeypatch.setattr(se, "build_candidates", lambda d, td=None: pd.DataFrame([
-        {"code": "688981", "name": "中芯国际", "industry": "半导体",
-         "is_st": False, "board": "科创板", "close": 50.0, "total_mv": 300.0,
+        {"code": "600001", "name": "测试主板股", "industry": "半导体",
+         "is_st": False, "board": "主板", "close": 50.0, "total_mv": 300.0,
          "list_date": None, "roe": 5.0, "profit_yoy": 10.0,
          "ocf_to_profit": float("nan"), "debt_ratio": float("nan"),
          "gross_margin": 30.0,
@@ -132,9 +132,39 @@ def test_track_disabled_exits_pool(db, monkeypatch):
     ]))
     monkeypatch.setattr(se, "track_news_heat", lambda d: {})
     out = se.run_strategy(db, datetime.date(2026, 10, 23))
-    row = db.query(StockPool).filter_by(code="688981", pool_type="track").one()
+    row = db.query(StockPool).filter_by(code="600001", pool_type="track").one()
     assert row.status == "out"
     assert row.out_reason == "赛道已停用"
+
+
+def test_star_market_incumbent_forced_out(db, monkeypatch):
+    """科创板已入池存量:每次策略运行都置出,释放名额并留档。"""
+    import datetime
+
+    from app.screener import strategy_engine as se
+    _mk_pool_row(db, 1, "688981")
+    monkeypatch.setattr("app.screener.market_regime.risk_guard_active",
+                        lambda d: False)
+    monkeypatch.setattr("app.screener.market_regime.latest_state",
+                        lambda d: None)
+    monkeypatch.setattr(se, "build_candidates", lambda d, td=None: pd.DataFrame([
+        {"code": "600001", "name": "测试主板股", "industry": "半导体",
+         "is_st": False, "board": "主板", "close": 50.0, "total_mv": 300.0,
+         "list_date": None, "roe": 5.0, "profit_yoy": 10.0,
+         "ocf_to_profit": float("nan"), "debt_ratio": float("nan"),
+         "gross_margin": 30.0, "turnover": 3.0, "mom20": 5.0,
+         "crowd_avoid": False, "roe_ind_pct": 100.0, "gm_ind_pct": 100.0,
+         "pe_pct_5y": float("nan"), "pe_ttm": float("nan"), "tracks": None,
+         "buy_setup": False, "rs_weak": False, "rs_strong": False,
+         "pricing_power": None, "ma60": float("nan"), "ma120": float("nan")},
+    ]))
+    monkeypatch.setattr(se, "track_news_heat", lambda d: {})
+    monkeypatch.setattr(se, "latest_signals", lambda d, **kw: [])
+    out = se.run_strategy(db, datetime.date(2026, 10, 23))
+    row = db.query(StockPool).filter_by(code="688981").one()
+    assert row.status == "out"
+    assert row.out_reason == "科创板不参与选股"
+    assert out["outs"] >= 1
 
 
 def test_hard_filter_track_mode_allows_neg_profit():

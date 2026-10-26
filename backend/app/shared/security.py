@@ -37,12 +37,20 @@ _fernet = Fernet(_resolve_fernet_key())
 
 # ---------- 密码 ----------
 
+def validate_password_bytes(plain: str) -> str:
+    if len(plain.encode("utf-8")) > 72:
+        raise ValueError("密码 UTF-8 编码不得超过 72 字节;已有超长密码请联系管理员重置")
+    return plain
+
+
 def hash_password(plain: str) -> str:
+    validate_password_bytes(plain)
     return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode()
 
 
 def verify_password(plain: str, hashed: str) -> bool:
     try:
+        validate_password_bytes(plain)
         return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode())
     except ValueError:
         return False
