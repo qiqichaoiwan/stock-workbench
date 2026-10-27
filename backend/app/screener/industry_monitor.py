@@ -11,7 +11,7 @@ import logging
 from datetime import date, timedelta
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -261,6 +261,64 @@ def _sync_industry_spot_only(db: Session, trade_date: date) -> int:
 
 # ---------------- 新兴赛道雷达 ----------------
 
+def _expected_trade_day(db: Session) -> date:
+    """应为的最新数据日:优先取指数日线的最近数据日(同一条收盘流水线),
+    无指数数据时按工作日 16:00 粗略推断(纯本地判断,不在请求里访问网络)。"""
+    from .models import IndexDaily
+
+    latest_idx = db.execute(select(IndexDaily.trade_date).order_by(
+        IndexDaily.trade_date.desc()).limit(1)).scalar_one_or_none()
+    if latest_idx is not None:
+        return latest_idx
+    now = dg.now_tz()
+    d = now.date()
+    if now.hour < 16 or d.weekday() >= 5:
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def industry_summary(db: Session) -> dict:
+    """行业截面元信息:数据日、覆盖度、历史积累天数、回避名单数。
+
+    降级路径(东财行业日线不可用→新浪行业快照)会把动量/拥挤度/资金写成 0,
+    直接渲染会与「真实 0」混淆:前端据此把对应列显示为「积累中/-」。
+    """
+    latest = db.execute(select(IndustryDaily.trade_date).order_by(
+        IndustryDaily.trade_date.desc()).limit(1)).scalar_one_or_none()
+    expected = _expected_trade_day(db)
+    history_days = int(db.execute(
+        select(func.count(func.distinct(IndustryDaily.trade_date)))).scalar_one() or 0)
+    if latest is None:
+        return {"as_of": "", "rows": 0, "history_days": 0, "avoid_count": 0,
+                "expected": expected.isoformat(), "stale": False, "heat_mode": "empty",
+                "coverage": {"momentum": False, "flow": False,
+                             "crowding": False, "valuation": False}}
+    rows = db.execute(select(IndustryDaily).where(
+        IndustryDaily.trade_date == latest)).scalars().all()
+    coverage = {
+        "momentum": any(abs(r.mom_20 or 0) > 1e-9 or abs(r.mom_60 or 0) > 1e-9 for r in rows),
+        "flow": any(abs(r.fund_flow or 0) > 1e-9 for r in rows),
+        "crowding": any(abs(r.ratio_score or 0) > 1e-9 for r in rows),
+        "valuation": len({r.pe_pct for r in rows}) > 1,
+    }
+    # heat 口径:无动量时 _apply_heat_scores 用涨跌幅+成交占比兜底(degraded);
+    # 有动量但无 PE 分位时估值维度被降权(partial)。
+    heat_mode = "degraded" if not coverage["momentum"] else (
+        "ok" if coverage["valuation"] else "partial")
+    return {
+        "as_of": latest.isoformat(), "rows": len(rows),
+        "history_days": history_days,
+        "avoid_count": sum(1 for r in rows
+                           if r.avoid_until is not None and r.avoid_until >= latest),
+        "expected": expected.isoformat(),
+        "stale": latest < expected,
+        "heat_mode": heat_mode,
+        "coverage": coverage,
+    }
+
+
 def emerging_tracks(db: Session, top: int = 12) -> list[dict]:
     """新兴赛道发现:优先「启动期」(低位 + 动量转正 + 未拥挤),而非已经涨完的高位行业。
 
@@ -370,7 +428,7 @@ def emerging_tracks(db: Session, top: int = 12) -> list[dict]:
              "ratio_score": r["ratio_score"], "news_3d": r["news_3d"],
              "news_surge": r["news_surge"],
              "score": round(float(r["score"]), 3),
-             "data_validity": r["data_validity"],
+             "data_validity": r["data_validity"], "as_of": latest.isoformat(),
              "tracked": r["name"] in tracked}
             for _, r in odf.iterrows()]
 

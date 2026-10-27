@@ -613,7 +613,12 @@ def _index_daily_em(index_code: str, start: str, end: str) -> pd.DataFrame:
 
 @resilient("index_daily_tx")
 def _index_daily_tx(index_code: str, start: str, end: str) -> pd.DataFrame:
-    """备源一:腾讯指数日线(含成交额,历史长)。"""
+    """备源一:腾讯指数日线(历史长,但只有成交量没有成交额)。
+
+    注意:akshare 返回的第 6 列虽名为 amount,实际是成交量(手);与新浪
+    volume 恰好相差 100 倍可验证。成交额只认东财源,这里置 0 避免把
+    "成交量"当"成交额"写库(否则页面会少 3 个数量级,并污染市场总量)。
+    """
     import akshare as ak
 
     df = ak.stock_zh_index_daily_tx(symbol=index_code)
@@ -621,7 +626,8 @@ def _index_daily_tx(index_code: str, start: str, end: str) -> pd.DataFrame:
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
     s = datetime.strptime(start, "%Y%m%d").date()
     e = datetime.strptime(end, "%Y%m%d").date()
-    df = df[(df["trade_date"] >= s) & (df["trade_date"] <= e)]
+    df = df[(df["trade_date"] >= s) & (df["trade_date"] <= e)].copy()
+    df["amount"] = 0.0
     return df[["trade_date", "open", "high", "low", "close", "amount"]]
 
 
@@ -672,18 +678,24 @@ def get_index_daily_with_source(index_code: str, start: str,
 
 
 def get_market_total_amount(start: str, end: str | None = None) -> pd.DataFrame:
-    """沪深京三市日成交额(元):sh000001 + sz399001 + bj899050(缺则跳过)。"""
-    frames = []
+    """沪深京三市日成交额(元):sh000001 + sz399001 + bj899050(缺则跳过)。
+
+    只有东财源提供成交额;腾讯/新浪备源 amount=0 会被跳过。沪、深任一
+    缺失时抛错而不是用单市/混单位数据凑总市场分母——否则行业成交额占比、
+    融资余额/成交额等相对指标会被放大约 2 倍甚至 1000 倍。北证数据可选。
+    """
+    frames = {}
     for idx in ("sh000001", "sz399001", "bj899050"):
         try:
             df = get_index_daily(idx, start, end)
-            if df["amount"].sum() > 0:  # 新浪源 amount=0,无法用
-                frames.append(df.set_index("trade_date")["amount"])
+            if df["amount"].sum() > 0:  # 新浪/腾讯源 amount=0,无法用
+                frames[idx] = df.set_index("trade_date")["amount"]
         except Exception as exc:  # noqa: BLE001
             log.warning("index amount failed %s: %s", idx, exc)
-    if not frames:
-        raise RuntimeError("market total amount unavailable")
-    total = pd.concat(frames, axis=1).fillna(0).sum(axis=1)
+    missing = [idx for idx in ("sh000001", "sz399001") if idx not in frames]
+    if missing:
+        raise RuntimeError(f"market total amount unavailable: missing {','.join(missing)}")
+    total = pd.concat(frames.values(), axis=1).fillna(0).sum(axis=1)
     return total.rename("amount").reset_index()
 
 
@@ -705,6 +717,40 @@ def get_index_spot() -> pd.DataFrame:
     except Exception as exc:  # noqa: BLE001
         log.warning("index spot failed: %s", exc)
         return pd.DataFrame()
+
+
+def get_index_spot_amount(codes: list[str] | None = None) -> dict[str, float]:
+    """指数快照成交额(元),用于补齐日线备源缺失的 amount。
+
+    腾讯/新浪指数日线只有成交量、没有成交额,收盘后写库的 amount 会是 0。
+    新浪指数快照(stock_zh_index_spot_sina)的「成交额」为元、收盘后即当日
+    全额(实测 sh000001 6724 亿 + sz399001 7885 亿 ≈ 全市场 1.46 万亿),
+    可交叉验证市场总览。失败返回空 dict,不抛错(amount 保持 0 显示 -)。
+    """
+    try:
+        import akshare as ak
+
+        _rate_limit()
+        df = ak.stock_zh_index_spot_sina()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("index spot amount failed: %s", exc)
+        return {}
+    if df is None or df.empty or "成交额" not in df.columns:
+        return {}
+    want = set(codes or [c for c, _ in INDEX_DISPLAY])
+    out: dict[str, float] = {}
+    for row in df.to_dict("records"):
+        code = str(row.get("代码") or "").strip()
+        if code not in want:
+            continue
+        val = row.get("成交额")
+        try:
+            amount = float(val)
+        except (TypeError, ValueError):
+            continue
+        if amount > 0:
+            out[code] = amount
+    return out
 
 
 # ---------------- 行业板块 ----------------

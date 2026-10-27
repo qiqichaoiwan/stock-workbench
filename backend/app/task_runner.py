@@ -309,6 +309,8 @@ def task_sync_indexes(db: Session):
 
     start = (dg.today() - timedelta(days=90)).strftime("%Y%m%d")
     out, errors = {}, {}
+    spot_amount: dict[str, float] = {}
+    spot_tried = False
     for code, name in dg.INDEX_DISPLAY:
         try:
             df, source = dg.get_index_daily_with_source(code, start)
@@ -318,22 +320,33 @@ def task_sync_indexes(db: Session):
             td = last["trade_date"]
             if hasattr(td, "date"):
                 td = td.date()
-            amount = float(last.get("amount") or 0.0)
+            close = _f(last.get("close"))
+            amount = _f(last.get("amount"))
             # pct_chg:源无此列时由收盘推导
             if "pct_chg" in df.columns:
-                pct = float(last.get("pct_chg") or 0.0)
+                pct = _f(last.get("pct_chg"))
             else:
                 closes = pd.to_numeric(df.sort_values("trade_date")["close"],
                                        errors="coerce").dropna()
-                pct = ((float(closes.iloc[-1]) / float(closes.iloc[-2]) - 1) * 100
-                       if len(closes) >= 2 else 0.0)
+                prev = float(closes.iloc[-2]) if len(closes) >= 2 else 0.0
+                pct = ((float(closes.iloc[-1]) / prev - 1) * 100
+                       if len(closes) >= 2 and prev else 0.0)
             row = db.execute(select(IndexDaily).where(
                 IndexDaily.code == code, IndexDaily.trade_date == td)
             ).scalar_one_or_none()
+            if amount <= 0 and row is not None and _f(row.amount) > 0:
+                # 腾讯/新浪备源没有成交额;同日重跑时保留已有东财真实值
+                amount = _f(row.amount)
+            elif amount <= 0 and td == dg.today():
+                # 当日走备源:用指数快照「成交额」(收盘后即当日全额)补值,
+                # 一次拉全表;失败则保持 0,页面成交额列显示 -。
+                if not spot_tried:
+                    spot_amount, spot_tried = dg.get_index_spot_amount(), True
+                amount = _f(spot_amount.get(code))
             if row is None:
                 row = IndexDaily(code=code, name=name, trade_date=td)
                 db.add(row)
-            row.name, row.close = name, float(last.get("close") or 0.0)
+            row.name, row.close = name, close
             row.pct_chg, row.amount = pct, amount
             row.source = source
             db.commit()

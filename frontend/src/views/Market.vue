@@ -1,10 +1,20 @@
 <template>
   <div>
-    <div class="card-head" style="margin-bottom:12px">
-      <span class="muted">收盘指数与盘中资金快照以各自数据日期为准</span>
+    <div class="market-status">
+      <div class="status-item">
+        <span class="status-label">指数</span>
+        <strong>{{ indexAsOfText }}</strong>
+      </div>
+      <div class="status-item">
+        <span class="status-label">板块资金</span>
+        <strong>{{ flowAsOfText }}</strong>
+        <el-tag v-if="flowStale" size="small" effect="plain" type="warning">早于最新数据日</el-tag>
+        <el-tag v-if="flowOffSession" size="small" effect="plain" type="info">{{ offSessionLabel(flowSnap) }}</el-tag>
+      </div>
       <span class="grow" />
       <el-button size="small" :loading="ixLoading || cmdLoading || flowLoading" @click="load">刷新数据</el-button>
     </div>
+    <p class="market-note muted">时间均为北京时间；指数展示最近收盘值，资金与总览展示最近采集时点，均非实时行情。</p>
     <el-alert v-if="statError" :title="statError" type="error" :closable="false" show-icon />
     <el-alert v-else-if="!statLoading && !hasStat" :title="`暂无市场总览数据，请在任务中心运行「${taskName('market_stat')}」`" type="info" :closable="false" />
     <el-card v-if="hasStat" class="page-card">
@@ -12,7 +22,8 @@
         <div class="card-head">
           <span>市场总览</span>
           <span class="grow" />
-          <span class="muted" style="font-size:12px">{{ stat.snap_time || '' }} · 来源:{{ stat.source || '-' }}</span>
+          <span class="muted" style="font-size:12px">{{ statAsOfText }} · 来源:{{ stat.source || '-' }}</span>
+          <el-tag v-if="statOffSession" size="small" effect="plain" type="warning">{{ offSessionLabel(stat.snap_time) }}</el-tag>
         </div>
       </template>
       <el-row :gutter="12">
@@ -28,8 +39,9 @@
       <template #header>
         <div class="card-head">
           <span>主要指数</span>
+          <el-tag v-if="latestIndexDate" size="small" effect="plain">数据日 {{ latestIndexDate }} · 收盘 15:00</el-tag>
           <span class="grow" />
-          <span class="muted" style="font-size:12px">交易日收盘后 16:45 更新 · 非实时行情</span>
+          <span class="muted" style="font-size:12px">每交易日 16:45 定时落库 · 东财日线含成交额，备源日成交额取新浪快照</span>
         </div>
       </template>
       <div class="table-scroll">
@@ -37,18 +49,31 @@
         <el-table-column prop="name" label="指数" min-width="110" />
         <el-table-column prop="code" label="代码" width="100" />
         <el-table-column label="点位" width="120" align="right">
-          <template #default="{ row }">{{ fmtNum(row.close) }}</template>
+          <template #default="{ row }"><span class="num">{{ fmtNum(row.close) }}</span></template>
         </el-table-column>
         <el-table-column label="涨跌幅" width="110" align="right">
           <template #default="{ row }">
-            <span :class="upDownClass(row.pct_chg)">{{ fmtPct(row.pct_chg) }}</span>
+            <span class="num" :class="upDownClass(row.pct_chg)">{{ fmtPct(row.pct_chg) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="成交额(亿)" width="130" align="right">
-          <template #default="{ row }">{{ row.amount ? fmtNum(row.amount / 1e8) : '-' }}</template>
+          <template #default="{ row }">
+            <span v-if="row.amount" class="num">{{ fmtNum(row.amount / 1e8) }}</span>
+            <el-tooltip v-else content="该日成交额缺失：东财日线未取到，新浪快照也无值" placement="top">
+              <span class="muted">-</span>
+            </el-tooltip>
+          </template>
         </el-table-column>
-        <el-table-column prop="trade_date" label="日期" width="110" />
-        <el-table-column prop="source" label="来源" width="90" />
+        <el-table-column label="数据日" width="140">
+          <template #default="{ row }">{{ tradeDateText(row.trade_date) }}</template>
+        </el-table-column>
+        <el-table-column label="点位源" width="90">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain" :type="row.source === 'em' ? 'success' : 'info'">
+              {{ sourceLabel(row.source) }}
+            </el-tag>
+          </template>
+        </el-table-column>
       </el-table>
       </div>
       <el-alert v-if="ixError" :title="ixError" type="error" :closable="false" show-icon />
@@ -65,6 +90,7 @@
       <template #header>
         <div class="card-head">
           <span>板块资金</span>
+          <el-tag v-if="flowSnap" size="small" effect="plain">{{ flowAsOfText }}</el-tag>
           <span class="grow" />
           <el-radio-group v-model="boardType" size="small" @change="loadFlow">
             <el-radio-button value="industry">行业</el-radio-button>
@@ -78,13 +104,18 @@
         <el-table-column prop="board_name" label="板块" min-width="130" show-overflow-tooltip />
         <el-table-column label="主力净流入(亿)" width="130" align="right">
           <template #default="{ row }">
-            <span :class="upDownClass(row.net_inflow)">{{ fmtNum(row.net_inflow) }}</span>
+            <span class="num" :class="upDownClass(row.net_inflow)">{{ fmtNum(row.net_inflow) }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="snap_time" label="快照时间" width="170" />
-        <el-table-column prop="source" label="来源" width="90" />
+        <el-table-column prop="source" label="来源" width="90">
+          <template #default="{ row }">{{ flowSourceLabel(row.source) }}</template>
+        </el-table-column>
       </el-table>
       </div>
+      <el-alert v-if="flows.length && flowStale" type="warning" :closable="false" show-icon
+                :title="`资金快照数据日 ${flowDateText} 早于最新指数数据日 ${latestIndexDate}，请在任务中心运行「${taskName('fund_flow')}」更新`" />
+      <el-alert v-else-if="flows.length && flowOffSession" type="info" :closable="false" show-icon
+                :title="`采集时点在交易时段外（${offSessionLabel(flowSnap)}），展示的是最近交易日的收盘累计值`" />
       <el-alert v-if="flowError" :title="flowError" type="error" :closable="false" show-icon />
       <el-empty v-if="!flowLoading && !flowError && !flows.length" description="暂无板块资金数据" :image-size="60">
         <template #description>
@@ -125,7 +156,13 @@
     </el-card>
 
     <el-card class="page-card">
-      <template #header>商品周期</template>
+      <template #header>
+        <div class="card-head">
+          <span>商品周期</span>
+          <span class="grow" />
+          <span v-if="commodityDate" class="muted" style="font-size:12px">数据日 {{ commodityDate }}</span>
+        </div>
+      </template>
       <div class="table-scroll">
       <el-table :data="commodities" size="small" v-loading="cmdLoading" stripe border>
         <el-table-column prop="series_name" label="品种" min-width="110" />
@@ -141,7 +178,9 @@
           </template>
         </el-table-column>
         <el-table-column prop="related_track" label="关联赛道" min-width="120" />
-        <el-table-column prop="trade_date" label="日期" width="110" />
+        <el-table-column label="数据日" width="140">
+          <template #default="{ row }">{{ tradeDateText(row.trade_date) }}</template>
+        </el-table-column>
       </el-table>
       </div>
       <el-alert v-if="cmdError" :title="cmdError" type="error" :closable="false" show-icon />
@@ -179,6 +218,17 @@ const hasStat = computed(() => stat.value && Object.keys(stat.value).length > 0
 const limitText = computed(() => `${stat.value.limit_up ?? '-'} / ${stat.value.limit_down ?? '-'}`)
 const amountText = computed(() => stat.value.amount_total != null
   ? fmtNum(Number(stat.value.amount_total)) : '-')
+const statOffSession = computed(() => outsideSession(stat.value.snap_time))
+const statAsOfText = computed(() => asOfText(stat.value.snap_time))
+
+// 时间口径:snap_time / trade_date 均为北京时间;指数日线是收盘值(15:00)
+const latestIndexDate = computed(() => {
+  const days = indexes.value.map((r) => String(r.trade_date || '').slice(0, 10)).filter(Boolean)
+  return days.length ? days.sort().at(-1) : ''
+})
+const indexAsOfText = computed(() => latestIndexDate.value
+  ? `${latestIndexDate.value} 收盘` : '暂无数据')
+const commodityDate = computed(() => String(commodities.value[0]?.trade_date || '').slice(0, 10))
 
 // 板块资金
 const boardType = ref('industry')
@@ -190,6 +240,59 @@ const histLoading = ref(false)
 let seq = 0
 let flowSeq = 0
 let histSeq = 0
+
+// 指数来源:东财含成交额,腾讯/新浪仅点位与涨跌
+const SOURCE_LABELS = { em: '东财', tx: '腾讯', sina: '新浪' }
+function sourceLabel(s) { return SOURCE_LABELS[s] || s || '-' }
+function flowSourceLabel(s) {
+  return ({ eastmoney: '东财', em: '东财', sina: '新浪' })[s] || s || '-'
+}
+
+// 时间展示:后端返回 'YYYY-MM-DDTHH:mm:ss'(北京时间),拆分日期/时间并标注盘前/盘后采集
+function splitDateTime(v) {
+  const m = String(v || '').replace('T', ' ').match(/^(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}:\d{2}))?/)
+  return { date: m?.[1] || '', time: m?.[2] || '' }
+}
+function dateOf(v) { return splitDateTime(v).date || '-' }
+function outsideSession(v) {
+  const phase = sessionPhase(v)
+  return phase === 'preopen' || phase === 'afterclose'
+}
+// 采集时点:盘前/盘中/盘后;盘后值即当日收盘累计,盘前值仍是上一交易日
+function sessionPhase(v) {
+  const { time } = splitDateTime(v)
+  if (!time) return ''
+  const [h, m] = time.split(':').map(Number)
+  const minutes = h * 60 + m
+  if (minutes < 9 * 60 + 30) return 'preopen'
+  if (minutes > 15 * 60) return 'afterclose'
+  return 'intraday'
+}
+function asOfText(v) {
+  const { date, time } = splitDateTime(v)
+  if (!date) return '暂无数据'
+  const phase = sessionPhase(v)
+  if (phase === 'preopen') return `${date} 盘前采集 ${time}`
+  if (phase === 'afterclose') return `${date} 收盘值(采集 ${time})`
+  return `${date} 快照 ${time}`
+}
+function offSessionLabel(v) {
+  return sessionPhase(v) === 'preopen' ? '盘前采集' : '盘后采集'
+}
+function tradeDateText(v) {
+  const s = String(v || '').slice(0, 10)
+  if (!s) return '-'
+  const d = new Date(`${s}T00:00:00Z`)
+  if (Number.isNaN(d.getTime())) return s
+  return `${s} 周${'日一二三四五六'[d.getUTCDay()]}`
+}
+
+const flowSnap = computed(() => flows.value[0]?.snap_time || '')
+const flowDateText = computed(() => dateOf(flowSnap.value))
+const flowAsOfText = computed(() => asOfText(flowSnap.value))
+const flowOffSession = computed(() => outsideSession(flowSnap.value))
+const flowStale = computed(() => !!flowDateText.value && flowDateText.value !== '-'
+  && !!latestIndexDate.value && flowDateText.value < latestIndexDate.value)
 
 function barH(v) {
   const xs = flowHist.value.map((h) => Math.abs(Number(h.net_inflow) || 0))
@@ -271,6 +374,13 @@ async function load() {
 </script>
 
 <style scoped>
+.market-status { display: flex; align-items: center; flex-wrap: wrap; gap: 14px;
+  padding: 10px 14px; margin-bottom: 6px; background: #fff;
+  border: 1px solid #ebeef5; border-radius: 6px; }
+.status-item { display: flex; align-items: center; gap: 8px; }
+.status-label { color: #909399; font-size: 12px; }
+.status-item strong { font-size: 14px; font-variant-numeric: tabular-nums; }
+.market-note { font-size: 12px; margin: 0 0 12px; }
 .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .native-mini { border-collapse: collapse; font-size: 12px; min-width: 280px; }
 .native-mini th, .native-mini td { border: 1px solid #ebeef5; padding: 4px 8px; }

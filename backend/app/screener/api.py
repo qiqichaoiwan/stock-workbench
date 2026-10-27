@@ -194,6 +194,21 @@ def industries(trade_date: str | None = None, user_id: int = Depends(current_use
             for r in rows]
 
 
+@router.get("/industries/summary")
+def industries_summary(user_id: int = Depends(current_user_id),
+                       db: Session = Depends(get_db)):
+    """行业截面元信息:数据日/覆盖度/历史积累天数/回避名单数。
+
+    覆盖度为 false 的维度表示当前口径取不到值(降级快照或历史不足),
+    前端据此显示「积累中/-」,避免把降级写入的 0 当作真实值。
+    """
+    try:
+        return industry_monitor.industry_summary(db)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("industry summary failed")
+        raise HTTPException(503, "行业截面元信息查询失败，数据库服务暂时不可用，请稍后重试") from exc
+
+
 @router.get("/indexes")
 def indexes(codes: str | None = None,
             user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
