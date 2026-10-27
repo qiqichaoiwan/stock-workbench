@@ -70,6 +70,7 @@ def get_db() -> Session:
 def missing_tables() -> list[str]:
     """列出 metadata 中定义但数据库缺失的表(迁移检查用,不建表)。"""
     from .portfolio import models as _pf_models  # noqa: F401
+    from .portfolio import dual_core_checklist_models as _card_models  # noqa: F401
     from .screener import models as _scr_models  # noqa: F401
 
     existing = set(inspect(engine).get_table_names())
@@ -81,6 +82,7 @@ def missing_tables() -> list[str]:
 
 def create_all() -> None:
     from .portfolio import models as _pf_models  # noqa: F401
+    from .portfolio import dual_core_checklist_models as _card_models  # noqa: F401
     from .screener import models as _scr_models  # noqa: F401
 
     PortfolioBase.metadata.create_all(engine)

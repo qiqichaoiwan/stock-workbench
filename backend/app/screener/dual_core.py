@@ -120,6 +120,10 @@ def _core_snapshot(df: pd.DataFrame) -> dict:
         "ath_high": prior_high,                      # 不含当日的历史最高
         "new_high_intraday": bool(_round(last["high"]) >= prior_high) if prior_high else None,
         "new_high_close": bool(_round(last["close"]) >= prior_close_high) if prior_close_high else None,
+        "high60": _round(df["high"].iloc[:-1].tail(60).max()) if len(df) >= 61 else None,
+        "high60_bars": min(60, len(df)-1),
+        "ma10": _round(closes.rolling(10).mean().iloc[-1]),
+        "ma20": _round(closes.rolling(20).mean().iloc[-1]),
         "ma5": ma5_now,
         "ma5_prev": ma5_prev,
         "ma5_up": bool(ma5_now > ma5_prev) if ma5_now is not None and ma5_prev is not None else None,
@@ -160,7 +164,7 @@ def _industry_top(db: Session) -> tuple[str, list[dict]]:
                           "amount": _round(r[2], 0)} for r in rows]
 
 
-def analyze(db: Session) -> dict:
+def _analyze_legacy(db: Session) -> dict:
     """计算双核共振当日判定与逐项检查(文档二的四步清单)。"""
     a_df, b_df = _load_daily(db, CORE_A), _load_daily(db, CORE_B)
     if a_df.empty or b_df.empty:
@@ -335,3 +339,25 @@ def analyze(db: Session) -> dict:
         "industry_top": industry_top,
         "series": series,
     }
+
+
+def analyze(db: Session) -> dict:
+    """Preserve actual stored history; never relabel daily OHLC as real-time final."""
+    from datetime import datetime
+    from .dual_core_v2 import CN, evaluate
+    legacy = _analyze_legacy(db)
+    core_evidence = {code: dict(snap, price=snap.get('close'), source='daily', timestamp=None)
+                     for code, snap in legacy['data'].items()}
+    v2 = evaluate({'cores': core_evidence}, now=datetime.now(CN))
+    out = dict(legacy)
+    out.update(v2)
+    out['legacy_analysis'] = {'verdict': legacy['verdict'], 'checks': legacy['checks'],
+                              'status': 'historical_reference_only'}
+    out['ready'] = legacy['ready']
+    out['history_as_of'] = legacy['as_of']
+    out['message'] = 'source_missing: 日线历史不能验证120秒实时性；情绪、行业和个股证据未接入。禁止开仓。'
+    out['verdict']['reasons'] = [out['message']]
+    if not legacy['ready']:
+        out['verdict']['level'] = '无数据'
+        out['message'] += ' 请先运行 dual_core 历史任务。'
+    return out

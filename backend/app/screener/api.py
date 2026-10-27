@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -210,6 +210,20 @@ def industries_summary(user_id: int = Depends(current_user_id),
         raise HTTPException(503, "行业截面元信息查询失败，数据库服务暂时不可用，请稍后重试") from exc
 
 
+@router.post("/dual-core/evaluate-v2")
+def dual_core_evaluate_v2(body: object = Body(...), user_id: int = Depends(current_user_id),
+                          db: Session = Depends(get_db)):
+    """Read-only manual evidence evaluation; never grants trusted live execution."""
+    from .dual_core_v2 import evaluate_v2, validate_payload_shape
+    try:
+        validate_payload_shape(body)
+    except ValueError:
+        raise HTTPException(422, 'invalid evaluation structure') from None
+    from .dual_core_context import evaluation_context, apply_day_guard
+    context = evaluation_context()
+    return apply_day_guard(evaluate_v2(body, now=context['now']), db, user_id, context['now'])
+
+
 @router.get("/dual-core")
 def dual_core_view(user_id: int = Depends(current_user_id),
                    db: Session = Depends(get_db)):
@@ -219,7 +233,10 @@ def dual_core_view(user_id: int = Depends(current_user_id),
     并提示先运行任务 dual_core,前端显示引导而不是伪造结论。
     """
     try:
-        return dual_core.analyze(db)
+        from .dual_core_context import evaluation_context, apply_day_guard, evaluate_server_snapshot
+        context = evaluation_context()
+        result = evaluate_server_snapshot(db, user_id, context, lambda: dual_core.analyze(db))
+        return apply_day_guard(result, db, user_id, context['now'])
     except Exception as exc:  # noqa: BLE001
         log.exception("dual core analyze failed")
         raise HTTPException(503, "双核共振判定失败，数据库服务暂时不可用，请稍后重试") from exc

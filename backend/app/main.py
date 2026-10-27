@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import ROOT_DIR, settings
 from .db import create_all, missing_tables
 from .portfolio.api import router as portfolio_router
+from .portfolio.dual_core_checklist_api import router as dual_core_cards_router
 from .screener.api import router as screener_router
 
 logging.basicConfig(level=logging.INFO,
@@ -122,6 +123,7 @@ def health():
 
 
 app.include_router(portfolio_router)
+app.include_router(dual_core_cards_router)
 app.include_router(screener_router)
 
 # 前端构建产物存在时由后端统一托管(单服务部署)

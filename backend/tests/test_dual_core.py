@@ -63,6 +63,10 @@ def _init_db(rows: dict[str, list[DualCoreDaily]]) -> Session:
 def _level(db: Session) -> dict:
     payload = dual_core.analyze(db)
     assert payload["ready"] is True
+    # v1 behavior is retained strictly as a historical reference, never live.
+    assert payload['verdict']['cap'] == 0
+    assert payload['source_missing']
+    payload = dict(payload, **payload['legacy_analysis'])
     return payload
 
 
@@ -195,7 +199,9 @@ def test_not_ready_without_data():
     db = _db()
     payload = dual_core.analyze(db)
     assert payload["ready"] is False
-    assert payload["checks"] == []
+    assert payload["checks"][0]['key'] == 'data'
+    assert payload["checks"][0]['pass'] is False
+    assert payload['source_missing']
     assert "dual_core" in payload["message"]
     db.close()
 
@@ -254,6 +260,9 @@ def test_checklist_rejects_bad_date():
 
 def test_dual_core_endpoint_no_data():
     db = _db()
+    from app.db import PortfolioBase
+    from app.portfolio import dual_core_checklist_models
+    PortfolioBase.metadata.create_all(db.get_bind())
     app = FastAPI()
     app.include_router(api.router)
     app.dependency_overrides[get_db] = lambda: db
