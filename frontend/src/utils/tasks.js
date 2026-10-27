@@ -10,6 +10,7 @@ export const TASK_NAMES = {
   sync_quotes: '收盘快照落库(日线)',
   intraday_snapshot: '盘中快照',
   sync_indexes: '指数收盘同步',
+  dual_core: '双核共振指数同步',
   sync_valuation: '估值快照',
   fund_flow: '板块资金快照',
   market_stat: '市场总览快照',

@@ -719,6 +719,78 @@ def get_index_spot() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+# ---------------- 双核共振指数(同花顺 883957 / 883994) ----------------
+
+# 东财/新浪都不提供这两个同花顺指数,只能直连 10jqka 公开 kline 接口(JSONP)。
+# last1200.js 一次返回近 1200 根日线(883994 自 2022-05-25 共 1073 根即全历史),
+# 足够算 10/20 周均线、5 日线与"历史最高点",无需分年拉取。
+DUAL_CORE_DISPLAY: list[tuple[str, str]] = [
+    ("883957", "同花顺全A(沪深京)"),
+    ("883994", "昨日打首板表现"),
+]
+
+_THS_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_THS_CACHE_TTL = 300.0
+_THS_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+    "Referer": "https://q.10jqka.com.cn/",
+}
+
+
+def _parse_ths_jsonp(text: str) -> dict:
+    """解析 10jqka JSONP:`quotebridge_v6_line_48_883957_01_last1200({...})`。"""
+    start, end = text.find("("), text.rfind(")")
+    if start < 0 or end <= start:
+        raise ValueError("invalid ths jsonp payload")
+    return json.loads(text[start + 1:end])
+
+
+def get_ths_index_daily(code: str, bars: int = 1200,
+                        use_cache: bool = True) -> pd.DataFrame:
+    """同花顺指数日线:列 trade_date/open/high/low/close/volume/amount/name。
+
+    数据源格式:`date,open,high,low,close,volume,amount`,单位元/股。
+    行数不足 30 视为失败并抛错(避免把半截数据当完整历史入库);缓存 5 分钟,
+    同一页面刷新/任务重跑只打一次接口。
+    """
+    key = f"{code}:{bars}"
+    if use_cache and key in _THS_CACHE:
+        ts, cached = _THS_CACHE[key]
+        if time.time() - ts < _THS_CACHE_TTL:
+            return cached.copy()
+    import requests
+
+    suffix = f"last{bars}" if bars else "last"
+    url = f"https://d.10jqka.com.cn/v6/line/48_{code}/01/{suffix}.js"
+    _rate_limit()
+    resp = requests.get(url, headers=_THS_HEADERS, timeout=(3, 12))
+    resp.raise_for_status()
+    payload = _parse_ths_jsonp(resp.text)
+    raw = payload.get("data") or ""
+    rows: list[tuple] = []
+    for line in raw.split(";"):
+        parts = line.strip().split(",")
+        if len(parts) < 5:
+            continue
+        try:
+            d = pd.to_datetime(parts[0], format="%Y%m%d").date()
+            o, h, l, c = (float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]))
+            amount = float(parts[6]) if len(parts) > 6 else 0.0
+        except (TypeError, ValueError):
+            continue
+        if c <= 0:
+            continue
+        rows.append((d, o, h, l, c, amount))
+    if len(rows) < 30:
+        raise ValueError(f"insufficient ths index bars for {code}: {len(rows)}")
+    df = pd.DataFrame(rows, columns=["trade_date", "open", "high", "low", "close", "amount"])
+    df = df.drop_duplicates("trade_date").sort_values("trade_date").reset_index(drop=True)
+    df["name"] = str(payload.get("name") or code)
+    _THS_CACHE[key] = (time.time(), df)
+    return df.copy()
+
+
 def get_index_spot_amount(codes: list[str] | None = None) -> dict[str, float]:
     """指数快照成交额(元),用于补齐日线备源缺失的 amount。
 

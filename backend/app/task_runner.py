@@ -361,6 +361,61 @@ def task_sync_indexes(db: Session):
     return result
 
 
+def task_sync_dual_core(db: Session):
+    """双核指数日线落库(同花顺 883957/883994):全量 upsert,单核失败继续。
+
+    同花顺 last1200 接口一次返回全量历史(883994 即上市以来全部),因此这里
+    直接按 (code, trade_date) 增量补齐:历史日期只插不改,最近 5 根覆盖更新
+    (盘中快照收盘后会变),pct_chg 由同一序列收盘价推导,与源端口径一致。
+    """
+    from .screener.models import DualCoreDaily
+
+    out, errors = {}, {}
+    for code, name in dg.DUAL_CORE_DISPLAY:
+        try:
+            df = dg.get_ths_index_daily(code)
+            if df.empty:
+                raise ValueError("empty dataframe")
+            df = df.sort_values("trade_date").reset_index(drop=True)
+            closes = pd.to_numeric(df["close"], errors="coerce")
+            pct = (closes / closes.shift(1) - 1) * 100
+            existing = {r[0]: r[1] for r in db.execute(
+                select(DualCoreDaily.trade_date, DualCoreDaily.id).where(
+                    DualCoreDaily.code == code)).all()}
+            tail = max(len(df) - 5, 0)
+            added = updated = 0
+            for i, r in df.iterrows():
+                td = r["trade_date"]
+                if hasattr(td, "date"):
+                    td = td.date()
+                values = {
+                    "name": name, "open": _f(r.get("open")), "high": _f(r.get("high")),
+                    "low": _f(r.get("low")), "close": _f(r.get("close")),
+                    "amount": _f(r.get("amount")),
+                    "pct_chg": 0.0 if i == 0 or pd.isna(pct.iloc[i]) else _f(pct.iloc[i]),
+                    "source": "ths",
+                }
+                row_id = existing.get(td)
+                if row_id is None:
+                    db.add(DualCoreDaily(code=code, trade_date=td, **values))
+                    added += 1
+                elif i >= tail:
+                    db.execute(update(DualCoreDaily).where(
+                        DualCoreDaily.id == row_id).values(**values))
+                    updated += 1
+            db.commit()
+            out[code] = {"name": name, "rows": int(len(df)), "added": added,
+                         "updated": updated, "last": str(df["trade_date"].iloc[-1])}
+        except Exception as exc:  # noqa: BLE001 单核失败记 errors 继续
+            db.rollback()
+            errors[code] = str(exc)[:200]
+            log.warning("sync dual core %s failed: %s", code, exc)
+    result: dict = {"dual_core": out}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
 def task_lhb_sync(db: Session, trade_date=None) -> dict:
     """龙虎榜日同步:拉取当日龙虎榜 + 席位→游资匹配落库(逐条 savepoint)。
 
@@ -905,6 +960,7 @@ TASKS = {
     "holding_patrol": task_holding_patrol,
     "backfill_history": task_backfill_history,
     "sync_indexes": task_sync_indexes,
+    "dual_core": task_sync_dual_core,
     "tracks_backfill": task_tracks_backfill,
     "fund_flow": task_fund_flow_snapshot,
     "market_stat": task_market_stat,

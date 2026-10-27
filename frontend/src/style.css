@@ -32,6 +32,14 @@ body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #f5f7
 .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .table-scroll .el-table { min-width: 640px; }
 
+/* ---------- 打印(所有页面统一:隐藏导航/交互,内容不断页) ---------- */
+@media print {
+  .aside, .header, .el-drawer, .el-message, .el-overlay, .no-print { display: none !important; }
+  html, body, #app, .el-container { height: auto !important; }
+  .main { padding: 0 !important; overflow: visible !important; }
+  .page-card { margin-bottom: 8px; }
+}
+
 /* ---------- 移动端(<=768px) ---------- */
 @media (max-width: 768px) {
   /* 次要列隐藏(与 hide-mobile 类配合),保留优先列 */

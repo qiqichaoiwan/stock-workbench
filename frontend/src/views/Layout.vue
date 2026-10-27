@@ -104,6 +104,7 @@ const menuGroups = [
     items: [
       { path: '/dashboard', title: '仪表盘' },
       { path: '/market', title: '大盘指数' },
+      { path: '/dual-core', title: '双核共振' },
       { path: '/pool', title: '选股池' },
       { path: '/lhb', title: '龙虎榜' },
       { path: '/industries', title: '行业与赛道' },

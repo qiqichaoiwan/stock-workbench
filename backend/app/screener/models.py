@@ -399,3 +399,44 @@ class LhbDaily(ScreenerBase):
     sell_seats: Mapped[str] = mapped_column(Text, default="[]")         # 卖方席位名 JSON
     matched_traders: Mapped[str] = mapped_column(Text, default="[]")    # 命中游资 JSON(含买卖方向)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class DualCoreDaily(ScreenerBase):
+    """双核共振指数日线:883957 同花顺全A + 883994 昨日打首板表现(同花顺源)。
+
+    周线由日线聚合(Upsample 到 W-FRI),不在表内单独存周线,避免两处不一致。
+    """
+
+    __tablename__ = "scr_dual_core_daily"
+    __table_args__ = (UniqueConstraint("code", "trade_date", name="uq_dual_core"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(12), index=True)          # 883957/883994
+    name: Mapped[str] = mapped_column(String(32), default="")
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    open: Mapped[float] = mapped_column(Float, default=0.0)
+    high: Mapped[float] = mapped_column(Float, default=0.0)
+    low: Mapped[float] = mapped_column(Float, default=0.0)
+    close: Mapped[float] = mapped_column(Float, default=0.0)
+    amount: Mapped[float] = mapped_column(Float, default=0.0)          # 成交额(元)
+    pct_chg: Mapped[float] = mapped_column(Float, default=0.0)
+    source: Mapped[str] = mapped_column(String(8), default="ths")
+
+
+class TradeChecklist(ScreenerBase):
+    """每日交易检查清单的人工项与盘后复盘(逐用户逐交易日一行)。
+
+    items 为 JSON:{"industry": true, "stock_kline": false, ...};
+    review 为 JSON:{"q1": "...", "q2": "...", "q3": "...", "note": "...", "path": "稳健中军", "cap": 70}。
+    自动判定项由 dual_core.analyze 实时计算,不落库,避免与指数数据脱节。
+    """
+
+    __tablename__ = "scr_trade_checklist"
+    __table_args__ = (UniqueConstraint("user_id", "trade_date", name="uq_checklist"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, index=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    items: Mapped[str] = mapped_column(Text, default="{}")
+    review: Mapped[str] = mapped_column(Text, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)

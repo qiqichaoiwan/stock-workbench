@@ -10,6 +10,7 @@ const routes = [
       { path: '', redirect: '/dashboard' },
       { path: 'dashboard', component: () => import('./views/Dashboard.vue'), meta: { group: 'screener', title: '仪表盘' } },
       { path: 'market', component: () => import('./views/Market.vue'), meta: { group: 'screener', title: '大盘指数' } },
+      { path: 'dual-core', component: () => import('./views/DualCore.vue'), meta: { group: 'screener', title: '双核共振' } },
       { path: 'pool', component: () => import('./views/Pool.vue'), meta: { group: 'screener', title: '选股池' } },
       { path: 'lhb', component: () => import('./views/Lhb.vue'), meta: { group: 'screener', title: '龙虎榜' } },
       { path: 'industries', component: () => import('./views/Industries.vue'), meta: { group: 'screener', title: '行业与赛道' } },

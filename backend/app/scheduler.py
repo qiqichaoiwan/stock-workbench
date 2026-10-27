@@ -91,6 +91,12 @@ def build_scheduler() -> BackgroundScheduler:
                   day_of_week="mon-fri", hour=16, minute=45,
                   id="eod_indexes", max_instances=1, coalesce=True)
 
+    # 双核指数(收盘后 16:50):同花顺 883957/883994 全量 upsert,
+    # 供「双核共振」页面当日判定与次日一票否决使用。
+    sched.add_job(_guarded, "cron", args=["dual_core"],
+                  day_of_week="mon-fri", hour=16, minute=50,
+                  id="eod_dual_core", max_instances=1, coalesce=True)
+
     sched.add_job(_guarded, "cron", args=["strategy"],
                   day_of_week="mon-fri", hour=17, minute=5,
                   id="strategy", max_instances=1, coalesce=True)

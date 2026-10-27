@@ -8,20 +8,21 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..portfolio.models import User
-from ..screener import industry_monitor, market_regime, news_monitor, strategy_engine, \
-    technical_signal, universe_manager
+from ..screener import dual_core, industry_monitor, market_regime, news_monitor, \
+    strategy_engine, technical_signal, universe_manager
 from ..shared import data_gateway as dg
 from ..shared.security import current_user_id, require_analyst
 from ..task_runner import TASKS, run_task
 from .lhb_match import filter_hot_money, match_seats, normalize_matched
-from .models import (CommodityPrice, FundFlowSnapshot, IndustryDaily, LhbDaily,
-                   MarketState, MarketStat, NewsItem, PoolPerformance,
-                   StockPool, StrategyCard, StrategyParams, TaskLog, Track)
+from .models import (CommodityPrice, DualCoreDaily, FundFlowSnapshot, IndustryDaily,
+                   LhbDaily, MarketState, MarketStat, NewsItem, PoolPerformance,
+                   StockPool, StrategyCard, StrategyParams, TaskLog, Track,
+                   TradeChecklist)
 from .universe_manager import EXCLUDED_CODE_LIKE
 
 log = logging.getLogger("screener.api")
@@ -207,6 +208,87 @@ def industries_summary(user_id: int = Depends(current_user_id),
     except Exception as exc:  # noqa: BLE001
         log.exception("industry summary failed")
         raise HTTPException(503, "行业截面元信息查询失败，数据库服务暂时不可用，请稍后重试") from exc
+
+
+@router.get("/dual-core")
+def dual_core_view(user_id: int = Depends(current_user_id),
+                   db: Session = Depends(get_db)):
+    """双核共振当日判定:周线格局 + 日线发令枪 + 5日线买卖点 + 四步清单。
+
+    只读实时计算(周线由日线聚合),不写库;数据未落库时返回 ready=False
+    并提示先运行任务 dual_core,前端显示引导而不是伪造结论。
+    """
+    try:
+        return dual_core.analyze(db)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("dual core analyze failed")
+        raise HTTPException(503, "双核共振判定失败，数据库服务暂时不可用，请稍后重试") from exc
+
+
+def _checklist_date(db: Session, trade_date: str | None) -> date:
+    """清单业务日:显式入参 > 双核指数最新落库日 > 今日(不依赖交易日历网络)。"""
+    if trade_date:
+        try:
+            return date.fromisoformat(trade_date)
+        except ValueError:
+            raise HTTPException(422, f"日期参数非法:{trade_date}(需 YYYY-MM-DD)")
+    latest = db.execute(select(func.max(DualCoreDaily.trade_date))).scalar_one_or_none()
+    return latest or dg.today()
+
+
+class ChecklistIn(BaseModel):
+    trade_date: str | None = None
+    items: dict = Field(default_factory=dict)     # 人工勾选 {key: bool}
+    review: dict = Field(default_factory=dict)    # 复盘 {q1,q2,q3,note,path,cap}
+
+
+@router.get("/dual-core/checklist")
+def get_checklist(trade_date: str | None = None,
+                  user_id: int = Depends(current_user_id),
+                  db: Session = Depends(get_db)):
+    """读取逐用户逐交易日的清单人工项与复盘;无记录返回空壳。"""
+    d = _checklist_date(db, trade_date)
+    try:
+        row = db.execute(select(TradeChecklist).where(
+            TradeChecklist.user_id == user_id,
+            TradeChecklist.trade_date == d)).scalar_one_or_none()
+        return {"trade_date": d.isoformat(),
+                "items": json.loads(row.items) if row and row.items else {},
+                "review": json.loads(row.review) if row and row.review else {},
+                "updated_at": row.updated_at.isoformat() if row and row.updated_at else ""}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.exception("get checklist failed")
+        raise HTTPException(503, "交易清单查询失败，数据库服务暂时不可用，请稍后重试") from exc
+
+
+@router.put("/dual-core/checklist")
+def save_checklist(body: ChecklistIn,
+                   user_id: int = Depends(current_user_id),
+                   db: Session = Depends(get_db)):
+    """整份覆盖保存(items/review 以本次提交为准,前端每次全量提交)。
+
+    清单是逐用户的个人复盘数据(同持仓/自选),登录即可写;只按 user_id 隔离。
+    """
+    d = _checklist_date(db, body.trade_date)
+    try:
+        row = db.execute(select(TradeChecklist).where(
+            TradeChecklist.user_id == user_id,
+            TradeChecklist.trade_date == d)).scalar_one_or_none()
+        if row is None:
+            row = TradeChecklist(user_id=user_id, trade_date=d)
+            db.add(row)
+        row.items = json.dumps(body.items, ensure_ascii=False)
+        row.review = json.dumps(body.review, ensure_ascii=False)
+        db.commit()
+        db.refresh(row)  # onupdate=now 由数据库侧生成,刷新后才能返回准确时间
+        return {"ok": True, "trade_date": d.isoformat(),
+                "updated_at": row.updated_at.isoformat() if row.updated_at else ""}
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        log.exception("save checklist failed")
+        raise HTTPException(503, "交易清单保存失败，数据库服务暂时不可用，请稍后重试") from exc
 
 
 @router.get("/indexes")
