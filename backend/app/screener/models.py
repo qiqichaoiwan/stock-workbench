@@ -379,7 +379,11 @@ class MarketStat(ScreenerBase):
 
 
 class LhbDaily(ScreenerBase):
-    """龙虎榜日明细:收盘后落库,buy/sell_seats 为席位名 JSON,matched_traders 为命中游资 JSON。"""
+    """龙虎榜日明细:收盘后落库,buy/sell_seats 为席位名 JSON,matched_traders 为命中游资 JSON。
+
+    matched_traders 条目:{seat, trader, side(买入/卖出), kind(游资/机构/北向), style, risk};
+    读取接口会按当前席位映射重算并补方向,并过滤机构/北向只返回游资,历史数据无需重跑任务。
+    """
 
     __tablename__ = "scr_lhb_daily"
     __table_args__ = (UniqueConstraint("code", "trade_date", name="uq_lhb_daily"),)
@@ -393,5 +397,5 @@ class LhbDaily(ScreenerBase):
     lhb_net: Mapped[float] = mapped_column(Float, default=0.0)          # 龙虎榜净买额(万)
     buy_seats: Mapped[str] = mapped_column(Text, default="[]")         # 买方席位名 JSON
     sell_seats: Mapped[str] = mapped_column(Text, default="[]")         # 卖方席位名 JSON
-    matched_traders: Mapped[str] = mapped_column(Text, default="[]")    # 命中游资 JSON
+    matched_traders: Mapped[str] = mapped_column(Text, default="[]")    # 命中游资 JSON(含买卖方向)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

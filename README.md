@@ -77,7 +77,7 @@ docker exec -it selectmoney python scripts/init_data.py --admin-user admin --adm
 1. `sync_members` 同步指数成分(候选域)
 2. `sync_basic` 股票基础信息
 3. `sync_tracks` / `tracks_backfill` 赛道成分(东财被墙时自动走降级链,见赛道管理"来源"列)
-4. `backfill_history` 历史日线回填(约30-60分钟,逐股 savepoint 隔离)
+4. `backfill_history` 历史日线回填(首次 5 年约 30-60 分钟;增量执行,已有日期自动跳过)
 5. `sync_financials` 财务(近8报告期,point-in-time 公告日)
 6. `sync_indexes` / `lhb_sync` / `fund_flow` / `market_stat` 新模块数据
 7. 其余任务(估值/行业/商品/市场状态/信号/策略)可随时手动触发,此后由调度器自动运行

@@ -13,16 +13,17 @@
 - 状态语义:success=全部完成;degraded=部分完成(有 errors/codes_failed);
   failed=整体抛错。degraded 不冒充 success,前端任务日志可直接区分。
 """
+import inspect
 import logging
 import json
 import os
 import threading
 import time
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from .db import SessionLocal
@@ -30,6 +31,7 @@ from .portfolio.models import User
 from .portfolio.report_service import weekly_report
 from .screener import industry_monitor, market_regime, news_monitor, strategy_engine, \
     technical_signal, universe_manager
+from .screener.lhb_match import match_seats
 from .screener.models import (DailyQuote, FinancialIndicator, FundFlowSnapshot,
                               IntradaySnapshot, LhbDaily, MarketStat, StockBasic,
                               TaskLog, Valuation)
@@ -188,6 +190,26 @@ def _is_degraded(result: dict) -> bool:
     return False
 
 
+def _progress_writer(task_id: int):
+    """慢任务进度写入器:独立会话只更新本任务日志的 detail。
+
+    任务自身可能正在写业务表(回填逐股提交),用独立会话避免把任务的
+    未提交事务一起提交/回滚;写失败只记 debug,绝不影响任务本身。
+    """
+    def _update(msg: str) -> None:
+        s = SessionLocal()
+        try:
+            s.execute(update(TaskLog).where(TaskLog.id == task_id)
+                      .values(detail=str(msg)[:2000]))
+            s.commit()
+        except Exception:  # noqa: BLE001 进度只是展示,失败可忽略
+            s.rollback()
+            log.debug("task %s progress update failed", task_id, exc_info=True)
+        finally:
+            s.close()
+    return _update
+
+
 def _log_wrap(name: str, fn, **kwargs):
     db = SessionLocal()
     t = TaskLog(task_name=name, status="running")
@@ -195,7 +217,14 @@ def _log_wrap(name: str, fn, **kwargs):
     try:
         db.add(t)
         db.commit()
-        result = fn(db, **kwargs) or {}
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "progress" in params:
+            result = fn(db, progress=_progress_writer(t.id), **kwargs) or {}
+        else:
+            result = fn(db, **kwargs) or {}
         # degraded(部分完成)绝不冒充 success:统一记 failed,detail 带 degraded 前缀
         if isinstance(result, dict) and _is_degraded(result):
             raise RuntimeError(f"task degraded: {result}")
@@ -334,11 +363,7 @@ def task_lhb_sync(db: Session, trade_date=None) -> dict:
     for _, r in df.iterrows():
         buy = list(r.get("buy_seats") or [])
         sell = list(r.get("sell_seats") or [])
-        matched = []
-        for seat in buy + sell:
-            hit = seats_map.get(str(seat).strip())
-            if hit:
-                matched.append({"seat": str(seat).strip(), **hit})
+        matched = match_seats(buy, sell, seats_map)
         tdate = r.get("trade_date")
         if hasattr(tdate, "date"):
             tdate = tdate.date()
@@ -703,47 +728,148 @@ def task_holding_patrol(db: Session):
     return out
 
 
-def task_backfill_history(db: Session, years: int = 5):
-    """一次性回填:候选域个股日线(前复权)。仅初始化使用,耗时较长。
+def _to_date(val) -> date | None:
+    """把 SQLite 聚合返回的字符串/日期统一成 date。"""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    try:
+        return datetime.strptime(str(val)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
-    每 code 一个 savepoint:单股异常只回滚本股(insert 全部撤销),
-    不污染已提交的其他 code;失败计数 codes_failed>0 时整体记 degraded。
+
+def _quote_rows(code: str, df: pd.DataFrame) -> list[dict]:
+    """DataFrame → DailyQuote 批量插入行;跳过无效交易日。"""
+    rows: list[dict] = []
+    for r in df.to_dict("records"):
+        td = r.get("trade_date")
+        if td is None or pd.isna(td):
+            continue
+        rows.append({
+            "code": code, "trade_date": td,
+            "open": _f(r.get("open")), "high": _f(r.get("high")),
+            "low": _f(r.get("low")), "close": _f(r.get("close")),
+            "volume": _f(r.get("volume")), "amount": _f(r.get("amount")),
+            "turnover": _f(r.get("turnover")), "pct_chg": _f(r.get("pct_chg")),
+            "total_mv": 0.0, "adj_factor": 1.0,
+        })
+    return rows
+
+
+def _insert_quotes(db: Session, rows: list[dict]) -> int:
+    """批量写入日线,按 (code, trade_date) 去重(重复数据直接忽略),返回新增行数。
+
+    SQLite 走 INSERT .. ON CONFLICT DO NOTHING 分批提交,比逐行 ORM add
+    快一个数量级;其他数据库保持逐行存在性检查(兼容迁移前的路径)。
     """
+    added = 0
+    if db.bind is not None and db.bind.dialect.name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        stmt = sqlite_insert(DailyQuote).on_conflict_do_nothing(
+            index_elements=["code", "trade_date"])
+        conn = db.connection()
+        # 每批 50 行,避免超过老版本 SQLite 的 999 个绑定参数上限
+        for i in range(0, len(rows), 50):
+            res = conn.execute(stmt, rows[i:i + 50])
+            added += max(res.rowcount or 0, 0)  # 冲突被忽略的行不计入新增
+        return added
+    for row in rows:
+        exists = db.execute(select(DailyQuote.id).where(
+            DailyQuote.code == row["code"],
+            DailyQuote.trade_date == row["trade_date"])).first()
+        if exists is None:
+            db.add(DailyQuote(**row))
+            added += 1
+    return added
+
+
+def task_backfill_history(db: Session, years: int = 5, progress=None):
+    """历史日线回填(前复权):按个股已有覆盖范围增量抓取,不重复下全量。
+
+    - 首次(库内该股没有更早历史)按 years 年全量拉取;之后只补最新交易日
+      之后的数据,已最新的股票直接跳过(不发请求),重复执行成本很低。
+    - 回填专用源:新浪 → 腾讯 → baostock(跳过被限流的东财,见 data_gateway)。
+    - 单股失败进重试队列,第二轮换 tx 源重试(跳过东财);仍失败才计入
+      codes_failed,前端据此显示"部分完成"而非整单失败。
+    """
+    years = max(1, min(int(years or 5), 20))
     codes = universe_manager.candidate_universe(db)
-    start = (dg.today() - timedelta(days=years * 365)).strftime("%Y%m%d")
-    done = failed = 0
-    failures: list[str] = []
-    for i, code in enumerate(codes):
+    total = len(codes)
+    end_day = dg.completed_trade_day()
+    start_day = dg.today() - timedelta(days=years * 365)
+
+    # 一次查出全部个股的已有日期覆盖,避免逐股 SELECT 全部历史日期
+    coverage = {
+        str(code): (_to_date(mn), _to_date(mx))
+        for code, mn, mx in db.execute(
+            select(DailyQuote.code, func.min(DailyQuote.trade_date),
+                   func.max(DailyQuote.trade_date)).group_by(DailyQuote.code))
+    }
+
+    done = skipped = inserted = 0
+    failures: list[tuple[str, str, date]] = []
+
+    def _fetch_one(code: str, fetch_start: date, src: str) -> int:
+        df, _source = dg.get_daily_history(
+            code, fetch_start.strftime("%Y%m%d"), end_day.strftime("%Y%m%d"),
+            source=src)
+        rows = _quote_rows(code, df) if not df.empty else []
+        if not rows:
+            return 0
+        with db.begin_nested():
+            added = _insert_quotes(db, rows)
+        db.commit()
+        return added
+
+    def _report(i: int) -> None:
+        if progress and (i == 1 or i % 20 == 0 or i == total):
+            progress(f"回填中 {i}/{total} · 新增 {inserted} 行 · 跳过 {skipped} 只"
+                     f" · 待重试 {len(failures)} 只 · 覆盖 {years} 年")
+
+    for i, code in enumerate(codes, 1):
+        cov = coverage.get(code)
+        fetch_start = start_day
+        if cov and cov[0] is not None:
+            mn, mx = cov
+            # 已有更早历史(已覆盖到请求起点附近)→ 只补最新交易日之后
+            if mn <= start_day + timedelta(days=10):
+                nxt = (mx or mn) + timedelta(days=1)
+                if nxt > end_day:
+                    skipped += 1
+                    _report(i)
+                    continue
+                fetch_start = nxt
         try:
-            df, _src = dg.get_daily_history(code, start)
-            if df.empty:
-                continue
-            existing = {d for (d,) in db.execute(select(DailyQuote.trade_date).where(
-                DailyQuote.code == code))}
-            # 逐 code savepoint:本股写库异常整体回滚,不影响其他 code
-            with db.begin_nested():
-                for _, r in df.iterrows():
-                    if r["trade_date"] in existing:
-                        continue
-                    db.add(DailyQuote(code=code, trade_date=r["trade_date"],
-                                      open=_f(r["open"]), high=_f(r["high"]),
-                                      low=_f(r["low"]), close=_f(r["close"]),
-                                      volume=_f(r.get("volume")),
-                                      amount=_f(r.get("amount")),
-                                      turnover=_f(r.get("turnover")),
-                                      pct_chg=_f(r.get("pct_chg"))))
-            db.commit()
+            inserted += _fetch_one(code, fetch_start, "backfill")
             done += 1
-        except Exception as exc:  # noqa: BLE001 单股异常隔离,继续下一股
-            db.rollback()  # 撤销本股 savepoint 残留,保证连接干净
-            failed += 1
-            failures.append(f"{code}: {exc}"[:200])
-            log.warning("backfill %s failed (rolled back): %s", code, exc)
-        if (i + 1) % 50 == 0:
-            log.info("backfill progress %s/%s (failed %s)", i + 1, len(codes), failed)
-    out: dict = {"codes_done": done, "codes_failed": failed}
-    if failures:
-        out["errors"] = failures[:20]  # _is_degraded 据此记 degraded,不冒充 success
+        except Exception as exc:  # noqa: BLE001 单股失败进重试队列,不拖垮整单
+            db.rollback()
+            failures.append((code, f"{code}: {exc}"[:200], fetch_start))
+            log.warning("backfill %s failed (will retry): %s", code, exc)
+        _report(i)
+
+    # 第二轮:失败股票换 tx 源重试一次(跳过东财,避免再等 30s+ 重试)
+    still: list[str] = []
+    for code, msg, fetch_start in failures:
+        try:
+            inserted += _fetch_one(code, fetch_start, "tx")
+            done += 1
+        except Exception as exc:  # noqa: BLE001 重试仍失败才计入失败
+            db.rollback()
+            still.append(f"{msg} | retry: {exc}"[:200])
+            log.warning("backfill retry %s failed: %s", code, exc)
+
+    out: dict = {"years": years, "codes_done": done,
+                 "codes_failed": len(still), "codes_skipped": skipped,
+                 "rows_added": inserted,
+                 "range": f"{start_day.isoformat()}~{end_day.isoformat()}"}
+    if still:
+        out["errors"] = still[:20]  # _is_degraded 据此记 degraded,不冒充 success
     return out
 
 

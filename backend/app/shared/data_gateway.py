@@ -432,11 +432,20 @@ def get_index_members(index_code: str) -> pd.DataFrame:
 
 # ---------------- 日线(主 akshare 东财 / 备 baostock) ----------------
 
+def _is_bse_code(code: str) -> bool:
+    """北交所代码:4/8 开头的老代码与 920 开头的新代码。
+
+    沪深 A 股不会以 4/8/92 开头,故按前缀即可区分;北交所需 bj 前缀,
+    各源用错前缀会直接报错/返回空(回填曾因此整单 degraded)。
+    """
+    return code.startswith(("4", "8", "92"))
+
+
 def _bs_code(code: str) -> str:
+    if _is_bse_code(code):
+        return f"bj.{code}"
     if code.startswith("6"):
         return f"sh.{code}"
-    if code.startswith(("8", "4")):
-        return f"bj.{code}"
     return f"sz.{code}"
 
 
@@ -459,7 +468,12 @@ def _daily_hist_ak(code: str, start: str, end: str) -> pd.DataFrame:
 
 @resilient("daily_hist_bs")
 def _daily_hist_bs(code: str, start: str, end: str) -> pd.DataFrame:
-    """baostock 个股日线:adjustflag="2" 为**前复权**、成交量**股**(无需×100)。"""
+    """baostock 个股日线:adjustflag="2" 为**前复权**、成交量**股**(无需×100)。
+
+    baostock 仅覆盖沪深,北交所(920xxx/4x/8x)直接返回空,避免无意义报错。
+    """
+    if _is_bse_code(code):
+        return pd.DataFrame()
     import baostock as bs
 
     lg = bs.login()
@@ -489,6 +503,8 @@ def _daily_hist_bs(code: str, start: str, end: str) -> pd.DataFrame:
 
 
 def _sina_symbol(code: str) -> str:
+    if _is_bse_code(code):
+        return f"bj{code}"
     if code.startswith(("6", "5")):
         return f"sh{code}"
     return f"sz{code}"
@@ -523,7 +539,8 @@ def _daily_hist_tx(code: str, start: str, end: str) -> pd.DataFrame:
     用原 amount 列近似,pct_chg 自算)。"""
     import akshare as ak
 
-    sym = ("sh" if code.startswith(("6", "5")) else "sz") + code
+    sym = (f"bj{code}" if _is_bse_code(code)
+           else ("sh" if code.startswith(("6", "5")) else "sz") + code)
     df = ak.stock_zh_a_hist_tx(symbol=sym, start_date=start, end_date=end, adjust="qfq")
     df = df.rename(columns={"date": "trade_date", "amount": "volume"})
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
@@ -537,9 +554,27 @@ def _daily_hist_tx(code: str, start: str, end: str) -> pd.DataFrame:
 
 def get_daily_history(code: str, start: str, end: str | None = None,
                       source: str = "auto") -> tuple[pd.DataFrame, str]:
-    """日线(前复权)。start/end: 'YYYYMMDD'。返回 (df, source)。四源降级:
-    东财akshare → 腾讯tx → 新浪sina → baostock(东财连续失败自动冷却,回填场景直走tx)。"""
+    """日线(前复权)。start/end: 'YYYYMMDD'。返回 (df, source)。
+
+    source:
+    - auto: 东财akshare → 腾讯tx → 新浪sina → baostock
+    - akshare/tx/sina: 指定首选源,失败继续降级
+    - backfill: 回填专用,跳过易被限流的东财(sina → tx → baostock);
+      历史回填逐股请求时不再为东财重试白等 30s+。
+    """
     end = end or today().strftime("%Y%m%d")
+    if source == "backfill":
+        try:
+            return _daily_hist_sina(code, start, end), "sina"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("daily sina failed for %s: %s", code, exc)
+        try:
+            df = _daily_hist_tx(code, start, end)
+            if not df.empty:
+                return df, "tx"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("daily tx failed for %s: %s", code, exc)
+        return _daily_hist_bs(code, start, end), "baostock"
     if source in ("auto", "akshare") and not _cooldown_check("daily_hist_ak"):
         try:
             df = _daily_hist_ak(code, start, end)
@@ -1194,8 +1229,9 @@ _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 
 def load_hot_money_seats() -> dict[str, dict]:
-    """游资席位映射表:seat(营业部全称) → {trader, style, risk}。
+    """游资席位映射表:seat(营业部全称) → {trader, style, risk, kind}。
 
+    kind 缺省按 trader/席位推断(游资/机构/北向),页面据此过滤机构与北向。
     读 backend/data/hot_money_seats.json;缺文件返回 {} 不抛错(调用方降级为空匹配)。"""
     path = _DATA_DIR / "hot_money_seats.json"
     try:
@@ -1210,10 +1246,21 @@ def load_hot_money_seats() -> dict[str, dict]:
     for it in items if isinstance(items, list) else []:
         seat = str(it.get("seat", "")).strip()
         if seat:
-            out[seat] = {"trader": str(it.get("trader", "")),
+            trader = str(it.get("trader", ""))
+            out[seat] = {"trader": trader,
                          "style": str(it.get("style", "")),
-                         "risk": str(it.get("risk", ""))}
+                         "risk": str(it.get("risk", "")),
+                         "kind": str(it.get("kind", "")).strip() or seat_kind(seat, trader)}
     return out
+
+
+def seat_kind(seat: str, trader: str) -> str:
+    """席位类别:游资 / 机构 / 北向(仅用于展示过滤,不影响匹配)。"""
+    if trader == "北向资金" or seat in ("沪股通专用", "深股通专用"):
+        return "北向"
+    if trader in ("公募/私募机构", "机构席位") or seat == "机构专用":
+        return "机构"
+    return "游资"
 
 
 def _coerce_trade_date_str(trade_date) -> str:

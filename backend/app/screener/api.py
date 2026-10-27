@@ -7,7 +7,7 @@ import logging
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -15,8 +15,10 @@ from ..db import get_db
 from ..portfolio.models import User
 from ..screener import industry_monitor, market_regime, news_monitor, strategy_engine, \
     technical_signal, universe_manager
+from ..shared import data_gateway as dg
 from ..shared.security import current_user_id, require_analyst
 from ..task_runner import TASKS, run_task
+from .lhb_match import filter_hot_money, match_seats, normalize_matched
 from .models import (CommodityPrice, FundFlowSnapshot, IndustryDaily, LhbDaily,
                    MarketState, MarketStat, NewsItem, PoolPerformance,
                    StockPool, StrategyCard, StrategyParams, TaskLog, Track)
@@ -331,10 +333,30 @@ def market_stat_latest(user_id: int = Depends(current_user_id),
 
 # ---------- 技术信号与新闻 ----------
 
+def _lhb_matched(row: LhbDaily, seats_map: dict) -> list[dict]:
+    """按当前映射重算命中(带买入/卖出方向),并过滤机构/北向只留游资。
+
+    席位缺失时回退库存 matched_traders;重算让历史数据同步享受更名归一/
+    新增席位,并补上方向。
+    """
+    try:
+        buy = json.loads(row.buy_seats or "[]")
+        sell = json.loads(row.sell_seats or "[]")
+    except (TypeError, ValueError):
+        buy, sell = [], []
+    if buy or sell:
+        return filter_hot_money(match_seats(buy, sell, seats_map))
+    return filter_hot_money(normalize_matched(row.matched_traders))
+
+
 @router.get("/lhb")
 def lhb(trade_date: str | None = None, limit: int = 50,
         user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
-    """最近交易日龙虎榜 [{code,name,close,pct_chg,lhb_net,matched_traders}];无数据 [] 不 500。"""
+    """最近交易日龙虎榜 [{code,name,close,pct_chg,lhb_net,trade_date,matched_traders}]。
+
+    matched_traders 统一为 [{seat,trader,side,style,risk}],side=买入/卖出,
+    同一游资同一方向去重;历史库存按当前席位映射重算,兼容旧格式。
+    """
     limit = min(max(limit, 1), MAX_LIMIT)
     # 日期参数在 try 外解析:非法日期返回 422,不与被吞成空数据的查询异常混在一起
     if trade_date:
@@ -355,9 +377,11 @@ def lhb(trade_date: str | None = None, limit: int = 50,
                 return []
             q = q.where(LhbDaily.trade_date == latest)
         rows = db.execute(q.order_by(LhbDaily.lhb_net.desc()).limit(limit)).scalars().all()
+        seats_map = dg.load_hot_money_seats()
         return [{"code": r.code, "name": r.name, "close": r.close,
                  "pct_chg": r.pct_chg, "lhb_net": r.lhb_net,
-                 "matched_traders": json.loads(r.matched_traders or "[]")}
+                 "trade_date": r.trade_date.isoformat(),
+                 "matched_traders": _lhb_matched(r, seats_map)}
                 for r in rows]
     except Exception:  # noqa: BLE001 无数据/老库缺表一律 [] 不 500
         return []
@@ -366,10 +390,11 @@ def lhb(trade_date: str | None = None, limit: int = 50,
 @router.get("/hot-money-seats")
 def hot_money_seats(user_id: int = Depends(current_user_id),
                     db: Session = Depends(get_db)):
-    """游资席位映射表 [{seat,trader,style,risk}]。"""
+    """游资席位映射表 [{seat,trader,style,risk,kind}];已过滤机构/北向。"""
     from ..shared import data_gateway as dg
 
-    return [{"seat": seat, **info} for seat, info in dg.load_hot_money_seats().items()]
+    return [{"seat": seat, **info} for seat, info in dg.load_hot_money_seats().items()
+            if info.get("kind", "游资") == "游资"]
 
 
 @router.get("/search")
@@ -667,7 +692,7 @@ def task_logs(limit: int = 50, analyst: User = Depends(require_analyst),
 
 
 class TaskRunIn(BaseModel):
-    years: int = 5
+    years: int = Field(default=5, ge=1, le=20)
 
 
 @router.post("/tasks/{name}/run")
@@ -680,10 +705,12 @@ def run_task_api(name: str, body: TaskRunIn | None = None,
     if name == "backfill_history" and body:
         kwargs["years"] = body.years
     # 后台线程执行,请求立即返回;慢任务(行业重试/历史回填)不再阻塞页面
-    from ..task_runner import run_task_async
+    from ..task_runner import run_task_async, _max_concurrent_tasks
 
     started = run_task_async(name, **kwargs)
     if not started:
-        raise HTTPException(409, f"任务 {name} 正在运行中,请稍后在日志里查看进度")
+        raise HTTPException(
+            409, f"任务未提交:同类任务已在运行中,或后台并发已达上限"
+                 f"({_max_concurrent_tasks()}),请在下方日志查看进度")
     return {"queued": True, "task": name,
             "message": "已提交后台执行,请在下方日志查看结果(慢任务可能需要数分钟)"}

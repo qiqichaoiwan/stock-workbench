@@ -16,9 +16,9 @@
         <el-table-column label="时间" width="150">
           <template #default="{ row }">{{ fmtDT(row.run_at) }}</template>
         </el-table-column>
-        <el-table-column label="状态" width="90">
+        <el-table-column label="状态" width="110">
           <template #default="{ row }">
-            <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
+            <el-tag :type="statusType(row)" size="small">{{ statusLabel(row) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="耗时" width="90" align="right">
@@ -43,6 +43,14 @@
       <el-select v-model="taskName" placeholder="选择任务" style="width:100%">
         <el-option v-for="(t, name) in TASK_NAMES" :key="name" :label="t" :value="name" />
       </el-select>
+      <div v-if="taskName === 'backfill_history'" style="margin-top:12px">
+        <span class="muted" style="font-size:12px;margin-right:6px">回填年数</span>
+        <el-input-number v-model="years" :min="1" :max="20" size="small" />
+        <p class="muted" style="font-size:12px;margin:6px 0 0">
+          增量回填:库内已有的日期自动跳过,重复执行只补最新数据;首次 5 年约需 20-40 分钟,
+          进度可直接在本页日志查看(支持后台运行,关闭页面不影响)。
+        </p>
+      </div>
       <p class="muted" style="font-size:12px">首次初始化建议顺序:{{ INIT_ORDER_TEXT }}</p>
       <template #footer>
         <el-button @click="dialog = false">取消</el-button>
@@ -66,23 +74,39 @@ const logs = ref([])
 const loading = ref(false)
 const dialog = ref(false)
 const taskName = ref('')
+const years = ref(5)
 const running = ref(false)
 const page = ref(1)
 const pageSize = 20
 const pagedLogs = computed(() => logs.value.slice((page.value - 1) * pageSize, page.value * pageSize))
 let pollTimer = null
+let autoTimer = null
 let pollToken = 0
 
 const statusLabels = { success: '成功', failed: '失败', running: '运行中', skipped: '跳过' }
-function statusLabel(s) { return statusLabels[s] || s }
-function statusType(s) {
-  return { success: 'success', failed: 'danger', running: 'primary', skipped: 'info' }[s] || 'info'
+function isPartial(row) {
+  return row.status === 'failed' && row.data_quality === 'degraded'
+}
+function statusLabel(row) {
+  if (isPartial(row)) return '部分完成'
+  return statusLabels[row.status] || row.status
+}
+function statusType(row) {
+  if (isPartial(row)) return 'warning'
+  return { success: 'success', failed: 'danger', running: 'primary', skipped: 'info' }[row.status] || 'info'
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  // 后台任务(如历史回填)运行时自动刷新进度,无需手动点触发
+  autoTimer = setInterval(() => {
+    if (logs.value.some((l) => l.status === 'running')) load()
+  }, 10000)
+})
 onBeforeUnmount(() => {
   pollToken += 1
   if (pollTimer) clearTimeout(pollTimer)
+  if (autoTimer) clearInterval(autoTimer)
 })
 
 async function load() {
@@ -105,9 +129,13 @@ async function run() {
   try {
     const target = taskName.value
     const startedId = Math.max(0, ...logs.value.map((l) => Number(l.id) || 0))
-    const r = await api.post(`/api/screener/tasks/${target}/run`, { years: 5 })
+    const body = target === 'backfill_history' ? { years: years.value } : {}
+    const r = await api.post(`/api/screener/tasks/${target}/run`, body)
     ElMessage.success(r.message || '已提交后台执行')
     dialog.value = false
+    // 回填首次全量可能 20-40 分钟:放宽轮询,进度见运行中日志的 detail
+    const maxTries = target === 'backfill_history' ? 1200 : 60
+    const interval = target === 'backfill_history' ? 10000 : 5000
     let tries = 0
     const poll = async () => {
       if (token !== pollToken) return
@@ -116,12 +144,16 @@ async function run() {
       if (token !== pollToken) return
       const hit = logs.value.find((l) => l.task_name === target && Number(l.id) > startedId && l.status !== 'running')
       if (hit) {
-        ElMessage({ type: hit.status === 'success' ? 'success' : 'error', message: `${taskLabel(target)} ${statusLabel(hit.status)}(${fmtDuration(hit.duration_ms, '未知')})` })
+        const type = hit.status === 'success' ? 'success' : isPartial(hit) ? 'warning' : 'error'
+        ElMessage({ type, message: `${taskLabel(target)} ${statusLabel(hit)}(${fmtDuration(hit.duration_ms, '未知')})` })
         pollTimer = null
         return
       }
-      if (tries < 36) pollTimer = setTimeout(poll, 5000)
-      else pollTimer = null
+      if (tries < maxTries) pollTimer = setTimeout(poll, interval)
+      else {
+        ElMessage.info(`${taskLabel(target)} 仍在后台运行,可稍后刷新本页查看结果`)
+        pollTimer = null
+      }
     }
     pollTimer = setTimeout(poll, 1000)
   } finally {

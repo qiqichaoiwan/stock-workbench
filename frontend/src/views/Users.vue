@@ -65,8 +65,19 @@
         <div class="card-head">
           <span>邀请码(一次性,凭码注册)</span>
           <span class="grow" />
-          <el-input-number v-model="inviteDays" :min="1" :max="90" size="small" style="width:110px;margin-right:10px" />
-          <el-button type="primary" size="small" :loading="creatingInvite" @click="genInvite">生成邀请码</el-button>
+          <span class="muted" style="font-size:12px;margin-right:4px">有效天数</span>
+          <el-input-number v-model="inviteDays" :min="1" :max="90" size="small"
+                           style="width:100px;margin-right:10px" />
+          <span class="muted" style="font-size:12px;margin-right:4px">生成个数</span>
+          <el-input-number v-model="inviteCount" :min="1" :max="50" size="small"
+                           style="width:100px;margin-right:10px" />
+          <el-button type="primary" size="small" :loading="creatingInvite" @click="genInvite">
+            生成邀请码
+          </el-button>
+          <el-button size="small" :loading="exporting" :disabled="!availableCount"
+                     @click="exportInvites">
+            导出可用邀请码{{ availableCount ? `(${availableCount})` : '' }}
+          </el-button>
         </div>
       </template>
       <el-table :data="invites" size="small" stripe border>
@@ -79,8 +90,9 @@
         <el-table-column prop="note" label="备注" min-width="120" />
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
-            <el-tag size="small" :type="row.used ? 'success' : row.active ? 'warning' : 'info'">
-              {{ row.used ? '已使用' : row.active ? '待使用' : '已作废' }}
+            <el-tag size="small"
+                    :type="row.used ? 'success' : (!row.active || row.expired) ? 'info' : 'warning'">
+              {{ row.used ? '已使用' : !row.active ? '已作废' : row.expired ? '已过期' : '待使用' }}
             </el-tag>
           </template>
         </el-table-column>
@@ -93,13 +105,13 @@
         </el-table-column>
         <el-table-column label="操作" width="80">
           <template #default="{ row }">
-            <el-button v-if="row.active && !row.used" size="small" link type="danger" @click="revoke(row)">作废</el-button>
+            <el-button v-if="row.available" size="small" link type="danger" @click="revoke(row)">作废</el-button>
           </template>
         </el-table-column>
       </el-table>
       <el-empty v-if="!invites.length" description="暂无邀请码" :image-size="60">
         <template #description>
-          <p>暂无邀请码,设置有效天数后点「生成邀请码」</p>
+          <p>暂无邀请码,设置有效天数与生成个数后点「生成邀请码」</p>
           <p class="muted" style="font-size:12px">邀请码一次性有效,凭码注册;用过即失效,不用可作废</p>
         </template>
       </el-empty>
@@ -196,7 +208,10 @@ const editTarget = ref(null)
 const editNickname = ref('')
 
 const inviteDays = ref(7)
+const inviteCount = ref(1)
 const creatingInvite = ref(false)
+const exporting = ref(false)
+const availableCount = computed(() => invites.value.filter((r) => r.available).length)
 
 onMounted(() => { load(); loadInvites() })
 
@@ -292,11 +307,38 @@ async function remove(row) {
 async function genInvite() {
   creatingInvite.value = true
   try {
-    const r = await api.post('/api/auth/invites', { expires_days: inviteDays.value })
-    ElMessage.success(`已生成:${r.code}`)
+    const r = await api.post('/api/auth/invites', {
+      expires_days: inviteDays.value,
+      count: inviteCount.value,
+    })
+    ElMessage.success(r.count > 1 ? `已生成 ${r.count} 个邀请码` : `已生成:${r.code}`)
     await loadInvites()
   } finally {
     creatingInvite.value = false
+  }
+}
+
+async function exportInvites() {
+  exporting.value = true
+  try {
+    const blob = await api.get('/api/auth/invites/export', {
+      responseType: 'blob',
+      silent: true,
+    })
+    const filename = `invite-codes-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.csv`
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    ElMessage.success(`已导出 ${availableCount.value} 个可用邀请码`)
+  } catch {
+    ElMessage.error('导出失败,请稍后重试')
+  } finally {
+    exporting.value = false
   }
 }
 

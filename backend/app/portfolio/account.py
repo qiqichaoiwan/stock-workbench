@@ -50,15 +50,38 @@ def _record_login_fail(client_ip: str) -> None:
 
 # ---------- 注册(凭邀请码) ----------
 
+def generate_invites(db: Session, created_by: int, note: str = "",
+                     expires_days: int = 7, count: int = 1) -> list[InviteCode]:
+    """批量生成一次性邀请码(1-50 个),单事务提交。
+
+    先本地去重再排除库内已存在的 code,避免极小概率的唯一键冲突
+    把整批生成打回;调用方按返回顺序展示/复制。
+    """
+    count = max(1, min(int(count or 1), 50))
+    codes: set[str] = set()
+    while len(codes) < count:
+        codes.add("INV-" + secrets.token_urlsafe(6)
+                  .replace("-", "").replace("_", "")[:10].upper())
+    existing = set(db.execute(
+        select(InviteCode.code).where(InviteCode.code.in_(codes))).scalars())
+    codes -= existing
+    while len(codes) < count:
+        codes.add("INV-" + secrets.token_urlsafe(6)
+                  .replace("-", "").replace("_", "")[:10].upper())
+    expires_at = datetime.now(timezone.utc) + timedelta(days=expires_days)
+    invs = [InviteCode(code=code, note=note, created_by=created_by,
+                       expires_at=expires_at) for code in sorted(codes)]
+    db.add_all(invs)
+    db.commit()
+    for inv in invs:
+        db.refresh(inv)
+    return invs
+
+
 def generate_invite(db: Session, created_by: int, note: str = "",
                     expires_days: int = 7) -> InviteCode:
-    code = "INV-" + secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:10].upper()
-    inv = InviteCode(code=code, note=note, created_by=created_by,
-                     expires_at=datetime.now(timezone.utc) + timedelta(days=expires_days))
-    db.add(inv)
-    db.commit()
-    db.refresh(inv)
-    return inv
+    """生成单个邀请码(保留旧调用入口)。"""
+    return generate_invites(db, created_by, note, expires_days, 1)[0]
 
 
 def register(db: Session, username: str, password: str, nickname: str = "",

@@ -2,7 +2,7 @@
 from datetime import date
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from pydantic import AfterValidator, BaseModel, Field
@@ -249,6 +249,23 @@ def delete_user(user_id: int, admin: User = Depends(require_admin),
 class InviteIn(BaseModel):
     note: str = ""
     expires_days: int = Field(default=7, ge=1, le=90)
+    count: int = Field(default=1, ge=1, le=50)
+
+
+def _invite_expired(inv: InviteCode) -> bool:
+    """SQLite 读回为 naive UTC,统一按 UTC 判断是否过期。"""
+    if not inv.expires_at:
+        return False
+    from datetime import datetime, timezone
+
+    exp = inv.expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return exp < datetime.now(timezone.utc)
+
+
+def _invite_available(inv: InviteCode) -> bool:
+    return bool(inv.active and inv.used_by is None and not _invite_expired(inv))
 
 
 @router.get("/auth/invites")
@@ -261,15 +278,50 @@ def list_invites(admin: User = Depends(require_admin), db: Session = Depends(get
              "used_by": names.get(r.used_by, "") if r.used_by else "",
              "used_at": _cn(r.used_at),
              "expires_at": _cn(r.expires_at),
-             "created_at": _cn(r.created_at)}
+             "created_at": _cn(r.created_at),
+             "expired": _invite_expired(r),
+             "available": _invite_available(r)}
             for r in rows]
+
+
+@router.get("/auth/invites/export")
+def export_invites(admin: User = Depends(require_admin),
+                   db: Session = Depends(get_db)):
+    """导出当前可用邀请码(active + 未使用 + 未过期)为 CSV。
+
+    UTF-8 BOM 前缀保证 Excel 直接打开不乱码;X-Invite-Count 供前端提示条数。
+    """
+    import csv
+    import io
+
+    rows = db.execute(select(InviteCode).where(
+        InviteCode.active == True,  # noqa: E712
+        InviteCode.used_by.is_(None)).order_by(InviteCode.id)).scalars().all()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["邀请码", "备注", "过期时间(北京时间)", "创建时间(北京时间)"])
+    count = 0
+    for inv in rows:
+        if not _invite_available(inv):
+            continue
+        writer.writerow([inv.code, inv.note, _cn(inv.expires_at) or "永久",
+                         _cn(inv.created_at)])
+        count += 1
+    fname = f"invite-codes-{date.today().strftime('%Y%m%d')}.csv"
+    return Response(
+        content=("\ufeff" + buf.getvalue()).encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"',
+                 "X-Invite-Count": str(count)})
 
 
 @router.post("/auth/invites")
 def create_invite(body: InviteIn, admin: User = Depends(require_admin),
                   db: Session = Depends(get_db)):
-    inv = account.generate_invite(db, admin.id, body.note, body.expires_days)
-    return {"id": inv.id, "code": inv.code}
+    invs = account.generate_invites(db, admin.id, body.note,
+                                    body.expires_days, body.count)
+    return {"count": len(invs), "id": invs[0].id, "code": invs[0].code,
+            "codes": [{"id": i.id, "code": i.code} for i in invs]}
 
 
 @router.delete("/auth/invites/{invite_id}")

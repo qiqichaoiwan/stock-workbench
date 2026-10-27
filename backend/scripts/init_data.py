@@ -2,7 +2,7 @@
 
 用法:
   python scripts/init_data.py --admin-user admin --admin-password <密码>
-  python scripts/init_data.py --admin-user admin --admin-password <密码> --backfill  # 连历史数据一起回填(约30-60分钟)
+  python scripts/init_data.py --admin-user admin --admin-password <密码> --backfill  # 连历史数据一起回填(首次约30-60分钟,增量补缺)
 """
 import argparse
 import sys

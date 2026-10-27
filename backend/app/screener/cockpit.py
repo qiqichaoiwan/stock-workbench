@@ -13,6 +13,10 @@ TZ = ZoneInfo("Asia/Shanghai")
 INDEXES = (("sh000001", "上证指数"), ("sz399001", "深证成指"),
            ("sz399006", "创业板指"), ("sh000688", "科创50"))
 
+# py_mini_racer(V8)初始化不是线程安全的,驾驶舱多个 Feed 并发调用 akshare
+# 会触发原生崩溃,因此这里的 akshare 调用统一串行。
+_AK_LOCK = threading.Lock()
+
 
 def _now():
     return datetime.now(TZ)
@@ -72,8 +76,9 @@ def _direct(fn, *args, **kwargs):
 
 
 def _load_calendar():
-    from ..shared import data_gateway as dg
-    return set(_direct(dg.get_trade_calendar, start="19900101", end="21001231"))
+    with _AK_LOCK:
+        from ..shared import data_gateway as dg
+        return set(_direct(dg.get_trade_calendar, start="19900101", end="21001231"))
 
 
 def _session(now):
@@ -134,15 +139,17 @@ def _points(frame):
 
 
 def _load_minutes(code, provider):
-    import akshare as ak
-    if provider == "em":
-        return _points(ak.index_zh_a_hist_min_em(symbol=code[2:], period="1"))
-    return _points(ak.stock_zh_a_minute(symbol=code, period="1", adjust=""))
+    with _AK_LOCK:
+        import akshare as ak
+        if provider == "em":
+            return _points(ak.index_zh_a_hist_min_em(symbol=code[2:], period="1"))
+        return _points(ak.stock_zh_a_minute(symbol=code, period="1", adjust=""))
 
 
 def _load_snapshot():
-    import akshare as ak
-    df = ak.stock_zh_index_spot_sina()
+    with _AK_LOCK:
+        import akshare as ak
+        df = ak.stock_zh_index_spot_sina()
     result = {}
     for row in df.to_dict("records"):
         code = str(row.get("代码", ""))
@@ -156,15 +163,16 @@ def _load_snapshot():
 
 
 def _load_flow(kind):
-    from ..shared import data_gateway as dg
-    fn = dg.get_industry_fund_flow if kind == "industry" else dg.get_concept_fund_flow
-    df = _direct(fn)
-    boards = [{"name": str(r["board_name"]), "net_inflow": _number(r["fund_flow"])}
-              for r in df.to_dict("records") if _number(r["fund_flow"]) is not None]
-    if not boards:
-        raise ValueError("empty fund flow")
-    return {"boards": sorted(boards, key=lambda r: r["net_inflow"], reverse=True),
-            "data_time": None}  # Provider exposes no source timestamp.
+    with _AK_LOCK:
+        from ..shared import data_gateway as dg
+        fn = dg.get_industry_fund_flow if kind == "industry" else dg.get_concept_fund_flow
+        df = _direct(fn)
+        boards = [{"name": str(r["board_name"]), "net_inflow": _number(r["fund_flow"])}
+                  for r in df.to_dict("records") if _number(r["fund_flow"]) is not None]
+        if not boards:
+            raise ValueError("empty fund flow")
+        return {"boards": sorted(boards, key=lambda r: r["net_inflow"], reverse=True),
+                "data_time": None}  # Provider exposes no source timestamp.
 
 
 def _choose(primary, secondary, first, second, active=True):
@@ -241,8 +249,9 @@ def _parse_news(df, important):
 
 def _load_news(important):
     if important:
-        import akshare as ak
-        return _parse_news(ak.stock_info_global_cls(symbol="重点"), True)
+        with _AK_LOCK:
+            import akshare as ak
+            return _parse_news(ak.stock_info_global_cls(symbol="重点"), True)
     import requests
     response = requests.get(
         "https://np-weblist.eastmoney.com/comm/web/getFastNewsList",

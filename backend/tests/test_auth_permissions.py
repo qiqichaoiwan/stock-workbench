@@ -198,3 +198,44 @@ def test_login_rate_limit():
         client.post("/api/auth/login", json={"username": "ghost", "password": "wrong-000000"})
     r = client.post("/api/auth/login", json={"username": "ghost", "password": "wrong-000000"})
     assert r.status_code == 429
+
+
+def test_invite_batch_count_and_available_export():
+    """生成个数生效;导出仅包含可用(未用/未作废/未过期)邀请码。"""
+    token = _login("boss")
+    headers = {"Authorization": f"Bearer {token}"}
+    r = client.post("/api/auth/invites",
+                    json={"note": "批量", "expires_days": 3, "count": 4},
+                    headers=headers)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["count"] == 4
+    codes = [item["code"] for item in data["codes"]]
+    assert len(codes) == 4 and len(set(codes)) == 4
+
+    r = client.get("/api/auth/invites", headers=headers)
+    rows = {item["code"]: item for item in r.json()}
+    assert all(rows[c]["available"] is True for c in codes)
+
+    # 消费一个:应变为不可用,且从导出中消失
+    r = client.post("/api/auth/register",
+                    json={"username": "batch_invite_user", "password": "batch-pass-123",
+                          "invite_code": codes[0]})
+    assert r.status_code == 200, r.text
+
+    r = client.get("/api/auth/invites/export", headers=headers)
+    assert r.status_code == 200
+    assert r.content.startswith(b"\xef\xbb\xbf")  # UTF-8 BOM,Excel 不乱码
+    text = r.content.decode("utf-8-sig")
+    assert codes[0] not in text
+    for code in codes[1:]:
+        assert code in text
+
+    # 数量上限校验(0 非法)
+    r = client.post("/api/auth/invites", json={"count": 0}, headers=headers)
+    assert r.status_code == 422
+
+    # 导出仅管理员可用
+    reader = {"Authorization": f"Bearer {_login('reader')}"}
+    r = client.get("/api/auth/invites/export", headers=reader)
+    assert r.status_code == 403
