@@ -13,6 +13,7 @@ from .db import create_all, missing_tables
 from .portfolio.api import router as portfolio_router
 from .portfolio.dual_core_checklist_api import router as dual_core_cards_router
 from .screener.api import router as screener_router
+from .shared.body_limit import PathBodyLimitMiddleware
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -97,6 +98,10 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+
+# 评估/清单写入的请求体上限在 ASGI 层生效,FastAPI 读取 body 之前就能拒绝超大上传;
+# 后加的 CORS 中间件位于最外层,保证 413 响应也带 CORS 头。
+app.add_middleware(PathBodyLimitMiddleware)
 
 # CORS(默认同源,显式配置才放行):
 # - 前后端同源部署(后端托管 dist)时无需跨域,此处仅放行 vite dev(5173)与本机调试。

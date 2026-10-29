@@ -355,7 +355,8 @@ def analyze(db: Session) -> dict:
                               'status': 'historical_reference_only'}
     out['ready'] = legacy['ready']
     out['history_as_of'] = legacy['as_of']
-    out['message'] = 'source_missing: 日线历史不能验证120秒实时性；情绪、行业和个股证据未接入。禁止开仓。'
+    out['message'] = ('source_missing: 日线历史不能验证120秒实时性；服务端实时快照当前不可用'
+                      '（非交易时段、未启用或采集失败），行业与个股仍为手工域。禁止开仓。')
     out['verdict']['reasons'] = [out['message']]
     if not legacy['ready']:
         out['verdict']['level'] = '无数据'

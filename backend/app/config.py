@@ -65,6 +65,9 @@ class Settings(BaseSettings):
 
     # 数据采集(超时/重试/限速,见模块 docstring)
     intraday_interval_minutes: int = 30   # 盘中半小时快照
+    # 双核 v2 服务端实时适配器开关:关闭后 GET /dual-core 只读已落库日线
+    # (unverified),不发外部请求;生产故障排查/断网时可作为 kill switch。
+    dual_core_feed_enabled: bool = True
     fetch_timeout_seconds: float = 60.0   # 单次等待上限,不终止底层调用;0=关闭(仅测试)
     fetch_retry_times: int = 3
     fetch_retry_wait_seconds: int = 5

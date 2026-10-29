@@ -147,8 +147,12 @@ def _run_with_timeout(fn, timeout: float, *args, **kwargs):
         raise TimeoutError(f"source call timed out after {timeout}s; underlying call continues") from exc
 
 
-def resilient(name: str):
-    """统一重试装饰器:限速 + 有界等待超时 + 指数退避;全部失败抛最后一次异常。"""
+def resilient(name: str, *, v8: bool = False):
+    """统一重试装饰器:限速 + 有界等待超时 + 指数退避;全部失败抛最后一次异常。
+
+    v8=True 的源会构造 py_mini_racer(V8)。V8 在两个线程并发初始化会让整个进程
+    原生崩溃(异常无法被 Python 捕获),因此这类调用必须经 call_v8 全局串行。
+    """
 
     def deco(fn):
         @wraps(fn)
@@ -157,6 +161,9 @@ def resilient(name: str):
             for attempt in range(1, settings.fetch_retry_times + 1):
                 try:
                     _rate_limit()
+                    if v8:
+                        return call_v8(fn, *args, timeout=settings.fetch_timeout_seconds,
+                                       **kwargs)
                     return _run_with_timeout(fn, settings.fetch_timeout_seconds,
                                             *args, **kwargs)
                 except Exception as exc:  # noqa: BLE001 采集层必须吞掉任意源错误再重试
@@ -167,14 +174,47 @@ def resilient(name: str):
                     time.sleep(wait)
             raise RuntimeError(f"[data_gateway] {name} 全部重试失败") from last_err
 
+        wrapper.__v8_serialized__ = v8
         return wrapper
 
     return deco
 
 
+# V8 调用全局串行锁:data_gateway 内部与驾驶舱等外部入口共用同一个锁,
+# 否则跨模块并发仍可能同时构造 MiniRacer 并让进程崩溃。
+_ak_serial = threading.RLock()
+
+
+def ak_serialized() -> threading.RLock:
+    """返回 V8 调用共享锁(供网关外的 akshare 直调入口复用)。"""
+    return _ak_serial
+
+
+def call_v8(fn, *args, timeout: float | None = None, **kwargs):
+    """串行执行会构造 MiniRacer 的 akshare 调用。
+
+    锁由工作线程持有直到底层调用真正结束(超时后也继续),因此一次超时的旧
+    调用不会与后续调用并发构造 V8。等待锁与调用本身都受同一个 timeout 约束;
+    无 timeout/<=0 时在当前线程内串行执行。
+    """
+    if timeout is None or timeout <= 0:
+        with _ak_serial:
+            return fn(*args, **kwargs)
+
+    def locked():
+        if not _ak_serial.acquire(timeout=timeout):
+            raise TimeoutError(f"V8 serialization lock wait timed out after {timeout}s")
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _ak_serial.release()
+
+    return _run_with_timeout(locked, timeout)
+
+
 # ---------------- 交易日历 ----------------
 
-@resilient("trade_calendar")
+@resilient("trade_calendar", v8=True)
 def get_trade_calendar(start: str | None = None, end: str | None = None) -> list[date]:
     """返回升序交易日列表(date)。start/end: 'YYYYMMDD'。"""
     import akshare as ak
@@ -510,7 +550,7 @@ def _sina_symbol(code: str) -> str:
     return f"sz{code}"
 
 
-@resilient("daily_hist_sina")
+@resilient("daily_hist_sina", v8=True)
 def _daily_hist_sina(code: str, start: str, end: str) -> pd.DataFrame:
     """第三源:新浪个股日线(**前复权**,adjust="qfq";成交量**手**→统一为股)。
 
@@ -631,7 +671,7 @@ def _index_daily_tx(index_code: str, start: str, end: str) -> pd.DataFrame:
     return df[["trade_date", "open", "high", "low", "close", "amount"]]
 
 
-@resilient("index_daily_sina")
+@resilient("index_daily_sina", v8=True)
 def _index_daily_sina(index_code: str, start: str, end: str) -> pd.DataFrame:
     """备源二:新浪指数日线(无成交额,amount 置 0)。"""
     import akshare as ak
@@ -791,6 +831,54 @@ def get_ths_index_daily(code: str, bars: int = 1200,
     return df.copy()
 
 
+_THS_QUOTE_CACHE: dict[str, tuple[float, dict]] = {}
+_THS_QUOTE_TTL = 5.0
+
+
+def get_ths_index_quote(code: str, use_cache: bool = True) -> dict:
+    """同花顺指数实时报价(realhead):price/open/high/low/prev_close/amount/pct_chg。
+
+    日线 kline 在收盘前后可能还没有当日 bar(实测 883994),realhead 已提供
+    当日 OHLC 与成交额。字段编号来自同花顺公开 JSONP:10=现价、7=开盘、
+    8=最高、9=最低、6=昨收、19=成交额(元)、199112=涨跌幅%。
+    源返回不完整/非正数时抛错,由上层保持缺失,绝不补零。
+    """
+    cached = _THS_QUOTE_CACHE.get(code)
+    if use_cache and cached and time.time() - cached[0] < _THS_QUOTE_TTL:
+        return dict(cached[1])
+    import requests
+
+    url = f"https://d.10jqka.com.cn/v6/realhead/48_{code}/last.js"
+    _rate_limit()
+    resp = requests.get(url, headers=_THS_HEADERS, timeout=(3, 8))
+    resp.raise_for_status()
+    payload = _parse_ths_jsonp(resp.text)
+    items = payload.get("items") or {}
+
+    def number(key: str) -> float | None:
+        try:
+            return float(items.get(key))
+        except (TypeError, ValueError):
+            return None
+
+    price, open_, high, low = (number(k) for k in ("10", "7", "8", "9"))
+    prev_close, pct_chg, amount = (number(k) for k in ("6", "199112", "19"))
+    if price is None or high is None or low is None:
+        raise ValueError(f"incomplete ths quote for {code}")
+    if min(price, high, low) <= 0 or high < price or low > price:
+        raise ValueError(f"invalid ths quote range for {code}")
+    quote = {
+        "code": code, "price": price,
+        "open": open_ if open_ is not None and open_ > 0 else price,
+        "high": high, "low": low, "prev_close": prev_close,
+        "amount": amount if amount is not None and amount > 0 else None,
+        "pct_chg": pct_chg, "time": str(items.get("time") or ""),
+        "source": "10jqka:realhead",
+    }
+    _THS_QUOTE_CACHE[code] = (time.time(), dict(quote))
+    return quote
+
+
 def get_index_spot_amount(codes: list[str] | None = None) -> dict[str, float]:
     """指数快照成交额(元),用于补齐日线备源缺失的 amount。
 
@@ -875,7 +963,7 @@ def _ths_concept_list() -> tuple[list[str], list[str]]:
     return names, codes
 
 
-@resilient("concept_board_ths")
+@resilient("concept_board_ths", v8=True)
 def _concept_board_cons_ths(board_name: str) -> pd.DataFrame:
     """同花顺名单核验:ak.stock_board_concept_name_ths() 名单存在即返回占位标记行。
 
@@ -959,6 +1047,186 @@ def _cached_spot_snapshot() -> pd.DataFrame:
     with _snap_cache_lock:
         _SNAP_CACHE = (time.monotonic(), df)
     return df
+
+
+# 选股池行情优先走新浪批量报价:一次 HTTP 请求即可拿到几十只股票的现价/涨跌幅,
+# 比全市场快照(akshare 三源降级,单次常超 8 秒)快得多;全市场快照仅作降级。
+_SINA_QUOTE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+    "Referer": "https://finance.sina.com.cn",
+}
+
+
+def _sina_symbol(code: str) -> str:
+    code = str(code).zfill(6)
+    if code.startswith(("4", "8", "92")):  # 北交所(含 920 新号段)
+        return f"bj{code}"
+    if code[0] in "69":
+        return f"sh{code}"
+    return f"sz{code}"
+
+
+def _quote_age(snapshot_at: str | None) -> float | None:
+    """行情时间到现在的秒数;时间不可解析返回 None(不冒充实时)。"""
+    try:
+        at = datetime.fromisoformat(snapshot_at)
+    except (TypeError, ValueError):
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=TZ)
+    return max(0.0, round((now_tz() - at.astimezone(TZ)).total_seconds(), 1))
+
+
+def _fetch_sina_batch_quotes(codes: set[str]) -> tuple[dict[str, dict], str | None]:
+    """新浪批量报价:返回 ({code: quote}, 行情时间)。价格缺失(停牌/无数据)的代码跳过。"""
+    import requests
+
+    ordered = sorted(codes)
+    quotes: dict[str, dict] = {}
+    stamps: set[str] = set()
+    for start in range(0, len(ordered), 50):
+        chunk = ordered[start:start + 50]
+        symbols = {_sina_symbol(code): code for code in chunk}
+        _rate_limit()
+        resp = requests.get("https://hq.sinajs.cn/list=" + ",".join(symbols),
+                            headers=_SINA_QUOTE_HEADERS, timeout=(3, 6))
+        resp.raise_for_status()
+        resp.encoding = "gbk"
+        for line in resp.text.strip().splitlines():
+            if not line.startswith("var hq_str_") or '="' not in line:
+                continue
+            symbol, payload = line[len("var hq_str_"):].split('="', 1)
+            code = symbols.get(symbol)
+            fields = payload.rsplit('";', 1)[0].split(",")
+            if code is None or len(fields) < 32:
+                continue
+            try:
+                price, prev_close = float(fields[3]), float(fields[2])
+                high, low = float(fields[4]), float(fields[5])
+                amount = float(fields[9])
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            pct_chg = round((price / prev_close - 1) * 100, 2) if prev_close > 0 else None
+            quotes[code] = {
+                "price": round(price, 3),
+                "pct_chg": pct_chg,
+                "high": round(high, 3) if high > 0 else None,
+                "low": round(low, 3) if low > 0 else None,
+                "amount": round(amount, 0) if amount > 0 else None,
+                "turnover": None,  # 新浪批量报价不含换手率
+            }
+            if fields[30] and fields[31]:
+                stamps.add(f"{fields[30]}T{fields[31]}+08:00")
+    if not quotes:
+        raise RuntimeError("sina batch quotes returned no valid rows")
+    # 取最新一条行情时间,避免停牌股残留的旧时间把整批行情标成过期
+    return quotes, max(stamps) if stamps else None
+
+
+# 选股池实时行情:全市场快照较重,进程内复用;过期后先返回旧快照并在后台刷新
+_SPOT_QUOTE_LOCK = threading.Lock()
+_SPOT_QUOTE_CACHE: tuple[float, str, pd.DataFrame, str] | None = None  # (monotonic, 快照时间, df, source)
+_SPOT_QUOTE_REFRESHING = False
+_SPOT_QUOTE_TTL = 15.0        # 15 秒内视为「实时」缓存
+_SPOT_QUOTE_STALE_MAX = 900.0  # 超过 15 分钟不再当行情用,降级为已落库日线
+
+
+def _refresh_spot_quotes() -> None:
+    """后台刷新全市场快照;失败保留旧缓存,由下次调用继续尝试。"""
+    global _SPOT_QUOTE_CACHE, _SPOT_QUOTE_REFRESHING
+    try:
+        df, source = get_spot_snapshot_with_source()
+    except Exception as exc:  # noqa: BLE001 刷新失败不能影响已有快照
+        log.warning("spot quote refresh failed: %s", exc)
+        with _SPOT_QUOTE_LOCK:
+            _SPOT_QUOTE_REFRESHING = False
+        return
+    with _SPOT_QUOTE_LOCK:
+        _SPOT_QUOTE_CACHE = (time.monotonic(), now_tz().isoformat(), df, source)
+        _SPOT_QUOTE_REFRESHING = False
+
+
+def _first_spot_snapshot():
+    """无缓存时同步拉一次快照;已有并发刷新则立即失败,不叠加外部请求。"""
+    global _SPOT_QUOTE_CACHE, _SPOT_QUOTE_REFRESHING
+    with _SPOT_QUOTE_LOCK:
+        entry = _SPOT_QUOTE_CACHE
+        if entry is not None:
+            return entry
+        if _SPOT_QUOTE_REFRESHING:
+            raise RuntimeError("spot snapshot refresh in progress")
+        _SPOT_QUOTE_REFRESHING = True
+    try:
+        df, source = get_spot_snapshot_with_source()
+    except Exception:
+        with _SPOT_QUOTE_LOCK:
+            _SPOT_QUOTE_REFRESHING = False
+        raise
+    entry = (time.monotonic(), now_tz().isoformat(), df, source)
+    with _SPOT_QUOTE_LOCK:
+        _SPOT_QUOTE_CACHE = entry
+        _SPOT_QUOTE_REFRESHING = False
+    return entry
+
+
+def get_spot_quotes(codes) -> tuple[dict[str, dict], str, str | None, float | None]:
+    """按代码返回实时行情子集与快照元信息。
+
+    返回 ({code: quote}, source, snapshot_at, age_seconds)。
+    quote 字段:price/pct_chg/high/low/amount/turnover。
+    优先新浪批量报价(单次请求,通常亚秒级);失败再降级为全市场快照缓存:
+    已有缓存时立即返回(即使超过 15 秒 TTL),同时后台刷新,避免每次轮询
+    都卡在一次 8 秒以上的全市场拉取上;只有完全无缓存时才同步拉取。
+    全部源失败且无缓存时抛错,由调用方降级为已落库日线;价格/涨跌幅缺失
+    (停牌等)的代码不出现在结果里,由调用方标记缺口。
+    """
+    global _SPOT_QUOTE_REFRESHING
+    wanted = {str(code).zfill(6) for code in (codes or []) if str(code).strip()}
+    if not wanted:
+        return {}, "none", None, None
+
+    try:
+        quotes, snapshot_at = _fetch_sina_batch_quotes(wanted)
+        return quotes, "sina", snapshot_at, _quote_age(snapshot_at)
+    except Exception as exc:  # noqa: BLE001 批量源失败才降级全市场快照
+        log.warning("sina batch quotes failed, fallback to full snapshot: %s", exc)
+
+    with _SPOT_QUOTE_LOCK:
+        entry = _SPOT_QUOTE_CACHE
+        expired = entry is not None and time.monotonic() - entry[0] > _SPOT_QUOTE_TTL
+        kick = expired and not _SPOT_QUOTE_REFRESHING
+        if kick:
+            _SPOT_QUOTE_REFRESHING = True
+    if kick:
+        threading.Thread(target=_refresh_spot_quotes,
+                         name="spot-quote-refresh", daemon=True).start()
+    if entry is None:
+        entry = _first_spot_snapshot()
+    age = time.monotonic() - entry[0]
+    if age > _SPOT_QUOTE_STALE_MAX:
+        raise RuntimeError(f"spot snapshot stale for {age:.0f}s")
+    df = entry[2]
+
+    def _rounded(value, digits):
+        return None if value is None or pd.isna(value) else round(float(value), digits)
+
+    quotes: dict[str, dict] = {}
+    for row in df.loc[df["code"].isin(wanted)].to_dict("records"):
+        price = row.get("price")
+        if price is None or pd.isna(price) or float(price) <= 0:
+            continue
+        quotes[str(row["code"]).zfill(6)] = {
+            "price": round(float(price), 3),
+            "pct_chg": _rounded(row.get("pct_chg"), 2),
+            "high": _rounded(row.get("high"), 3),
+            "low": _rounded(row.get("low"), 3),
+            "amount": _rounded(row.get("amount"), 0),
+            "turnover": _rounded(row.get("turnover"), 2),
+        }
+    return quotes, entry[3], entry[1], round(age, 1)
 
 
 def _concept_board_keyword(board_name: str, track=None, db=None) -> pd.DataFrame:
@@ -1485,7 +1753,7 @@ def get_commodity_history(sina_symbol: str, days: int = 260) -> pd.DataFrame:
 
 # ---------------- 同花顺行业指数(参照系,备选) ----------------
 
-@resilient("ths_industry_index")
+@resilient("ths_industry_index", v8=True)
 def get_ths_industry_daily(ths_code: str, start: str, end: str | None = None) -> pd.DataFrame:
     """同花顺行业指数日线(如 881121 半导体)。列:trade_date,close,amount。"""
     import akshare as ak

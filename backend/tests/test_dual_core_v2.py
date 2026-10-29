@@ -87,6 +87,7 @@ def test_cumulative_ladder_and_unbacktested_lock():
 def test_divergence_requires_two_positive_red_shrinks():
     p=fixture(); p['cores']['883994']['macd_hist']=[5,4,3]
     r=evaluate(p)
+    assert r['divergence'] is True
     assert r['position']['forbid_high_boards'] is True
     assert r['position']['single_cap']<=30
 

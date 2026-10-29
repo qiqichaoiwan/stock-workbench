@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from ..shared.data_gateway import ak_serialized
+
 TZ = ZoneInfo("Asia/Shanghai")
 INDEXES = (("sh000001", "上证指数"), ("sz399001", "深证成指"),
            ("sz399006", "创业板指"), ("sh000688", "科创50"))
@@ -16,6 +18,10 @@ INDEXES = (("sh000001", "上证指数"), ("sz399001", "深证成指"),
 # py_mini_racer(V8)初始化不是线程安全的,驾驶舱多个 Feed 并发调用 akshare
 # 会触发原生崩溃,因此这里的 akshare 调用统一串行。
 _AK_LOCK = threading.Lock()
+# 会构造 MiniRacer 的调用必须与 data_gateway 共用同一把锁,否则跨模块并发
+# (定时任务 + 驾驶舱)仍会让进程崩溃;非 V8 的 HTTP 源继续用 _AK_LOCK,避免
+# 长达数秒的网络等待阻塞全局 V8 锁。
+_V8_LOCK = ak_serialized()
 
 
 def _now():
@@ -76,7 +82,7 @@ def _direct(fn, *args, **kwargs):
 
 
 def _load_calendar():
-    with _AK_LOCK:
+    with _V8_LOCK:
         from ..shared import data_gateway as dg
         return set(_direct(dg.get_trade_calendar, start="19900101", end="21001231"))
 
@@ -139,10 +145,12 @@ def _points(frame):
 
 
 def _load_minutes(code, provider):
-    with _AK_LOCK:
-        import akshare as ak
-        if provider == "em":
+    import akshare as ak
+    if provider == "em":
+        with _AK_LOCK:
             return _points(ak.index_zh_a_hist_min_em(symbol=code[2:], period="1"))
+    # stock_zh_a_minute 内部调用 stock_zh_a_daily,会构造 MiniRacer。
+    with _V8_LOCK:
         return _points(ak.stock_zh_a_minute(symbol=code, period="1", adjust=""))
 
 

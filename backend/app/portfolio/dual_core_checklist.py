@@ -1,6 +1,5 @@
 """Manual execution-card persistence, not an order execution service."""
 import json
-import math
 import re
 from datetime import datetime, timezone
 from typing import Literal
@@ -9,6 +8,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
+from ..shared.json_guard import bounded_json, number  # noqa: F401 (re-exported for callers)
 from .dual_core_checklist_models import ExecutionCard, CardAudit, VerifiedDayEvent
 from zoneinfo import ZoneInfo
 
@@ -116,41 +116,6 @@ class CardInput(BaseModel):
         return self
 
 
-def number(value, lower, upper, integer=False):
-    if type(value) not in (int, float) or not math.isfinite(value) or not lower <= value <= upper:
-        raise ValueError('numeric field outside range')
-    if integer and type(value) is not int:
-        raise ValueError('integer required')
-
-
-def bounded_json(value, depth=0):
-    if depth > 6:
-        raise ValueError('maximum JSON depth is six')
-    if isinstance(value, dict):
-        if len(value) > 100:
-            raise ValueError('too many object fields')
-        for key, item in value.items():
-            if not isinstance(key, str) or len(key) > 80:
-                raise ValueError('invalid field name')
-            normalized = key.lower().replace('-', '_')
-            if (normalized != 'frozen_sessions' and any(s in normalized for s in ('password', 'secret', 'token', 'session', 'api_key', 'apikey', 'authorization', 'cookie'))) or normalized == 'key':
-                raise ValueError('credential fields forbidden')
-            bounded_json(item, depth + 1)
-    elif isinstance(value, list):
-        if len(value) > 300:
-            raise ValueError('too many array items')
-        for item in value:
-            bounded_json(item, depth + 1)
-    elif isinstance(value, str):
-        if len(value) > 4096:
-            raise ValueError('text exceeds 4096 characters')
-    elif type(value) in (int, float):
-        if not math.isfinite(value):
-            raise ValueError('non-finite number')
-    elif value is not None and type(value) is not bool:
-        raise ValueError('invalid JSON value')
-
-
 def day_guard(db, user_id, trade_date):
     events = db.scalars(select(VerifiedDayEvent).where(VerifiedDayEvent.user_id == user_id,
         VerifiedDayEvent.trade_date == str(trade_date)).order_by(VerifiedDayEvent.id)).all()
@@ -200,16 +165,40 @@ def manual_calculation(payload, recorded_at):
     return evaluate_v2(candidate, now=datetime.fromisoformat(recorded_at))
 
 
-def serialize(db, card):
+def _stored_calculation(db, card, revision):
+    """Return the calculation snapshot persisted with that audit revision.
+
+    Reads never re-run the rule engine: every save writes the computed result
+    into its audit row, so GET/list replay it instead of paying the candidate
+    recursion again. Legacy rows without a snapshot fall back to recomputation.
+    """
+    snapshot = db.scalar(select(CardAudit.snapshot).where(
+        CardAudit.user_id == card.user_id, CardAudit.trade_date == card.trade_date,
+        CardAudit.phase == card.phase, CardAudit.revision == revision))
+    if not snapshot:
+        return None
+    try:
+        value = json.loads(snapshot).get('calculation')
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def serialize(db, card, calculation=None):
     guard = day_guard(db, card.user_id, card.trade_date)
     times = {'data_check': ('09:30', 'data_integrity'), 'preview': ('14:30', 'warning_only'),
              'final': ('14:45', 'manual_record_only'), 'weekly_review': ('Friday 15:00+', 'next_trade_review')}
     time, purpose = times[card.phase]
+    payload = json.loads(card.payload)
+    if calculation is None:
+        calculation = _stored_calculation(db, card, card.revision)
+    if calculation is None:
+        calculation = manual_calculation(payload, card.updated_at)
     return dict(trade_date=card.trade_date, phase=card.phase, revision=card.revision,
-        **json.loads(card.payload), provenance='manual', decision_status='blocked' if guard['frozen'] else 'unverified',
+        **payload, provenance='manual', decision_status='blocked' if guard['frozen'] else 'unverified',
         calendar_status='unverified', effective_trade_date=None,
         schedule={'timezone': 'Asia/Shanghai', 'time': time, 'purpose': purpose},
-        automatic_evidence=[], calculation=manual_calculation(json.loads(card.payload), card.updated_at),
+        automatic_evidence=[], calculation=calculation,
         day_guard=guard, created_at=card.created_at, updated_at=card.updated_at)
 
 
@@ -218,8 +207,12 @@ def save_card(db, user_id, trade_date, phase, body):
     if body.revision != (card.revision if card else 0):
         raise HTTPException(409, 'revision conflict')
     now = datetime.now(timezone.utc).isoformat()
-    payload = json.dumps(body.model_dump(exclude={'revision'}), ensure_ascii=False)
+    payload_dict = body.model_dump(exclude={'revision'})
+    payload = json.dumps(payload_dict, ensure_ascii=False)
     action = 'update' if card else 'create'
+    # Compute before writing so a failed calculation cannot leave a partial row;
+    # the same snapshot is reused for the audit row and the response.
+    calculation = manual_calculation(payload_dict, now)
     try:
         if card is None:
             card = ExecutionCard(user_id=user_id, trade_date=str(trade_date), phase=phase,
@@ -234,18 +227,18 @@ def save_card(db, user_id, trade_date, phase, body):
                 db.rollback()
                 raise HTTPException(409, 'revision conflict')
             db.refresh(card)
-        add_audit(db, card, action)
+        add_audit(db, card, action, calculation)
         db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, 'revision conflict') from None
-    return serialize(db, card)
+    return serialize(db, card, calculation)
 
 
-def add_audit(db, card, action):
+def add_audit(db, card, action, calculation=None):
     db.add(CardAudit(user_id=card.user_id, trade_date=card.trade_date, phase=card.phase,
         revision=card.revision, action=action, recorded_at=card.updated_at,
-        snapshot=json.dumps(serialize(db, card), ensure_ascii=False)))
+        snapshot=json.dumps(serialize(db, card, calculation), ensure_ascii=False)))
 
 
 def audit(db, card):
@@ -257,6 +250,7 @@ def audit(db, card):
 
 
 def delete_card(db, card, revision):
+    calculation = _stored_calculation(db, card, revision)
     result = db.execute(update(ExecutionCard).where(ExecutionCard.id == card.id,
         ExecutionCard.revision == revision, ExecutionCard.deleted.is_(False)).values(
         revision=revision + 1, deleted=True, updated_at=datetime.now(timezone.utc).isoformat()))
@@ -264,6 +258,6 @@ def delete_card(db, card, revision):
         db.rollback()
         raise HTTPException(409, 'revision conflict')
     db.refresh(card)
-    add_audit(db, card, 'delete')
+    add_audit(db, card, 'delete', calculation)
     db.commit()
     return {'deleted': True, 'revision': card.revision}

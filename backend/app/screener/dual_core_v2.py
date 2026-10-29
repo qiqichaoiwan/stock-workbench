@@ -79,11 +79,18 @@ def evaluate(payload: dict, *, now: datetime, calendar: dict | None = None) -> d
         return result
     if missing: return missing_result()
     a, b, e = groups['cores.883957'], groups['cores.883994'], groups['emotion']
+    import math
+
     required = ['price','prev_high','prev_low','ma5','ma10','ma20','ma5_prev','wma5','wma10','wma20','w_pct','below_ma5_days','wma20_up4']
     absent = [f'cores.{code}.{k}' for code,c in [('883957',a),('883994',b)] for k in required if c.get(k) is None]
-    absent += ['cores.883994.'+k for k in ['high60','macd_hist','macd_dead_cross'] if b.get(k) is None]
+    absent += ['cores.883994.'+k for k in ('high60','macd_dead_cross') if b.get(k) is None]
+    hist_b = b.get('macd_hist')
+    # Three MACD histogram values are required for the divergence rule; null/NaN
+    # items are unknown, never a smaller-but-valid shift.
+    if (not isinstance(hist_b, list) or len(hist_b) < 3
+            or any(type(x) not in (int, float) or not math.isfinite(x) for x in hist_b[-3:])):
+        absent.append('cores.883994.macd_hist')
     absent += ['emotion.'+k for k in ['limit_up','broken','limit_down','height','amount','amount_ma5'] if e.get(k) is None]
-    import math
     for code,c in [('883957',a),('883994',b)]:
         for key in required + (['high60'] if code=='883994' else []):
             value=c.get(key)
@@ -126,6 +133,7 @@ def evaluate(payload: dict, *, now: datetime, calendar: dict | None = None) -> d
         tier=0
     hist=b['macd_hist']
     divergence=bool(gb and (len(hist)>=3 and hist[-3]>hist[-2]>hist[-1]>0 or b['macd_dead_cross']))
+    result['divergence']=divergence  # Step 5 conclusion; absent when evidence is missing
     cap = [10,50,100][tier]
     if broken[10]: cap /= 2
     if divergence: cap=min(cap,50)
@@ -140,6 +148,15 @@ def evaluate(payload: dict, *, now: datetime, calendar: dict | None = None) -> d
         veto=not bool(cap),daily_ok=bool(ga and gb),weekly_ok=bull,reasons=[c['reason'] for c in checks if c['pass'] is False])
     account=payload.get('account', {})
     holdings=payload.get('holdings', [])
+    # Risk evidence is collected before the numbered tree: an unknown account or
+    # holding field must block entries, never default to a benign zero/false.
+    risk_missing=['account.'+k for k in ('daily_pnl','weekly_pnl','consecutive_losses','stopped_today','data_failure_today','total_weight','frozen_sessions','review_complete','two_month_low_winrate') if account.get(k) is None]
+    risk_missing += [f'holdings.{idx}.{k}' for idx,h in enumerate(holdings)
+                     for k in ('black_swan','pnl','high_volume_bear','high_upper_shadow','price','ma5','boards','bought_today','limit_down_locked','weight') if h.get(k) is None]
+    if risk_missing:
+        missing.extend(risk_missing);result['data_quality']['complete']=False
+        check('risk_evidence',0,risk_missing,'all known',None,'unknown account / holding risks')
+        return missing_result()
     def finish(step, action, reason, targets=(), fraction=1):
         orders=[]
         for h in targets:
@@ -164,16 +181,13 @@ def evaluate(payload: dict, *, now: datetime, calendar: dict | None = None) -> d
     if bad: return finish(5,'take_profit','numbered Step 5 precedes MA5 reduction; batch size requires manual execution',bad,.5)
     bad=[h for h in holdings if h.get('price',float('inf'))<h.get('ma5',0)*.997]
     if bad: return finish(6,'reduce_half','holding MA5 exception never applies',bad,.5)
-    pullback = b.get('pct_chg_high',0)>=3 and b['price']<=b.get('high',0)*.98
+    pct_b, high_b = b.get('pct_chg_high'), b.get('high')
+    pullback = pct_b is not None and high_b is not None and pct_b >= 3 and b['price'] <= high_b * .98
+    if pct_b is None or high_b is None:
+        check('pullback_inputs',7,{'pct_chg_high':pct_b,'high':high_b},
+              'known core B pullback inputs',None,'unknown; no reduction inferred')
     bad=[h for h in holdings if h.get('boards',0)>=3 and pullback]
     if bad: return finish(7,'reduce_half','core B pullback; do not compound half reductions',bad,.5)
-    risk_missing=['account.'+k for k in ('daily_pnl','weekly_pnl','consecutive_losses','stopped_today','data_failure_today','total_weight','frozen_sessions','review_complete','two_month_low_winrate') if account.get(k) is None]
-    risk_missing += [f'holdings.{idx}.{k}' for idx,h in enumerate(holdings)
-                     for k in ('black_swan','pnl','high_volume_bear','high_upper_shadow','price','ma5','boards','bought_today','limit_down_locked','weight') if h.get(k) is None]
-    if risk_missing:
-        missing.extend(risk_missing);result['data_quality']['complete']=False
-        check('risk_evidence',0,risk_missing,'all known',None,'unknown account / holding risks')
-        return missing_result()
     # Existing portfolio compliance never depends on the next candidate passing.
     if account.get('consecutive_losses',0)>=2:
         pos['tier_cap']/=2;pos['new_entry_cap']=max(0,pos['tier_cap']-20)
@@ -202,6 +216,11 @@ def evaluate(payload: dict, *, now: datetime, calendar: dict | None = None) -> d
         missing.extend(candidate_invalid)
         return missing_result()
     i,s=groups['industry'],groups['stock']
+    def known(group,key,default):
+        # Optional stock patterns may be omitted or explicitly null; null means
+        # "pattern not available", so fall back to a value that never triggers it.
+        value=group.get(key)
+        return default if value is None else value
     def rule(key,group,fields,test,threshold):
         absent=[f for f in fields if group.get(f) is None]
         if absent: missing.extend(key+'.'+f for f in absent)
@@ -220,8 +239,8 @@ def evaluate(payload: dict, *, now: datetime, calendar: dict | None = None) -> d
     filters.append(rule('stock_daily',s,['price','open','ma5','ma10','ma20','volume_ratio','high_upper_shadow','stagnation'],
         lambda: not s['high_upper_shadow'] and not s['stagnation'] and (
             ((s['price']/s['open']-1)*100>=3 and s['open']<min(s['ma5'],s['ma10'],s['ma20']) and s['price']>max(s['ma5'],s['ma10'],s['ma20']) and s['volume_ratio']>=1.5)
-            or (s.get('box_range20',100)<=15 and s['price']>s.get('prior_high20',float('inf')) and s['volume_ratio']>=1.5)
-            or (s.get('n_bear_age',100)<=3 and s['price']>s.get('n_bear_high',float('inf')) and s['volume_ratio']>=1.2)),
+            or (known(s,'box_range20',100)<=15 and s['price']>known(s,'prior_high20',float('inf')) and s['volume_ratio']>=1.5)
+            or (known(s,'n_bear_age',100)<=3 and s['price']>known(s,'n_bear_high',float('inf')) and s['volume_ratio']>=1.2)),
         'one-yang / prior20 box / N reversal; reject upper shadow or stagnation'))
     filters.append(rule('stock_ma5',s,['price','low','ma5','prev_price','prev_ma5','volume_ratio','ma5_bad'],
         lambda:s['ma5_bad'] or (s['low']>=s['ma5'] and s['price']>=s['ma5']) or (s['price']>s['ma5'] and s['prev_price']<s['prev_ma5'] and s['volume_ratio']>=1.5),'MA5 pullback or volume breakout; bad MA5 trial only'))
@@ -235,7 +254,7 @@ def evaluate(payload: dict, *, now: datetime, calendar: dict | None = None) -> d
         result['conflicts'].append('Trial <=10 minus 20 percentage points leaves zero: block new entry.')
     result['verdict'].update(cap=pos['tier_cap'], position_text=f"0%-{pos['tier_cap']}%")
     if pos['only_core'] and not s.get('is_core'): return finish(10,'block','MA20 broken: core only')
-    if pos['forbid_high_boards'] and (s.get('boards',0)>=3 or (divergence and not s.get('is_core') and s.get('boards')!=1)):
+    if pos['forbid_high_boards'] and (known(s,'boards',0)>=3 or (divergence and not known(s,'is_core',False) and s.get('boards')!=1)):
         return finish(10,'block','divergence/weekly weak forbids high boards')
     if account.get('total_weight',0)>pos['tier_cap']:
         result['decision']['target_total_weight']=pos['tier_cap']
@@ -261,6 +280,8 @@ def evaluate(payload: dict, *, now: datetime, calendar: dict | None = None) -> d
 
 def validate_payload_shape(payload):
     """Reject structural JSON errors with a constant message, never echo evidence."""
+    from ..shared.json_guard import bounded_json
+    bounded_json(payload)
     def obj(value):
         if not isinstance(value,dict): raise ValueError('invalid evaluation structure')
         return value

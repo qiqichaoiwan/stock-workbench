@@ -4,25 +4,28 @@
 """
 import json
 import logging
-from datetime import date
+import threading
+from datetime import date, datetime
 
-from fastapi import APIRouter, Body, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..portfolio.models import User
+from ..shared.json_guard import bounded_json
 from ..screener import dual_core, industry_monitor, market_regime, news_monitor, \
     strategy_engine, technical_signal, universe_manager
 from ..shared import data_gateway as dg
 from ..shared.security import current_user_id, require_analyst
 from ..task_runner import TASKS, run_task
 from .lhb_match import filter_hot_money, match_seats, normalize_matched
-from .models import (CommodityPrice, DualCoreDaily, FundFlowSnapshot, IndustryDaily,
-                   LhbDaily, MarketState, MarketStat, NewsItem, PoolPerformance,
-                   StockPool, StrategyCard, StrategyParams, TaskLog, Track,
-                   TradeChecklist)
+from .dual_core_v2 import CN
+from .models import (CommodityPrice, DailyQuote, DualCoreDaily, FundFlowSnapshot,
+                   IndustryDaily, LhbDaily, MarketState, MarketStat, NewsItem,
+                   PoolPerformance, StockPool, StrategyCard, StrategyParams,
+                   TaskLog, Track, TradeChecklist)
 from .universe_manager import EXCLUDED_CODE_LIKE
 
 log = logging.getLogger("screener.api")
@@ -30,6 +33,36 @@ log = logging.getLogger("screener.api")
 router = APIRouter(prefix="/api/screener", tags=["screener"])
 
 MAX_LIMIT = 500
+
+# JSON request bodies for evaluation/checklist writes are small (128 KiB is far
+# above the UI draft). Reading the stream keeps chunked requests bounded too,
+# because Content-Length alone can be absent or lie.
+BODY_LIMIT = 131072
+
+
+async def _bounded_body(request: Request, limit: int):
+    message = f"请求体超过 {limit // 1024} KiB 上限"
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        raise HTTPException(413, message)
+    # FastAPI reads the body before solving dependencies, so the cached bytes
+    # are what we can bound here; the ASGI middleware stops the read early.
+    cached = getattr(request, "_body", None)
+    if cached is not None:
+        if len(cached) > limit:
+            raise HTTPException(413, message)
+        return
+    chunks, size = [], 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(413, message)
+        chunks.append(chunk)
+    request._body = b"".join(chunks)
+
+
+async def bounded_evaluation_body(request: Request):
+    await _bounded_body(request, BODY_LIMIT)
 
 
 def _stock_names(db: Session, codes: set[str] | list[str] | None = None) -> dict[str, str]:
@@ -110,6 +143,119 @@ def market_states(limit: int = 60, user_id: int = Depends(current_user_id),
 
 
 # ---------- 选股池 ----------
+
+# 行情快照失败/超时时必须尽快返回已落库日线,不能把页面拖到网关超时。
+POOL_QUOTE_WAIT_SECONDS = 8.0
+# 快照年龄超过该值(秒)不再标「实时」,只提示数据延迟
+POOL_QUOTE_REALTIME_MAX_AGE = 90.0
+
+
+def _quote_session(now: datetime) -> str:
+    """A股连续竞价时段(北京时间):09:30–11:30、13:00–15:00;其余为收盘。"""
+    if now.weekday() >= 5:
+        return "closed"
+    minute = now.hour * 60 + now.minute
+    if 570 <= minute <= 690 or 780 <= minute <= 900:
+        return "trading"
+    return "closed"
+
+
+def _quote_number(value, digits: int = 2):
+    """NaN/None/非数字统一返回 None,避免把 NaN 写进 JSON。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:
+        return None
+    return round(number, digits)
+
+
+def _pool_codes(db: Session, pool_type: str, track_id: int | None) -> list[str]:
+    q = select(StockPool.code).where(StockPool.status == "in",
+                                     StockPool.pool_type == pool_type,
+                                     StockPool.code.not_like(EXCLUDED_CODE_LIKE))
+    if pool_type == "track" and track_id is not None:
+        q = q.where(StockPool.track_id == track_id)
+    return [str(code).zfill(6) for code in db.execute(q).scalars().all()]
+
+
+@router.get("/pool/quotes")
+def pool_quotes(pool_type: str = "main", track_id: int | None = None,
+                user_id: int = Depends(current_user_id), db: Session = Depends(get_db)):
+    """选股池现价与当日涨跌幅:新浪批量行情优先,失败降级全市场快照/已落库日线。
+
+    批量行情单次请求亚秒级;全市场快照由网关进程内缓存(过期先返回旧快照并
+    后台刷新),因此首次无缓存时最多等待 8 秒,之后轮询不会卡在全市场拉取上。
+    超时/源失败直接返回已落库最近收盘数据,前端据此显示「收盘价」且不谎称实时。
+    """
+    now = datetime.now(CN)
+    codes = _pool_codes(db, pool_type, track_id)
+    spot: dict[str, dict] = {}
+    source, error = "unavailable", None
+    snapshot_at: str | None = None
+    snapshot_age: float | None = None
+    if codes:
+        box: dict = {}
+
+        def fetch():
+            try:
+                quotes, origin, taken_at, age = dg.get_spot_quotes(codes)
+                box.update(quotes=quotes, source=origin,
+                           snapshot_at=taken_at, age=age)
+            except Exception as exc:  # noqa: BLE001 行情失败必须降级为缺失
+                box["error"] = str(exc)[:160]
+                log.warning("pool quotes failed: %s", exc)
+
+        worker = threading.Thread(target=fetch, name="pool-quotes", daemon=True)
+        worker.start()
+        worker.join(POOL_QUOTE_WAIT_SECONDS)
+        if worker.is_alive():
+            error = "quote_timeout"
+        elif box.get("error"):
+            error = "quote_failed"
+        else:
+            spot = box.get("quotes") or {}
+            source = box.get("source") or "unavailable"
+            snapshot_at = box.get("snapshot_at")
+            snapshot_age = box.get("age")
+    items: dict[str, dict] = {}
+    for code, quote in spot.items():
+        if code in codes:
+            items[code] = {**quote, "quote_source": source, "quote_kind": "spot"}
+    pending = [code for code in codes if code not in items]
+    if pending:
+        rows = db.execute(select(DailyQuote.code, DailyQuote.trade_date,
+                                 DailyQuote.close, DailyQuote.pct_chg)
+                          .where(DailyQuote.code.in_(pending))
+                          .order_by(DailyQuote.code, DailyQuote.trade_date.desc())).all()
+        seen: set[str] = set()
+        for code, trade_date, close, pct in rows:
+            code = str(code).zfill(6)
+            if code in seen or code not in pending:
+                continue
+            seen.add(code)
+            price = _quote_number(close, 3)
+            if price is None or price <= 0:
+                continue
+            items[code] = {"price": price,
+                           "pct_chg": _quote_number(pct),
+                           "trade_date": trade_date.isoformat(),
+                           "quote_source": "stored_daily", "quote_kind": "stored"}
+    missing = [code for code in codes if code not in items]
+    counts = {"total": len(codes),
+              "spot": sum(1 for item in items.values() if item["quote_kind"] == "spot"),
+              "stored": sum(1 for item in items.values() if item["quote_kind"] == "stored"),
+              "missing": len(missing)}
+    session = _quote_session(now)
+    # 只有交易时段、且快照足够新才敢标「实时」;过期缓存仅标注延迟,不冒充实时
+    fresh = snapshot_age is not None and snapshot_age <= POOL_QUOTE_REALTIME_MAX_AGE
+    return {"as_of": now.isoformat(), "session": session,
+            "snapshot_at": snapshot_at, "snapshot_age_seconds": snapshot_age,
+            "realtime": counts["spot"] > 0 and session == "trading" and fresh,
+            "source": source, "items": items, "missing": missing,
+            "counts": counts, "errors": [error] if error else []}
+
 
 @router.get("/pool")
 def pool(pool_type: str = "main", track_id: int | None = None,
@@ -211,7 +357,8 @@ def industries_summary(user_id: int = Depends(current_user_id),
 
 
 @router.post("/dual-core/evaluate-v2")
-def dual_core_evaluate_v2(body: object = Body(...), user_id: int = Depends(current_user_id),
+def dual_core_evaluate_v2(_: None = Depends(bounded_evaluation_body),
+                          body: object = Body(...), user_id: int = Depends(current_user_id),
                           db: Session = Depends(get_db)):
     """Read-only manual evidence evaluation; never grants trusted live execution."""
     from .dual_core_v2 import evaluate_v2, validate_payload_shape
@@ -219,9 +366,9 @@ def dual_core_evaluate_v2(body: object = Body(...), user_id: int = Depends(curre
         validate_payload_shape(body)
     except ValueError:
         raise HTTPException(422, 'invalid evaluation structure') from None
-    from .dual_core_context import evaluation_context, apply_day_guard
-    context = evaluation_context()
-    return apply_day_guard(evaluate_v2(body, now=context['now']), db, user_id, context['now'])
+    from .dual_core_context import evaluation_clock, apply_day_guard
+    now = evaluation_clock()
+    return apply_day_guard(evaluate_v2(body, now=now), db, user_id, now)
 
 
 @router.get("/dual-core")
@@ -258,6 +405,16 @@ class ChecklistIn(BaseModel):
     items: dict = Field(default_factory=dict)     # 人工勾选 {key: bool}
     review: dict = Field(default_factory=dict)    # 复盘 {q1,q2,q3,note,path,cap}
 
+    @model_validator(mode='after')
+    def validate_bounded(self):
+        bounded_json(self.items)
+        bounded_json(self.review)
+        size = len(json.dumps(self.items, ensure_ascii=False)) + len(
+            json.dumps(self.review, ensure_ascii=False))
+        if size > 65536:
+            raise ValueError('checklist payload exceeds 64 KiB')
+        return self
+
 
 @router.get("/dual-core/checklist")
 def get_checklist(trade_date: str | None = None,
@@ -281,7 +438,8 @@ def get_checklist(trade_date: str | None = None,
 
 
 @router.put("/dual-core/checklist")
-def save_checklist(body: ChecklistIn,
+def save_checklist(_: None = Depends(bounded_evaluation_body),
+                   body: ChecklistIn = Body(...),
                    user_id: int = Depends(current_user_id),
                    db: Session = Depends(get_db)):
     """整份覆盖保存(items/review 以本次提交为准,前端每次全量提交)。

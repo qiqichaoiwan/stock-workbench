@@ -84,7 +84,9 @@ def _all_a_valuation_pct() -> float:
         import akshare as ak
 
         dg._rate_limit()
-        df = ak.stock_index_pe_lg(symbol="沪深300")
+        # stock_index_pe_lg constructs py_mini_racer; serialize with the gateway.
+        df = dg.call_v8(ak.stock_index_pe_lg, symbol="沪深300",
+                        timeout=dg.settings.fetch_timeout_seconds)
         df = df.rename(columns={"日期": "d", "市盈率TTM": "pe"})
         df["d"] = pd.to_datetime(df["d"])
         cut = pd.Timestamp.today() - pd.DateOffset(years=5)
