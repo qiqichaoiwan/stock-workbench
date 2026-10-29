@@ -28,6 +28,8 @@ const routes = [
       { path: 'help', component: () => import('./views/Help.vue'), meta: { group: 'help', title: '使用帮助' } },
     ],
   },
+  // 未知/过期地址兜底：hash 路由下手输或旧的页内锚点会落到不存在路径，避免白屏
+  { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
 ]
 
 const router = createRouter({ history: createWebHashHistory(), routes })

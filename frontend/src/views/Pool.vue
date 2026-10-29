@@ -20,6 +20,7 @@
             成员 {{ fmtInt(currentTrack.member_count) }} 只 · 来源{{ trackSourceLabel(currentTrack.member_source) }}
           </span>
           <span class="grow" />
+          <span class="muted" style="font-size:12px" :title="quoteStatusText(quoteMeta, quoteLoading)">{{ quoteStatusText(quoteMeta, quoteLoading) }}</span>
           <el-input v-model="search" placeholder="搜索代码 / 名称" clearable style="width:200px" />
         </div>
       </template>
@@ -38,6 +39,19 @@
         <el-table-column prop="code" label="代码" width="90" />
         <el-table-column label="名称" min-width="110">
           <template #default="{ row }">{{ cleanName(row.name) }}</template>
+        </el-table-column>
+        <el-table-column label="现价" width="90" align="right">
+          <template #default="{ row }">
+            <span v-if="quoteOf(row)" class="num" :title="quoteTitle(row)">{{ fmtNum(quoteOf(row).price) }}</span>
+            <span v-else class="muted">-</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="今日涨跌幅" width="110" align="right">
+          <template #default="{ row }">
+            <span v-if="quoteOf(row) && quoteOf(row).pct_chg !== null && quoteOf(row).pct_chg !== undefined"
+                  :class="upDownClass(quoteOf(row).pct_chg)" :title="quoteTitle(row)">{{ fmtPct(quoteOf(row).pct_chg) }}</span>
+            <span v-else class="muted">-</span>
+          </template>
         </el-table-column>
         <el-table-column label="评级" width="90">
           <template #default="{ row }">
@@ -82,7 +96,7 @@
                        :page-sizes="[20, 50, 100]" v-model:page-size="pageSize"
                        v-model:current-page="page" />
       </div>
-      <p v-if="!allTrackEmpty" class="muted" style="font-size:12px;margin:6px 0 0">前端分页 · 共 {{ filteredRows.length }} 只(服务端全量取回,已按评分全局排序)（行情来源见任务日志「{{ taskName('sync_quotes') }}」首字段）</p>
+      <p v-if="!allTrackEmpty" class="muted" style="font-size:12px;margin:6px 0 0">前端分页 · 共 {{ filteredRows.length }} 只(服务端全量取回,已按评分全局排序);现价/涨跌幅优先取服务端实时行情(新浪批量报价),失败时降级为全市场快照缓存或已落库日线并标注来源;交易时段每 20 秒自动刷新,非交易时段为最近收盘快照。</p>
     </el-card>
 
     <el-card class="page-card">
@@ -111,8 +125,8 @@ import { computed, onMounted, onBeforeUnmount, ref, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
-import { cleanName, fmtNum, fmtInt, ratingLabel, ratingType } from '../utils/fmt'
-import { taskName } from '../utils/tasks'
+import { cleanName, fmtNum, fmtInt, fmtPct, ratingLabel, ratingType, upDownClass } from '../utils/fmt'
+import { isTradingSession, quoteStatusText, quoteStamp } from '../utils/poolQuotes'
 import { useUserStore } from '../store'
 
 const store = useUserStore()
@@ -132,6 +146,64 @@ const pageSize = ref(20)
 // riskGuard 三态:false=未触发 / true=生效 / null=加载失败(显式区分失败态)
 const riskGuard = ref(false)
 let loadSeq = 0
+
+// 行情:现价 / 今日涨跌幅(实时快照优先,失败降级已落库日线,口径在页头标注)
+const quotes = ref({})
+const quoteMeta = ref({})
+const quoteLoading = ref(false)
+let quoteSeq = 0
+let quoteTimer = null
+
+function quoteOf(row) {
+  return quotes.value[String(row?.code || '')] || null
+}
+
+function quoteTitle(row) {
+  const quote = quoteOf(row)
+  if (!quote) return ''
+  if (quote.quote_kind === 'stored') return `已落库日线 ${quote.trade_date || ''}`.trim()
+  const at = quoteStamp(quoteMeta.value.snapshot_at)
+  const kind = quoteMeta.value.realtime ? '实时行情' : '行情快照'
+  return at ? `${kind} ${at}` : kind
+}
+
+async function loadQuotes() {
+  const seq = (quoteSeq += 1)
+  if (!rows.value.length) {
+    quotes.value = {}
+    quoteMeta.value = {}
+    quoteLoading.value = false
+    return
+  }
+  quoteLoading.value = true
+  try {
+    const q = { pool_type: poolType.value }
+    if (poolType.value === 'track' && trackId.value) q.track_id = trackId.value
+    const data = await api.get('/api/screener/pool/quotes', { params: q, silent: true })
+    if (seq !== quoteSeq) return // 竞态:丢弃过期行情响应
+    quotes.value = data?.items || {}
+    quoteMeta.value = data || {}
+  } catch {
+    // 刷新失败保留上一份行情,避免轮询抖动把已有现价/涨跌幅刷成空
+  } finally {
+    if (seq === quoteSeq) quoteLoading.value = false
+  }
+}
+
+function scheduleQuoteRefresh() {
+  if (quoteTimer) { clearInterval(quoteTimer); quoteTimer = null }
+  if (!isTradingSession()) return // 非交易时段不轮询,避免无意义打源
+  quoteTimer = setInterval(() => {
+    if (document.visibilityState === 'hidden') return
+    loadQuotes()
+  }, 20000)
+}
+
+function onVisibilityChange() {
+  if (document.visibilityState !== 'visible') return
+  loadQuotes()
+  scheduleQuoteRefresh()
+}
 
 // 赛道tab:当前选中赛道,全部为 0 时显空状态引导卡
 const currentTrack = computed(() =>
@@ -178,6 +250,9 @@ async function load() {
   } finally {
     if (seq === loadSeq) loading.value = false
   }
+  // 行情独立异步加载:列表先渲染,行情慢/失败都不阻塞表格
+  await loadQuotes()
+  scheduleQuoteRefresh()
 }
 
 async function forceOut(row) {
@@ -205,6 +280,7 @@ watch(() => [route.query.q, route.query.t], applyQuerySearch)
 
 onMounted(async () => {
   applyQuerySearch()
+  document.addEventListener('visibilitychange', onVisibilityChange)
   try {
     const list = await api.get('/api/screener/tracks', { silent: true })
     tracks.value = Array.isArray(list) ? list : []
@@ -222,5 +298,10 @@ onMounted(async () => {
     riskGuard.value = !!d.risk_guard
   } catch { riskGuard.value = null }
 })
-onBeforeUnmount(() => { loadSeq += 1 })
+onBeforeUnmount(() => {
+  loadSeq += 1
+  quoteSeq += 1 // 丢弃在途行情响应
+  if (quoteTimer) { clearInterval(quoteTimer); quoteTimer = null }
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+})
 </script>

@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test:dual-core": "node --test src/utils/dualCoreCard.test.mjs src/utils/dualCorePage.test.mjs"
+    "test:dual-core": "node --test src/utils/dualCoreCard.test.mjs src/utils/dualCorePage.test.mjs",
+    "test:pool": "node --test src/utils/poolQuotes.test.mjs"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",

@@ -10,11 +10,12 @@ test('real Vue page fails closed, edits records and saves exact card with readba
   const calls = []
   let saved
   let releaseAudit
+  let autoResponse = { as_of:'2026-10-27', history_as_of:'2026-10-27', data:{}, version:'2.0',phase:'closed',source_missing:['cores.883957.source','cores.883957.timestamp','cores.883994.source','cores.883994.timestamp','emotion','emotion-feed-missing'],data_quality:{complete:false},checks:[],verdict:{cap:0},decision:{can_open:false}}
   globalThis.__dualApi = {
     async get(url) {
       calls.push(['GET',url])
       if(url.endsWith('/audit')) return new Promise(resolve=>{releaseAudit=resolve})
-      if (url === '/api/screener/dual-core') return { as_of:'2026-10-27', history_as_of:'2026-10-27', data:{}, version:'2.0',phase:'closed',source_missing:['emotion-feed-missing'],data_quality:{complete:false},checks:[],verdict:{cap:0},decision:{can_open:false}}
+      if (url === '/api/screener/dual-core') return autoResponse
       if (saved) return saved
       throw {response:{status:404}}
     },
@@ -40,6 +41,20 @@ test('real Vue page fails closed, edits records and saves exact card with readba
     await flush()
     assert.match(host.textContent,/缺失阻断/)
     assert.match(host.textContent,/emotion-feed-missing/)
+    // 同一核心的来源+时间戳合并不重复，且核心缺口标明是服务端数据链问题。
+    assert.equal(host.textContent.match(/核心 883957 实时快照/g).length,1)
+    assert.equal(host.textContent.match(/核心 883994 实时快照/g).length,1)
+    assert.equal(host.querySelectorAll('.dc-gap-table tbody tr').length,4)
+    const coreRow = [...host.querySelectorAll('.dc-gap-table tbody tr')].find(r=>r.textContent.includes('883957'))
+    assert.match(coreRow.textContent,/来源未核验/)
+    assert.match(coreRow.textContent,/时间戳缺失/)
+    let gapScrolled = ''
+    host.querySelector('#dc-step-2').scrollIntoView = () => { gapScrolled = 'dc-step-2' }
+    const gapLink = host.querySelector('.dc-gap-table a')
+    assert.ok(gapLink)
+    gapLink.click(); await flush()
+    assert.equal(gapScrolled,'dc-step-2')
+    assert.equal(win.location.hash,'')
     assert.equal(host.querySelectorAll('section[id^="dc-step-"]').length,12)
     const click = async text => { const b=[...host.querySelectorAll('button')].find(b=>b.textContent===text); assert.ok(b,text); b.click(); await flush() }
     await click('添加手工记录')
@@ -80,11 +95,32 @@ test('real Vue page fails closed, edits records and saves exact card with readba
     assert.match(host.textContent,/manual-evidence/)
     assert.match(host.textContent,/缺失阻断/)
     assert.match(host.textContent,/reference-fixture/)
-    const date = host.querySelector('input[type="date"]'); date.value='2026-10-29'; date.dispatchEvent(new win.Event('change',{bubbles:true})); await flush()
+    // 固定选一个明确非当天的历史日期，避免测试随系统日期漂移。
+    const date = host.querySelector('input[type="date"]'); date.value='2020-01-06'; date.dispatchEvent(new win.Event('change',{bubbles:true})); await flush()
     assert.doesNotMatch(host.textContent,/reference-fixture|manual-evidence|emotion-feed-missing/)
+    assert.match(host.textContent,/所选日期不是今天/)
     assert.match(host.querySelector('[data-manual-bool="account.review_complete"]').value,/unknown/)
     assert.ok(host.querySelector('[data-manual-number="core.883957.price"]'))
     assert.ok(host.querySelector('[data-manual-number="industry.amount_ma20"]'))
+    let scrolled = ''
+    host.querySelector('#dc-step-0').scrollIntoView = () => { scrolled = 'dc-step-0' }
+    host.querySelector('.dc-step-nav a').click(); await flush()
+    assert.equal(scrolled,'dc-step-0')
+    assert.equal(win.location.hash,'')
+    // 非交易时段收盘复核快照：核心/情绪由服务端补齐，只剩手工台账缺口。
+    autoResponse = { as_of:'2026-10-29T00:05:00+08:00', history_as_of:'2026-10-28', data:{}, version:'2.0', phase:'closed', feed_status:'closed', feed_trade_date:'2026-10-28', review_only:true, source_missing:['industry','stock'], data_quality:{complete:false}, checks:[], verdict:{cap:0}, decision:{can_open:false,action:'block',reason:'source_missing'}, day_guard:{frozen:false,events:[]} }
+    const todayKey = new Intl.DateTimeFormat('en-CA', { timeZone:'Asia/Shanghai', year:'numeric', month:'2-digit', day:'2-digit' }).format(new Date())
+    date.value = todayKey; date.dispatchEvent(new win.Event('change',{bubbles:true})); await flush()
+    assert.match(host.textContent,/非交易时段/)
+    assert.match(host.textContent,/收盘快照/)
+    assert.match(host.textContent,/仅手工台账缺口/)
+    assert.doesNotMatch(host.textContent,/服务端存在缺口/)
+    assert.doesNotMatch(host.textContent,/核心 883957 实时快照/)
+    const closedRows = [...host.querySelectorAll('.dc-gap-table tbody tr')]
+    assert.equal(closedRows.length, 2)
+    assert.match(closedRows[0].textContent,/行业证据/)
+    assert.match(closedRows[1].textContent,/个股证据/)
+    assert.match(host.textContent,/最近收盘快照 · 非实时/)
     app.unmount()
   } finally { await unlink(path); await unlink(childPath); win.happyDOM.abort() }
 })
