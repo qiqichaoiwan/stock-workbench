@@ -1,6 +1,6 @@
 """Portfolio REST API:账户/用户管理/持仓/交易/报告/LLM设置(全部 user_id 隔离)。"""
 from datetime import date
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -222,6 +222,9 @@ def reset_password(user_id: int, body: ResetPasswordIn,
 @router.delete("/auth/users/{user_id}")
 def delete_user(user_id: int, admin: User = Depends(require_admin),
                 db: Session = Depends(get_db)):
+    from .dual_core_checklist_models import CardAudit, ExecutionCard, VerifiedDayEvent
+    from ..screener.models import TradeChecklist
+
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(404, "用户不存在")
@@ -233,7 +236,8 @@ def delete_user(user_id: int, admin: User = Depends(require_admin),
     # 用批量 DELETE 而非 db.delete(row):后者由 unit of work 统一 flush,
     # 语句顺序不保证,会先发 DELETE pf_user 触发 FOREIGN KEY constraint failed。
     for model in (TradeRecord, WatchAlertLog, AiAnalysis, WeeklyReport,
-                  UserLlmConfig, Watchlist, Holding):
+                  UserLlmConfig, Watchlist, Holding, TradeChecklist,
+                  CardAudit, VerifiedDayEvent, ExecutionCard):
         db.execute(delete(model).where(model.user_id == user.id))
     # 邀请码无外键:清空 used_by 防孤儿引用,同时置 active=False 防被重新使用
     db.execute(update(InviteCode).where(InviteCode.used_by == user.id)
@@ -335,6 +339,21 @@ def revoke_invite(invite_id: int, admin: User = Depends(require_admin),
     return {"ok": True}
 
 
+# 仅返回当前用户持仓或自选的行情，不接受任意用户或代码作为查询范围。
+@router.get("/portfolio/quotes")
+def portfolio_quote_api(scope: Literal["holdings", "watchlist"],
+                        user_id: int = Depends(current_user_id),
+                        db: Session = Depends(get_db)):
+    from . import live_quotes
+    if scope == "holdings":
+        codes = db.execute(select(Holding.code).where(
+            Holding.user_id == user_id, Holding.status == "holding")).scalars().all()
+    else:
+        codes = db.execute(select(Watchlist.code).where(
+            Watchlist.user_id == user_id)).scalars().all()
+    return live_quotes.portfolio_quotes(db, codes)
+
+
 # ---------- 持仓 ----------
 
 class HoldingIn(BaseModel):
@@ -343,7 +362,7 @@ class HoldingIn(BaseModel):
     quantity: int = Field(gt=0)
     buy_date: date
     stop_pct: float = Field(default=holding_service.INITIAL_STOP_PCT, gt=0, le=30)
-    take_profit_price: float = 0.0
+    take_profit_price: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     note: str = ""
 
 
@@ -407,27 +426,34 @@ def _watch_code_check(code: str) -> str:
 def _watch_dict(w, db: Session) -> dict:
     from ..shared import stock_ref
 
-    latest = stock_ref.latest_close(db, w.code)
+    try:
+        latest = stock_ref.latest_close(db, w.code)
+    except Exception:
+        latest = None
     close = latest[1] if latest else None
-    pct = 0.0
+    pct = None
     if latest is not None:
-        hist = stock_ref.quote_history(db, w.code, days=5)
+        try:
+            hist = stock_ref.quote_history(db, w.code, days=5)
+        except Exception:
+            hist = []
         prev = hist[-2]["close"] if len(hist) >= 2 else None
-        pct = round((close / prev - 1) * 100, 2) if prev else 0.0
+        pct = round((close / prev - 1) * 100, 2) if prev else None
     return {"id": w.id, "code": w.code, "name": w.name,
             "cost_price": w.cost_price, "take_profit": w.take_profit,
             "stop_loss": w.stop_loss, "alert_pct": w.alert_pct,
             "note": w.note, "close": close, "pct_chg": pct,
+            "quote_at": latest[0].isoformat() if latest else None,
             "created_at": _cn(w.created_at)}
 
 
 class WatchIn(BaseModel):
     code: str = Field(min_length=6, max_length=6)
     name: str = ""
-    cost_price: float = 0.0
-    take_profit: float = 0.0
-    stop_loss: float = 0.0
-    alert_pct: float = 0.0
+    cost_price: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    take_profit: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    stop_loss: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    alert_pct: float = Field(default=0.0, ge=0, allow_inf_nan=False)
     note: str = ""
 
 

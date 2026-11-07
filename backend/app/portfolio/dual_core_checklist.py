@@ -178,8 +178,9 @@ def _stored_calculation(db, card, revision):
     if not snapshot:
         return None
     try:
-        value = json.loads(snapshot).get('calculation')
-    except (TypeError, ValueError):
+        decoded = json.loads(snapshot)
+        value = decoded.get('calculation') if isinstance(decoded, dict) else None
+    except (TypeError, ValueError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -189,7 +190,15 @@ def serialize(db, card, calculation=None):
     times = {'data_check': ('09:30', 'data_integrity'), 'preview': ('14:30', 'warning_only'),
              'final': ('14:45', 'manual_record_only'), 'weekly_review': ('Friday 15:00+', 'next_trade_review')}
     time, purpose = times[card.phase]
-    payload = json.loads(card.payload)
+    payload_error = False
+    try:
+        payload = json.loads(card.payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+        payload_error = True
+    if not isinstance(payload, dict):
+        payload = {}
+        payload_error = True
     if calculation is None:
         calculation = _stored_calculation(db, card, card.revision)
     if calculation is None:
@@ -199,7 +208,8 @@ def serialize(db, card, calculation=None):
         calendar_status='unverified', effective_trade_date=None,
         schedule={'timezone': 'Asia/Shanghai', 'time': time, 'purpose': purpose},
         automatic_evidence=[], calculation=calculation,
-        day_guard=guard, created_at=card.created_at, updated_at=card.updated_at)
+        day_guard=guard, created_at=card.created_at, updated_at=card.updated_at,
+        payload_error=payload_error)
 
 
 def save_card(db, user_id, trade_date, phase, body):
@@ -245,8 +255,23 @@ def audit(db, card):
     rows = db.scalars(select(CardAudit).where(CardAudit.user_id == card.user_id,
         CardAudit.trade_date == card.trade_date, CardAudit.phase == card.phase)
         .order_by(CardAudit.revision)).all()
-    return [dict(revision=r.revision, action=r.action, recorded_at=r.recorded_at,
-                 snapshot=json.loads(r.snapshot)) for r in rows]
+    items = []
+    for row in rows:
+        try:
+            snapshot = json.loads(row.snapshot)
+            if not isinstance(snapshot, dict):
+                raise ValueError('audit snapshot must be an object')
+            item = dict(revision=row.revision, action=row.action,
+                        recorded_at=row.recorded_at, snapshot=snapshot)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # Historical rows can predate the bounded serializer. Keep the
+            # audit timeline visible and report the bad row instead of turning
+            # the whole endpoint/export into a 500.
+            item = dict(revision=row.revision, action=row.action,
+                        recorded_at=row.recorded_at, snapshot=None,
+                        snapshot_error='invalid_json')
+        items.append(item)
+    return items
 
 
 def delete_card(db, card, revision):

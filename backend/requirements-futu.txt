@@ -1,0 +1,2 @@
+# Optional, only when Futu OpenD is installed and the account has quote rights.
+futu-api==10.12.7208

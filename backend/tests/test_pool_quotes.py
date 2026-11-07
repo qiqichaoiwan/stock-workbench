@@ -21,7 +21,8 @@ CN = ZoneInfo("Asia/Shanghai")
 
 
 @pytest.fixture(autouse=True)
-def reset_quote_cache():
+def reset_quote_cache(monkeypatch):
+    monkeypatch.setattr(dg, "completed_trade_day", lambda: date(2026, 10, 29))
     dg._SPOT_QUOTE_CACHE = None
     dg._SPOT_QUOTE_REFRESHING = False
     yield
@@ -80,7 +81,8 @@ def test_spot_quotes_preferred_and_missing_code_falls_back_to_stored(client, db,
 
     assert data["source"] == "akshare"
     assert data["session"] == "trading"
-    assert data["realtime"] is True
+    # 无逐股行情时间的源不冒充实时,即使采集时刻很近。
+    assert data["realtime"] is False
     assert data["snapshot_at"] == SNAPSHOT_AT
     assert data["snapshot_age_seconds"] == 2.0
     assert data["counts"] == {"total": 2, "spot": 1, "stored": 1, "missing": 0}
@@ -157,17 +159,77 @@ def test_empty_pool_skips_source(client, monkeypatch):
     assert data["errors"] == []
 
 
+def test_per_stock_timestamp_not_batch_timestamp_controls_realtime(client, pool, monkeypatch):
+    now = datetime.now(CN)
+    recent = (now - timedelta(seconds=5)).isoformat()
+    old = (now - timedelta(days=1)).isoformat()
+    monkeypatch.setattr(api, "_quote_session", lambda _: "trading")
+    monkeypatch.setattr(api.dg, "get_spot_quotes", lambda codes: ({
+        "600000": {"price": 10, "quote_at": recent},
+        "000001": {"price": 9, "quote_at": old},
+    }, "sina", recent, 5))
+    data = client.get("/api/screener/pool/quotes").json()
+    assert data["items"]["600000"]["realtime"] is True
+    assert data["items"]["000001"]["realtime"] is False
+    assert data["realtime"] is False
+
+
+def test_stream_window_is_returned_and_rechecked_after_public_fetch(client, pool, monkeypatch):
+    from app.config import settings
+    from app import marketdata
+
+    stamp = (datetime.now(CN) - timedelta(seconds=5)).isoformat()
+
+    class Hub:
+        def snapshot(self, codes):
+            return {"max_age_seconds": 3.0, "delayed_max_age_seconds": 15.0,
+                    "items": {"600000": {"price": 10, "quality": "realtime",
+                                         "provider": "licensed", "provider_time": stamp,
+                                         "age_seconds": 0}}}
+
+    monkeypatch.setattr(settings, "marketdata_stream_enabled", True)
+    monkeypatch.setattr(marketdata, "get_hub", lambda: Hub())
+    monkeypatch.setattr(api, "_quote_session", lambda _: "trading")
+    monkeypatch.setattr(api, "bounded_get_spot_quotes", lambda *a, **kw: (({}, "sina", None, None), None))
+    quote = client.get("/api/screener/pool/quotes").json()["items"]["600000"]
+    assert quote["realtime_max_age_seconds"] == 3.0
+    assert quote["delayed_max_age_seconds"] == 15.0
+    assert quote["quote_quality"] == "delayed"
+    assert quote["realtime"] is False
+
+
+def test_unverified_snapshot_and_future_daily_not_called_realtime(client, db, pool, monkeypatch):
+    db.add(DailyQuote(code="000001", trade_date=date(2099, 1, 1), close=99, pct_chg=99))
+    db.commit()
+    monkeypatch.setattr(api, "_quote_session", lambda _: "trading")
+    monkeypatch.setattr(api.dg, "completed_trade_day", lambda: date(2026, 10, 29))
+    monkeypatch.setattr(api.dg, "get_spot_quotes", lambda codes: (
+        {"600000": {"price": 12}}, "efinance", datetime.now(CN).isoformat(), 1))
+    data = client.get("/api/screener/pool/quotes").json()
+    assert data["items"]["600000"]["realtime"] is False
+    assert data["realtime"] is False
+    assert data["items"]["000001"]["trade_date"] == "2026-10-28"
+
+
 @pytest.mark.parametrize("at,expected", [
     (datetime(2026, 10, 29, 9, 29, tzinfo=CN), "closed"),
     (datetime(2026, 10, 29, 9, 30, tzinfo=CN), "trading"),
-    (datetime(2026, 10, 29, 11, 30, tzinfo=CN), "trading"),
+    (datetime(2026, 10, 29, 11, 30, tzinfo=CN), "closed"),
     (datetime(2026, 10, 29, 12, 0, tzinfo=CN), "closed"),
     (datetime(2026, 10, 29, 13, 0, tzinfo=CN), "trading"),
-    (datetime(2026, 10, 29, 15, 0, tzinfo=CN), "trading"),
+    (datetime(2026, 10, 29, 15, 0, tzinfo=CN), "closed"),
     (datetime(2026, 10, 29, 15, 1, tzinfo=CN), "closed"),
     (datetime(2026, 10, 31, 10, 0, tzinfo=CN), "closed"),  # 周六
 ])
-def test_quote_session_boundaries(at, expected):
+def test_quote_session_boundaries(at, expected, monkeypatch):
+    # Session classification is calendar-verified in production.  Keep this
+    # pure boundary test deterministic by supplying a bounded calendar that
+    # covers both the trading day and the weekend case.
+    from app.screener import cockpit
+    feed = cockpit.Feed("test-calendar", 86400)
+    feed.value = {date(2026, 10, 29), date(2026, 12, 31)}
+    feed.attempt = time.monotonic()
+    monkeypatch.setattr(cockpit, "_calendar", feed)
     assert api._quote_session(at) == expected
 
 

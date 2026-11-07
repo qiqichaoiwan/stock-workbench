@@ -1,6 +1,6 @@
 <template>
-  <div>
-    <div class="market-status">
+  <div class="workbench-page market-page">
+    <div class="market-status status-banner">
       <div class="status-item">
         <span class="status-label">指数</span>
         <strong>{{ indexAsOfText }}</strong>
@@ -14,10 +14,10 @@
       <span class="grow" />
       <el-button size="small" :loading="ixLoading || cmdLoading || flowLoading" @click="load">刷新数据</el-button>
     </div>
-    <p class="market-note muted">时间均为北京时间；指数展示最近收盘值，资金与总览展示最近采集时点，均非实时行情。</p>
+    <p class="market-note muted"><span class="eyebrow">数据口径</span> 时间均为北京时间；指数展示最近收盘值，资金与总览展示最近采集时点，均非实时行情。</p>
     <el-alert v-if="statError" :title="statError" type="error" :closable="false" show-icon />
     <el-alert v-else-if="!statLoading && !hasStat" :title="`暂无市场总览数据，请在任务中心运行「${taskName('market_stat')}」`" type="info" :closable="false" />
-    <el-card v-if="hasStat" class="page-card">
+    <el-card v-if="hasStat" class="page-card workbench-card">
       <template #header>
         <div class="card-head">
           <span>市场总览</span>
@@ -35,7 +35,7 @@
       <p v-if="stat.source_note" class="muted" style="font-size:12px;margin:8px 0 0">数据来源：{{ stat.source_note }}</p>
     </el-card>
 
-    <el-card class="page-card">
+    <el-card class="page-card workbench-card">
       <template #header>
         <div class="card-head">
           <span>主要指数</span>
@@ -45,7 +45,7 @@
         </div>
       </template>
       <div class="table-scroll">
-      <el-table :data="indexes" size="small" v-loading="ixLoading" stripe border>
+      <el-table class="workbench-table" :data="indexes" size="small" v-loading="ixLoading" stripe border>
         <el-table-column prop="name" label="指数" min-width="110" />
         <el-table-column prop="code" label="代码" width="100" />
         <el-table-column label="点位" width="120" align="right">
@@ -86,7 +86,7 @@
     </el-card>
 
     <!-- 行业资金:调 /fund-flow,点击行拉 history 画迷你趋势 -->
-    <el-card class="page-card">
+    <el-card class="page-card workbench-card">
       <template #header>
         <div class="card-head">
           <span>板块资金</span>
@@ -99,7 +99,7 @@
         </div>
       </template>
       <div class="table-scroll">
-      <el-table :data="flows" size="small" v-loading="flowLoading" stripe border
+      <el-table class="workbench-table" :data="flows" size="small" v-loading="flowLoading" stripe border
                 highlight-current-row @row-click="onFlowRow">
         <el-table-column prop="board_name" label="板块" min-width="130" show-overflow-tooltip />
         <el-table-column label="主力净流入(亿)" width="130" align="right">
@@ -144,18 +144,22 @@
           </div>
           <div v-if="flowHist.length" class="table-scroll" style="margin-top:8px">
             <table class="native-mini">
-              <tr><th>日期</th><th style="text-align:right">净流入(亿)</th></tr>
-              <tr v-for="h in flowHist" :key="h.snap_date">
-                <td>{{ h.snap_date }}</td>
-                <td style="text-align:right" :class="upDownClass(h.net_inflow)">{{ fmtNum(h.net_inflow) }}</td>
-              </tr>
+              <thead>
+                <tr><th>日期</th><th style="text-align:right">净流入(亿)</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="h in flowHist" :key="h.snap_date">
+                  <td>{{ h.snap_date }}</td>
+                  <td style="text-align:right" :class="upDownClass(h.net_inflow)">{{ fmtNum(h.net_inflow) }}</td>
+                </tr>
+              </tbody>
             </table>
           </div>
         </div>
       </div>
     </el-card>
 
-    <el-card class="page-card">
+    <el-card class="page-card workbench-card">
       <template #header>
         <div class="card-head">
           <span>商品周期</span>
@@ -164,7 +168,7 @@
         </div>
       </template>
       <div class="table-scroll">
-      <el-table :data="commodities" size="small" v-loading="cmdLoading" stripe border>
+      <el-table class="workbench-table" :data="commodities" size="small" v-loading="cmdLoading" stripe border>
         <el-table-column prop="series_name" label="品种" min-width="110" />
         <el-table-column label="信号" width="90">
           <template #default="{ row }">
@@ -256,7 +260,7 @@ function splitDateTime(v) {
 function dateOf(v) { return splitDateTime(v).date || '-' }
 function outsideSession(v) {
   const phase = sessionPhase(v)
-  return phase === 'preopen' || phase === 'afterclose'
+  return phase === 'preopen' || phase === 'lunch' || phase === 'afterclose'
 }
 // 采集时点:盘前/盘中/盘后;盘后值即当日收盘累计,盘前值仍是上一交易日
 function sessionPhase(v) {
@@ -265,6 +269,7 @@ function sessionPhase(v) {
   const [h, m] = time.split(':').map(Number)
   const minutes = h * 60 + m
   if (minutes < 9 * 60 + 30) return 'preopen'
+  if (minutes >= 11 * 60 + 30 && minutes < 13 * 60) return 'lunch'
   if (minutes > 15 * 60) return 'afterclose'
   return 'intraday'
 }
@@ -273,11 +278,12 @@ function asOfText(v) {
   if (!date) return '暂无数据'
   const phase = sessionPhase(v)
   if (phase === 'preopen') return `${date} 盘前采集 ${time}`
+  if (phase === 'lunch') return `${date} 午间休市快照 ${time}`
   if (phase === 'afterclose') return `${date} 收盘值(采集 ${time})`
   return `${date} 快照 ${time}`
 }
 function offSessionLabel(v) {
-  return sessionPhase(v) === 'preopen' ? '盘前采集' : '盘后采集'
+  return ({ preopen: '盘前采集', lunch: '午间休市', afterclose: '盘后采集' })[sessionPhase(v)] || '非交易时段'
 }
 function tradeDateText(v) {
   const s = String(v || '').slice(0, 10)
@@ -375,12 +381,17 @@ async function load() {
 
 <style scoped>
 .market-status { display: flex; align-items: center; flex-wrap: wrap; gap: 14px;
-  padding: 10px 14px; margin-bottom: 6px; background: #fff;
-  border: 1px solid #ebeef5; border-radius: 6px; }
+  padding: 12px 16px; margin-bottom: 8px; background: var(--surface-card, #fff);
+  border: 1px solid var(--line-soft, #e6ebf2); border-radius: var(--radius-card, 12px);
+  box-shadow: var(--shadow-card, 0 4px 16px rgba(24, 44, 72, .05)); }
 .status-item { display: flex; align-items: center; gap: 8px; }
 .status-label { color: #909399; font-size: 12px; }
 .status-item strong { font-size: 14px; font-variant-numeric: tabular-nums; }
-.market-note { font-size: 12px; margin: 0 0 12px; }
+.market-note { font-size: 12px; margin: 0 0 14px; }
+.eyebrow { color: var(--brand, #2f6fed); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.workbench-card { border-radius: var(--radius-card, 12px); border-color: var(--line-soft, #e6ebf2); box-shadow: var(--shadow-card, 0 4px 16px rgba(24, 44, 72, .05)); }
+.workbench-table :deep(.el-table__header th) { background: #f7f9fc; color: #617089; font-size: 12px; }
+.workbench-table :deep(.el-table__row:hover > td) { background: #f4f8ff !important; }
 .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .native-mini { border-collapse: collapse; font-size: 12px; min-width: 280px; }
 .native-mini th, .native-mini td { border: 1px solid #ebeef5; padding: 4px 8px; }

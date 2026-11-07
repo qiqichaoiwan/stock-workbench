@@ -29,6 +29,7 @@ SQLite 多 worker 约束(必读):
 """
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # backend/
@@ -73,6 +74,38 @@ class Settings(BaseSettings):
     fetch_retry_wait_seconds: int = 5
     fetch_rate_limit_seconds: float = 0.6  # 相邻外部请求最小间隔
 
+    # 可选的推送行情接入层。默认关闭；关闭时现有 AKShare/新浪/腾讯链路继续
+    # 作为研究/复盘降级源。开启后仍需把数据源、授权范围和共享存储单独验收，
+    # 不能因为收到一条推送就把它标成交易所级 SLA。
+    marketdata_stream_enabled: bool = False
+    # Process ownership is explicit so an API replica never opens a second
+    # broker/OpenD connection.  The standalone marketdata worker must run with
+    # ``MARKETDATA_PROCESS_ROLE=worker``; the FastAPI process must stay ``api``.
+    marketdata_process_role: str = "api"  # api | worker
+    # 富途等个人账户行情不可默认广播给多租户；必须由部署者明确声明单租户。
+    marketdata_single_tenant: bool = False
+    marketdata_authorized_providers: str = ""
+    marketdata_ingest_token: str = ""
+    marketdata_max_age_seconds: float = 3.0
+    marketdata_delayed_max_age_seconds: float = 15.0
+    marketdata_future_tolerance_seconds: float = 2.0
+    marketdata_symbols: str = ""
+    # latest/sequence 默认进程内；生产多 worker/多副本必须切到 Redis。
+    # Redis 客户端是可选依赖，未安装或服务不可达时健康接口会明确报错，
+    # 不会把本地内存快照伪装成共享 SLA 存储。
+    marketdata_storage_mode: str = "memory"  # memory | redis
+    marketdata_redis_url: str = ""
+    marketdata_redis_prefix: str = "stock-workbench:marketdata"
+    marketdata_redis_stream_maxlen: int = 100_000
+
+    # 可选富途 OpenD 适配器。futu-api 不放进基础镜像，未安装/未配置时不影响
+    # 现有系统；启用前必须确认账号授权和单租户数据使用范围。
+    futu_enabled: bool = False
+    futu_opend_host: str = "127.0.0.1"
+    futu_opend_port: int = 11111
+    futu_max_symbols: int = 100
+    futu_reconnect_max_backoff: float = 30.0
+
     # 允许的跨域来源(逗号分隔,追加到内置 dev 白名单);同源部署无需配置。
     # 生产前后端分离部署时必须显式配置 CORS_ORIGINS=https://app.example.com,
     # 为空则默认同源(仅放行本地 vite dev 端口),见 main.py。
@@ -82,6 +115,30 @@ class Settings(BaseSettings):
     max_concurrent_tasks: int = 3
 
     tz: str = "Asia/Shanghai"
+
+    @field_validator("marketdata_storage_mode", mode="before")
+    @classmethod
+    def _validate_marketdata_storage_mode(cls, value: object) -> str:
+        """Reject an unknown storage mode instead of silently using memory.
+
+        A typo such as ``MARKETDATA_STORAGE_MODE=redsi`` would otherwise make
+        a multi-worker deployment fall back to process-local state while its
+        operators believe Redis is active.  Failing during configuration load
+        keeps that unsafe state from reaching startup.
+        """
+        mode = str(value).strip().lower()
+        if mode not in {"memory", "redis"}:
+            raise ValueError("MARKETDATA_STORAGE_MODE 必须为 memory 或 redis")
+        return mode
+
+    @field_validator("marketdata_process_role", mode="before")
+    @classmethod
+    def _validate_marketdata_process_role(cls, value: object) -> str:
+        """Keep broker connection ownership unambiguous across containers."""
+        role = str(value).strip().lower()
+        if role not in {"api", "worker"}:
+            raise ValueError("MARKETDATA_PROCESS_ROLE 必须为 api 或 worker")
+        return role
 
     @property
     def is_using_default_jwt(self) -> bool:

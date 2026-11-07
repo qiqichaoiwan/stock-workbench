@@ -1,19 +1,20 @@
 <template>
-  <div>
-    <el-card class="page-card">
+  <div class="workbench-page watchlist-page">
+    <el-card class="page-card workbench-card alerts-card">
       <template #header>
         <div class="card-head">
           <span>命中提醒</span>
           <span class="grow" />
-          <el-button size="small" @click="loadAlerts">刷新</el-button>
+          <el-button size="small" :loading="alertsLoading" @click="loadAlerts">刷新</el-button>
         </div>
       </template>
+      <el-alert v-if="alertsError" type="error" :title="alertsError" :closable="false" show-icon />
       <div v-if="alerts.length">
         <el-alert v-for="a in alerts" :key="a.code + a.rule + a.created_at"
                   type="warning" :closable="false" show-icon style="margin-bottom:8px"
                   :title="`${a.code} ${a.rule}`" :description="`${a.message || ''} ${a.created_at || ''}`" />
       </div>
-      <el-empty v-else description="暂无命中提醒" :image-size="60">
+      <el-empty v-else-if="!alertsLoading && !alertsError" description="暂无命中提醒" :image-size="60">
         <template #description>
           <p>暂无命中提醒,价格触及三价或涨跌幅阈值后自动出现</p>
           <p class="muted" style="font-size:12px">由盘中「{{ taskName('watch_alert') }}」任务每 30 分钟扫描;提醒只读不改止损,仅提示</p>
@@ -21,24 +22,33 @@
       </el-empty>
     </el-card>
 
-    <el-card class="page-card">
+    <el-card class="page-card workbench-card">
       <template #header>
         <div class="card-head">
           <span>自选预警</span>
           <span class="grow" />
+          <el-button size="small" :loading="loading" @click="load">刷新列表</el-button>
+          <el-button size="small" @click="refreshQuotes">刷新行情</el-button>
           <el-button type="primary" size="small" @click="openAdd">新增自选</el-button>
         </div>
       </template>
+      <el-alert v-if="listError" type="error" :title="listError" :closable="false" show-icon />
+      <div class="quote-status-banner" :class="{ degraded: quoteError }" role="status">
+        <span class="status-dot" aria-hidden="true" />
+        <span>{{ quoteError || '行情每 30 秒刷新，预警只使用可核验的新鲜盘中行情。' }}</span>
+        <span class="grow" />
+        <span class="muted">数据源与时间按单股展示</span>
+      </div>
       <div class="table-scroll">
-      <el-table :data="rows" size="small" v-loading="loading" stripe border>
+      <el-table class="workbench-table" :data="rows" size="small" v-loading="loading" stripe border>
         <el-table-column prop="code" label="代码" width="90" />
         <el-table-column prop="name" label="名称" min-width="110" show-overflow-tooltip />
-        <el-table-column label="现价" width="90" align="right">
-          <template #default="{ row }">{{ fmtNum(row.close) }}</template>
+        <el-table-column label="现价" width="210" align="right">
+          <template #default="{ row }">{{ fmtNum(quoteFor(row).price) }}<div class="muted quote-note">{{ portfolioQuoteLabel(quoteFor(row)) }}</div></template>
         </el-table-column>
         <el-table-column label="涨跌幅" width="100" align="right">
           <template #default="{ row }">
-            <span :class="upDownClass(row.pct_chg)">{{ fmtPct(row.pct_chg) }}</span>
+            <span :class="upDownClass(quoteFor(row).pct_chg)">{{ fmtPct(quoteFor(row).pct_chg) }}</span>
           </template>
         </el-table-column>
         <el-table-column label="成本" width="90" align="right">
@@ -66,7 +76,7 @@
         </el-table-column>
       </el-table>
       </div>
-      <el-empty v-if="!loading && !rows.length" description="暂无自选,点击右上新增" :image-size="60">
+      <el-empty v-if="!loading && !listError && !rows.length" description="暂无自选,点击右上新增" :image-size="60">
         <template #description>
           <p>暂无自选,点击右上新增</p>
           <p class="muted" style="font-size:12px">成本=盈亏参考价,止盈/止损=触发提醒线,预警%=单日涨跌幅阈值;任一项填 0 表示不设</p>
@@ -107,11 +117,24 @@
 import { onMounted, onBeforeUnmount, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '../api'
+import { effectiveQuote, portfolioQuoteLabel } from '../utils/portfolioQuotes'
+import { isTradingSession, markQuoteRefreshFailed } from '../utils/poolQuotes'
 import { fmtNum, fmtPct, upDownClass } from '../utils/fmt'
 import { taskName } from '../utils/tasks'
 
 const rows = ref([])
+const quotes = ref({})
+const quoteError = ref('')
+let quoteSeq = 0
+let quoteRequestId = 0
+let quoteBusy = false
+let timer = null
+let clockTimer = null
+const quoteClock = ref(Date.now())
 const alerts = ref([])
+const alertsLoading = ref(false)
+const alertsError = ref('')
+const listError = ref('')
 const loading = ref(false)
 const dlg = ref(false)
 const saving = ref(false)
@@ -125,27 +148,94 @@ const rules = {
   ],
 }
 let seq = 0
+let alertsSeq = 0
 
-onMounted(() => { load(); loadAlerts() })
-onBeforeUnmount(() => { seq += 1 })
+onMounted(() => {
+  load(); loadAlerts(); timer = setInterval(() => { if (isTradingSession()) refreshQuotes() }, 30000)
+  clockTimer = setInterval(() => { quoteClock.value = Date.now() }, 1000)
+  document.addEventListener('visibilitychange', onVisibilityChange)
+})
+onBeforeUnmount(() => {
+  seq += 1; alertsSeq += 1; invalidateQuotes(); clearInterval(timer); clearInterval(clockTimer)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+})
+function onVisibilityChange() {
+  quoteClock.value = Date.now()
+  if (document.visibilityState === 'visible' && isTradingSession()) refreshQuotes()
+}
+
+function quoteFor(row) {
+  const quote = quotes.value[row.code] || { price: row.close, pct_chg: row.pct_chg,
+    quote_at: row.quote_at, quote_kind: row.close == null ? 'missing' : 'stored' }
+  return effectiveQuote(quote, quoteClock.value)
+}
+async function refreshQuotes() {
+  if (quoteBusy || !rows.value.length) return
+  quoteBusy = true
+  const requestId = ++quoteRequestId
+  const cur = ++quoteSeq
+  try {
+    const data = await api.get('/api/portfolio/quotes?scope=watchlist', { silent: true })
+    if (cur !== quoteSeq) return
+    quotes.value = data.items || {}
+    quoteError.value = (data.errors || []).join('；')
+  } catch {
+    if (cur === quoteSeq) {
+      // Do not keep a realtime label after a failed refresh. Each quote keeps
+      // its price for continuity, but is explicitly marked as a prior result.
+      quotes.value = markQuoteRefreshFailed(quotes.value)
+      quoteError.value = '行情读取失败，继续显示上次行情。'
+    }
+  } finally {
+    if (requestId === quoteRequestId) quoteBusy = false
+  }
+}
+
+function invalidateQuotes() {
+  quoteSeq += 1
+  quoteRequestId += 1
+  quoteBusy = false
+  // A list reload can replace symbols. Clear the old map so a response for
+  // the previous list cannot be rendered as a quote for the new rows.
+  quotes.value = {}
+}
 
 async function load() {
   const cur = (seq += 1)
   loading.value = true
+  listError.value = ''
+  quoteError.value = ''
+  invalidateQuotes()
   try {
-    const data = await api.get('/api/watchlist', { silent: true }).catch(() => [])
+    const data = await api.get('/api/watchlist', { silent: true })
     if (cur !== seq) return
-    rows.value = Array.isArray(data) ? data : []
+    if (!Array.isArray(data)) throw new Error('invalid watchlist response')
+    rows.value = data
+    await refreshQuotes()
+  } catch {
+    if (cur === seq) {
+      listError.value = `自选列表读取失败${rows.value.length ? '，显示上次结果' : ''}；请点击刷新列表重试。`
+      quoteError.value = '列表读取失败，行情等待重试。'
+    }
   } finally {
     if (cur === seq) loading.value = false
   }
 }
 
 async function loadAlerts() {
+  const cur = ++alertsSeq
+  alertsError.value = ''
+  alertsLoading.value = true
   try {
-    const data = await api.get('/api/watchlist/alerts', { silent: true }).catch(() => [])
-    alerts.value = Array.isArray(data) ? data : []
-  } catch { alerts.value = [] }
+    const data = await api.get('/api/watchlist/alerts', { silent: true })
+    if (cur !== alertsSeq) return
+    if (!Array.isArray(data)) throw new Error('invalid alerts response')
+    alerts.value = data
+  } catch {
+    if (cur === alertsSeq) alertsError.value = `预警读取失败${alerts.value.length ? '，显示上次结果' : ''}；请点击刷新重试。`
+  } finally {
+    if (cur === alertsSeq) alertsLoading.value = false
+  }
 }
 
 function resetForm() {
@@ -181,8 +271,8 @@ async function save() {
   try {
     const payload = {
       code: form.code,
-      cost_price: form.cost_price, take_profit: form.take_profit,
-      stop_loss: form.stop_loss, alert_pct: form.alert_pct, note: form.note || '',
+      cost_price: form.cost_price ?? 0, take_profit: form.take_profit ?? 0,
+      stop_loss: form.stop_loss ?? 0, alert_pct: form.alert_pct ?? 0, note: form.note || '',
     }
     if (editing.value) await api.put(`/api/watchlist/${editing.value.id}`, payload, { silent: true })
     else await api.post('/api/watchlist', payload, { silent: true })
@@ -211,5 +301,14 @@ async function remove(row) {
 </script>
 
 <style scoped>
+.quote-note { font-size: 11px; line-height: 1.3; }
 .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.workbench-card { border-radius: var(--radius-card, 12px); border-color: var(--line-soft, #e6ebf2); box-shadow: var(--shadow-card, 0 4px 16px rgba(24, 44, 72, .05)); }
+.workbench-table :deep(.el-table__header th) { background: #f7f9fc; color: #617089; font-size: 12px; }
+.workbench-table :deep(.el-table__row:hover > td) { background: #f4f8ff !important; }
+.quote-status-banner { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 7px 10px; margin-bottom: 12px; border: 1px solid #cbe9dc; border-radius: 8px; background: #f1fbf6; color: #236a50; font-size: 12px; }
+.quote-status-banner.degraded { border-color: #f0d7a5; background: #fff9ed; color: #8b5b00; }
+.status-dot { width: 7px; height: 7px; border-radius: 50%; background: #2fbb82; box-shadow: 0 0 0 3px rgba(47, 187, 130, .12); }
+.degraded .status-dot { background: #d99518; box-shadow: 0 0 0 3px rgba(217, 149, 24, .12); }
+@media (max-width: 768px) { .quote-status-banner { align-items: flex-start; flex-wrap: wrap; } .quote-status-banner .grow { display: none; } }
 </style>

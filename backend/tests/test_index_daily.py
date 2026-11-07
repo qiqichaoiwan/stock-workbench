@@ -162,3 +162,37 @@ def test_sync_indexes_skips_spot_fill_for_past_dates(db, monkeypatch):
     row = db.execute(select(IndexDaily)).scalar_one()
     assert row.amount == 0
     assert calls == []
+
+
+def test_index_daily_accepts_short_requested_interval(monkeypatch):
+    """A one-session refresh must not be rejected by a history-size gate."""
+    frame = pd.DataFrame([{
+        "trade_date": date(2026, 10, 27), "open": 100.0, "high": 101.0,
+        "low": 99.0, "close": 100.5, "amount": 1.0,
+    }])
+    def fake_em(*args):
+        return frame
+    fake_em.__name__ = "_index_daily_em"
+    monkeypatch.setattr(dg, "_index_daily_em", fake_em)
+    monkeypatch.setattr(dg, "_index_daily_tx", lambda *args: pytest.fail("fallback not expected"))
+    monkeypatch.setattr(dg, "_index_daily_sina", lambda *args: pytest.fail("fallback not expected"))
+
+    got, source = dg.get_index_daily_with_source("sh000001", "20261027", "20261027")
+    assert source == "em"
+    assert len(got) == 1
+
+
+def test_daily_history_empty_primary_falls_back(monkeypatch):
+    """Transient empty frames must continue through the history fallback chain."""
+    calls = []
+    monkeypatch.setattr(dg, "_daily_hist_ak", lambda *args: pd.DataFrame())
+    monkeypatch.setattr(dg, "_daily_hist_tx", lambda *args: pd.DataFrame())
+    monkeypatch.setattr(dg, "_daily_hist_sina", lambda *args: pd.DataFrame())
+    fallback = pd.DataFrame([{"trade_date": date(2026, 10, 27), "close": 10.0}])
+    monkeypatch.setattr(dg, "_daily_hist_bs", lambda *args: calls.append(True) or fallback)
+    dg._source_cooldown.clear()
+
+    got, source = dg.get_daily_history("600000", "20261027", "20261027")
+    assert source == "baostock"
+    assert got.equals(fallback)
+    assert calls == [True]

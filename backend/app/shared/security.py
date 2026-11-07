@@ -1,5 +1,4 @@
 """安全基座:JWT、bcrypt 密码哈希、Fernet 密钥加密(用户 LLM api_key)。"""
-import base64
 import hashlib
 import hmac
 import os

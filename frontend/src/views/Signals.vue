@@ -7,8 +7,10 @@
         <el-select v-model="sigType" placeholder="全部类型" clearable style="width:180px">
           <el-option v-for="(label, key) in labels" :key="key" :label="label" :value="key" />
         </el-select>
+        <el-button size="small" :loading="loading" @click="load">刷新</el-button>
       </div>
     </template>
+    <el-alert v-if="loadError" type="error" :title="loadError" :closable="false" show-icon />
     <el-table :data="pagedRows" size="small" v-loading="loading" max-height="620" stripe border>
       <el-table-column prop="trade_date" label="日期" width="110" />
       <el-table-column prop="code" label="代码" width="90" />
@@ -31,7 +33,7 @@
         </template>
       </el-table-column>
     </el-table>
-    <el-empty v-if="!loading && !rows.length" description="暂无技术信号" :image-size="60">
+    <el-empty v-if="!loading && !loadError && !rows.length" description="暂无技术信号" :image-size="60">
       <template #description>
         <p>暂无技术信号,请先在任务中心运行「{{ taskName('signals') }}」后可见</p>
         <p class="muted" style="font-size:12px">收盘后 16:40 落库;周末/非交易日无新增属预期</p>
@@ -54,6 +56,7 @@ import { taskName } from '../utils/tasks'
 const rows = ref([])
 const sigType = ref('')
 const loading = ref(false)
+const loadError = ref('')
 const page = ref(1)
 const pageSize = 20
 let loadSeq = 0
@@ -76,12 +79,21 @@ function detailText(d) {
 async function load() {
   const seq = (loadSeq += 1)
   loading.value = true
+  loadError.value = ''
+  rows.value = []
   try {
     const data = await api.get('/api/screener/signals',
       { params: { signal_type: sigType.value || undefined, limit: 300 }, silent: true })
     if (seq !== loadSeq) return // 竞态:切换类型时丢弃过期响应
-    rows.value = Array.isArray(data) ? data : (data?.items || data?.data || [])
+    const items = Array.isArray(data) ? data : (data?.items || data?.data)
+    if (!Array.isArray(items)) throw new Error('invalid signals response')
+    rows.value = items
     page.value = 1
+  } catch {
+    if (seq === loadSeq) {
+      rows.value = []
+      loadError.value = '技术信号读取失败，请点击刷新重试。'
+    }
   } finally {
     if (seq === loadSeq) loading.value = false
   }

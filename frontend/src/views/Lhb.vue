@@ -9,6 +9,7 @@
           <el-button size="small" @click="load">刷新</el-button>
         </div>
       </template>
+      <el-alert v-if="lhbError" type="error" :title="lhbError" :closable="false" show-icon />
       <div class="table-scroll">
       <el-table :data="lhbRows" size="small" v-loading="lhbLoading" stripe border>
         <el-table-column prop="code" label="代码" width="90" />
@@ -41,7 +42,7 @@
         <el-table-column prop="trade_date" label="交易日" width="110" />
       </el-table>
       </div>
-      <el-empty v-if="!lhbLoading && !lhb.length" description="暂无龙虎榜数据" :image-size="60">
+      <el-empty v-if="!lhbLoading && !lhbError && !lhb.length" description="暂无龙虎榜数据" :image-size="60">
         <template #description>
           <p>暂无龙虎榜数据,收盘后 17:10「{{ taskName('lhb_sync') }}」落库后可见</p>
           <p class="muted" style="font-size:12px">周末/非交易日无数据属预期;交易日晚间仍空请去任务中心手动运行「{{ taskName('lhb_sync') }}」</p>
@@ -51,6 +52,7 @@
 
     <el-card class="page-card">
       <template #header>游资席位</template>
+      <el-alert v-if="seatError" type="error" :title="seatError" :closable="false" show-icon />
       <div class="table-scroll">
       <el-table :data="seatRows" size="small" v-loading="seatLoading" stripe border>
         <el-table-column prop="seat" label="席位" min-width="170" show-overflow-tooltip />
@@ -63,7 +65,7 @@
         </el-table-column>
       </el-table>
       </div>
-      <el-empty v-if="!seatLoading && !seatRows.length" description="暂无游资席位数据" :image-size="60" />
+      <el-empty v-if="!seatLoading && !seatError && !seatRows.length" description="暂无游资席位数据" :image-size="60" />
     </el-card>
   </div>
 </template>
@@ -78,6 +80,8 @@ const lhb = ref([])
 const seats = ref([])
 const lhbLoading = ref(false)
 const seatLoading = ref(false)
+const lhbError = ref('')
+const seatError = ref('')
 let seq = 0
 
 // 兼容后端历史格式:对象数组 / JSON 字符串 / 字符串数组;同一游资同一方向去重
@@ -164,14 +168,17 @@ function riskType(risk) {
 async function load() {
   const cur = (seq += 1)
   lhbLoading.value = seatLoading.value = true
+  lhbError.value = seatError.value = ''
   try {
-    const [a, b] = await Promise.all([
-      api.get('/api/screener/lhb', { silent: true }).catch(() => []),
-      api.get('/api/screener/hot-money-seats', { silent: true }).catch(() => []),
+    const [a, b] = await Promise.allSettled([
+      api.get('/api/screener/lhb', { silent: true }),
+      api.get('/api/screener/hot-money-seats', { silent: true }),
     ])
     if (cur !== seq) return
-    lhb.value = Array.isArray(a) ? a : []
-    seats.value = Array.isArray(b) ? b : []
+    if (a.status === 'fulfilled' && Array.isArray(a.value)) lhb.value = a.value
+    else lhbError.value = `龙虎榜读取失败${lhb.value.length ? '，显示上次结果' : ''}；请点击刷新重试。`
+    if (b.status === 'fulfilled' && Array.isArray(b.value)) seats.value = b.value
+    else seatError.value = `席位读取失败${seats.value.length ? '，显示上次结果' : ''}；请点击刷新重试。`
   } finally {
     if (cur === seq) lhbLoading.value = seatLoading.value = false
   }

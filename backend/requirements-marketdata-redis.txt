@@ -1,0 +1,2 @@
+# Optional shared market-data storage. The base image intentionally omits this.
+redis>=5.0,<8

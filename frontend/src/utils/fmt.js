@@ -33,13 +33,6 @@ export function fmtDT(iso) {
   return `${m[1]} ${m[2]}`
 }
 
-// 同日新闻列表:只显示 'HH:mm'
-export function fmtTimeShort(iso) {
-  const s = String(iso || '').replace('T', ' ')
-  const m = s.match(/^\d{4}-\d{2}-\d{2} (\d{2}:\d{2})/)
-  return m ? m[1] : (iso || '-')
-}
-
 // 股票名清理:去掉 XD/XR/DR 除权除息前缀(显示用)
 export function cleanName(name) {
   return String(name || '').replace(/^(XD|XR|DR)/, '')

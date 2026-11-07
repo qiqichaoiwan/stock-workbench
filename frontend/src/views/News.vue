@@ -5,8 +5,10 @@
         <span>新闻甄别流(低频采集 · 规则过滤日内噪声 · 服务赛道确认,不作入场依据)</span>
         <span class="grow" />
         <el-switch v-model="screenedOnly" active-text="仅甄别通过" @change="load" />
+        <el-button size="small" :loading="loading" @click="load">刷新</el-button>
       </div>
     </template>
+    <el-alert v-if="loadError" type="error" :title="loadError" :closable="false" show-icon />
     <el-table :data="pagedRows" size="small" v-loading="loading" max-height="620" stripe border>
       <el-table-column label="时间" width="150">
         <template #default="{ row }">{{ fmtDT(row.publish_time) }}</template>
@@ -34,7 +36,7 @@
         </template>
       </el-table-column>
     </el-table>
-    <el-empty v-if="!loading && !rows.length" description="暂无新闻" :image-size="60">
+    <el-empty v-if="!loading && !loadError && !rows.length" description="暂无新闻" :image-size="60">
       <template #description>
         <p>暂无新闻,请先在任务中心运行「{{ taskName('news') }}」后可见</p>
         <p class="muted" style="font-size:12px">交易日 11:40 / 14:40 低频采集;若开启「仅甄别通过」仍为空,可关掉开关确认是否连噪声也没有</p>
@@ -57,6 +59,7 @@ import { taskName } from '../utils/tasks'
 const rows = ref([])
 const screenedOnly = ref(true)
 const loading = ref(false)
+const loadError = ref('')
 const page = ref(1)
 const pageSize = 20
 let loadSeq = 0
@@ -65,12 +68,21 @@ const pagedRows = computed(() => rows.value.slice((page.value - 1) * pageSize, p
 async function load() {
   const seq = (loadSeq += 1)
   loading.value = true
+  loadError.value = ''
+  rows.value = []
   try {
     const data = await api.get('/api/screener/news',
       { params: { screened_only: screenedOnly.value, limit: 200 }, silent: true })
     if (seq !== loadSeq) return // 竞态:丢弃过期响应
-    rows.value = Array.isArray(data) ? data : (data?.items || data?.data || [])
+    const items = Array.isArray(data) ? data : (data?.items || data?.data)
+    if (!Array.isArray(items)) throw new Error('invalid news response')
+    rows.value = items
     page.value = 1
+  } catch {
+    if (seq === loadSeq) {
+      rows.value = []
+      loadError.value = '新闻读取失败，请点击刷新重试。'
+    }
   } finally {
     if (seq === loadSeq) loading.value = false
   }

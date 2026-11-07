@@ -4,7 +4,6 @@
 """
 import json
 import logging
-import threading
 from datetime import date, datetime
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
@@ -18,6 +17,7 @@ from ..shared.json_guard import bounded_json
 from ..screener import dual_core, industry_monitor, market_regime, news_monitor, \
     strategy_engine, technical_signal, universe_manager
 from ..shared import data_gateway as dg
+from ..shared.quote_fetch import bounded_get_spot_quotes, stream_quality_at_age
 from ..shared.security import current_user_id, require_analyst
 from ..task_runner import TASKS, run_task
 from .lhb_match import filter_hot_money, match_seats, normalize_matched
@@ -78,6 +78,15 @@ def _stock_names(db: Session, codes: set[str] | list[str] | None = None) -> dict
     return dict(db.execute(q).all())
 
 
+def _json_or_default(raw, default):
+    """读取历史 JSON 字段时逐行降级，避免一条脏记录拖垮整页接口。"""
+    try:
+        value = json.loads(raw or "")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+    return value if isinstance(value, type(default)) else default
+
+
 # ---------- 驾驶舱（独立实时缓存，不写数据库） ----------
 
 @router.get("/cockpit/market")
@@ -92,6 +101,23 @@ def cockpit_news(user_id: int = Depends(current_user_id)):
     from . import cockpit
 
     return cockpit.news()
+
+
+@router.get("/cockpit/session")
+def cockpit_session(user_id: int = Depends(current_user_id)):
+    """Return only the market session badge used by the application shell.
+
+    The navigation shell polls this endpoint periodically.  Keeping it
+    separate from ``/cockpit/market`` prevents every heartbeat from starting
+    four minute feeds, a full index snapshot, and fund-flow refreshes.  The
+    calendar loader remains singleflight cached inside :mod:`cockpit`, so a
+    cold request is still bounded and returns a loading/unverified state while
+    the background refresh is in progress.
+    """
+    from . import cockpit
+
+    now = cockpit._now()
+    return {"session": cockpit._session(now), "server_time": now.isoformat()}
 
 
 # ---------- 仪表盘 ----------
@@ -139,7 +165,7 @@ def market_states(limit: int = 60, user_id: int = Depends(current_user_id),
              "cycle_stage": r.cycle_stage, "position_range": r.position_range,
              "breadth": r.breadth, "amount_pct_60d": r.amount_pct_60d,
              "valuation_pct": r.valuation_pct, "margin_ratio": r.margin_ratio,
-             "score": json.loads(r.score_json or "{}")} for r in rows]
+             "score": _json_or_default(r.score_json, {})} for r in rows]
 
 
 # ---------- 选股池 ----------
@@ -151,13 +177,25 @@ POOL_QUOTE_REALTIME_MAX_AGE = 90.0
 
 
 def _quote_session(now: datetime) -> str:
-    """A股连续竞价时段(北京时间):09:30–11:30、13:00–15:00;其余为收盘。"""
-    if now.weekday() >= 5:
-        return "closed"
-    minute = now.hour * 60 + now.minute
-    if 570 <= minute <= 690 or 780 <= minute <= 900:
-        return "trading"
-    return "closed"
+    """Return a calendar-verified quote session, or ``unknown``.
+
+    A weekday is not sufficient for A shares because exchange holidays move
+    every year.  Unknown/stale calendar data must never be labelled as an open
+    session by a quote endpoint.
+    """
+    try:
+        from . import cockpit
+
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=CN)
+        else:
+            now = now.astimezone(CN)
+        session = cockpit._session(now)
+        if not session.get("calendar_verified"):
+            return "unknown"
+        return "trading" if session.get("state") == "trading" else "closed"
+    except Exception:  # noqa: BLE001 - quote endpoint remains available
+        return "unknown"
 
 
 def _quote_number(value, digits: int = 2):
@@ -195,39 +233,101 @@ def pool_quotes(pool_type: str = "main", track_id: int | None = None,
     source, error = "unavailable", None
     snapshot_at: str | None = None
     snapshot_age: float | None = None
+    stream_codes: set[str] = set()
+    # 已授权/已配置的推送源优先于公共轮询源；best_effort/延迟事件仍可展示，
+    # 但 realtime 只由质量门禁明确授权的事件产生。
+    try:
+        from ..config import settings
+        if settings.marketdata_stream_enabled:
+            from ..marketdata import get_hub
+            stream = get_hub().snapshot(codes)
+            for code, event in (stream.get("items") or {}).items():
+                if event.get("quality") not in {"realtime", "best_effort", "delayed"}:
+                    continue
+                price = _quote_number(event.get("price"), 3)
+                if price is None or price <= 0:
+                    continue
+                stream_codes.add(code)
+                spot[code] = {
+                    "price": price,
+                    "pct_chg": _quote_number(event.get("pct_chg")),
+                    "quote_at": event.get("provider_time"),
+                    "quote_source": event.get("provider"),
+                    "quote_kind": "stream",
+                    "quote_quality": event.get("quality"),
+                    "sequence": event.get("sequence"),
+                    "provider_sequence": event.get("provider_sequence"),
+                    "sequence_contiguous": event.get("sequence_contiguous"),
+                    "pct_chg_source": event.get("pct_chg_source"),
+                    "pct_chg_reference_at": event.get("pct_chg_reference_at"),
+                    "pct_chg_reference_price": event.get("pct_chg_reference_price"),
+                    "realtime": event.get("quality") == "realtime",
+                    "realtime_max_age_seconds": stream.get("max_age_seconds"),
+                    "delayed_max_age_seconds": stream.get("delayed_max_age_seconds"),
+                    "age_seconds": event.get("age_seconds"),
+                }
+                if snapshot_at is None or str(event.get("provider_time") or "") > snapshot_at:
+                    snapshot_at = event.get("provider_time")
+                    snapshot_age = event.get("age_seconds")
+            if stream_codes:
+                providers = sorted({str(item.get("quote_source")) for item in spot.values()
+                                    if item.get("quote_source")})
+                source = " / ".join(providers) or "stream"
+    except Exception as exc:  # noqa: BLE001 推送缓存故障不能阻塞公共降级链
+        log.warning("marketdata stream unavailable: %s", exc)
+        error = "stream_unavailable"
     if codes:
-        box: dict = {}
-
-        def fetch():
-            try:
-                quotes, origin, taken_at, age = dg.get_spot_quotes(codes)
-                box.update(quotes=quotes, source=origin,
-                           snapshot_at=taken_at, age=age)
-            except Exception as exc:  # noqa: BLE001 行情失败必须降级为缺失
-                box["error"] = str(exc)[:160]
-                log.warning("pool quotes failed: %s", exc)
-
-        worker = threading.Thread(target=fetch, name="pool-quotes", daemon=True)
-        worker.start()
-        worker.join(POOL_QUOTE_WAIT_SECONDS)
-        if worker.is_alive():
-            error = "quote_timeout"
-        elif box.get("error"):
-            error = "quote_failed"
-        else:
-            spot = box.get("quotes") or {}
-            source = box.get("source") or "unavailable"
-            snapshot_at = box.get("snapshot_at")
-            snapshot_age = box.get("age")
+        pending_stream = [code for code in codes if code not in stream_codes]
+        fetched, public_error = bounded_get_spot_quotes(
+            pending_stream, timeout=POOL_QUOTE_WAIT_SECONDS) if pending_stream else (None, None)
+        if fetched:
+            public_spot, public_source, public_snapshot_at, public_snapshot_age = fetched
+            spot.update(public_spot)
+            source = (f"{source} / {public_source}" if source not in {"unavailable", public_source}
+                      else public_source)
+            if snapshot_at is None:
+                snapshot_at, snapshot_age = public_snapshot_at, public_snapshot_age
+        if public_error:
+            error = public_error
+    now = datetime.now(CN)
+    session = _quote_session(now)
     items: dict[str, dict] = {}
     for code, quote in spot.items():
         if code in codes:
-            items[code] = {**quote, "quote_source": source, "quote_kind": "spot"}
+            # 每只股票独立核验来源时间。采集时刻、批次中其他股票的时间都不能替代。
+            age = None
+            try:
+                at = datetime.fromisoformat(quote.get("quote_at") or "")
+                if at.tzinfo is not None:
+                    age = (now - at.astimezone(CN)).total_seconds()
+                    if age < 0:
+                        age = None
+            except (ValueError, TypeError):
+                pass
+            if quote.get("quote_kind") == "stream":
+                quote["quote_quality"] = stream_quality_at_age(
+                    quote.get("quote_quality"), age, quote.get("realtime_max_age_seconds"),
+                    quote.get("delayed_max_age_seconds"))
+                realtime = quote["quote_quality"] == "realtime" and session == "trading"
+            else:
+                limit = POOL_QUOTE_REALTIME_MAX_AGE
+                quote["realtime_max_age_seconds"] = limit
+                quote["delayed_max_age_seconds"] = limit
+                realtime = session == "trading" and age is not None and age <= limit
+            items[code] = {**quote, "quote_source": quote.get("quote_source") or source,
+                           "quote_kind": quote.get("quote_kind", "spot"),
+                           "realtime": realtime, "age_seconds": age}
     pending = [code for code in codes if code not in items]
     if pending:
+        try:
+            cutoff = dg.completed_trade_day()
+        except Exception:  # 日历不可用时不能猜测已完成交易日
+            cutoff = None
+            error = error or "calendar_unavailable"
         rows = db.execute(select(DailyQuote.code, DailyQuote.trade_date,
                                  DailyQuote.close, DailyQuote.pct_chg)
-                          .where(DailyQuote.code.in_(pending))
+                          .where(DailyQuote.code.in_(pending),
+                                 DailyQuote.trade_date <= cutoff if cutoff else False)
                           .order_by(DailyQuote.code, DailyQuote.trade_date.desc())).all()
         seen: set[str] = set()
         for code, trade_date, close, pct in rows:
@@ -244,15 +344,15 @@ def pool_quotes(pool_type: str = "main", track_id: int | None = None,
                            "quote_source": "stored_daily", "quote_kind": "stored"}
     missing = [code for code in codes if code not in items]
     counts = {"total": len(codes),
-              "spot": sum(1 for item in items.values() if item["quote_kind"] == "spot"),
+              "spot": sum(1 for item in items.values()
+                           if item["quote_kind"] in {"spot", "stream"}),
               "stored": sum(1 for item in items.values() if item["quote_kind"] == "stored"),
               "missing": len(missing)}
-    session = _quote_session(now)
-    # 只有交易时段、且快照足够新才敢标「实时」;过期缓存仅标注延迟,不冒充实时
-    fresh = snapshot_age is not None and snapshot_age <= POOL_QUOTE_REALTIME_MAX_AGE
+    realtime_count = sum(1 for item in items.values() if item.get("realtime"))
     return {"as_of": now.isoformat(), "session": session,
             "snapshot_at": snapshot_at, "snapshot_age_seconds": snapshot_age,
-            "realtime": counts["spot"] > 0 and session == "trading" and fresh,
+            "realtime": bool(codes) and realtime_count == len(codes),
+            "realtime_count": realtime_count,
             "source": source, "items": items, "missing": missing,
             "counts": counts, "errors": [error] if error else []}
 
@@ -269,7 +369,7 @@ def pool(pool_type: str = "main", track_id: int | None = None,
     return [{"id": r.id, "code": r.code, "name": r.name, "rating": r.rating,
              "score": r.score, "in_price": r.in_price,
              "trade_date": r.trade_date.isoformat(),
-             "reasons": json.loads(r.reasons or "[]"),
+             "reasons": _json_or_default(r.reasons, []),
              "track_id": r.track_id} for r in rows]
 
 
@@ -655,8 +755,12 @@ def lhb(trade_date: str | None = None, limit: int = 50,
                  "trade_date": r.trade_date.isoformat(),
                  "matched_traders": _lhb_matched(r, seats_map)}
                 for r in rows]
-    except Exception:  # noqa: BLE001 无数据/老库缺表一律 [] 不 500
-        return []
+    except Exception as exc:  # noqa: BLE001
+        # An empty result is a valid "no board today" state.  A query or
+        # schema failure is different and must remain observable to the UI so
+        # it can show a retry/error state instead of claiming there was no data.
+        log.exception("lhb query failed")
+        raise HTTPException(503, "龙虎榜查询失败，数据库服务暂时不可用，请稍后重试") from exc
 
 
 @router.get("/hot-money-seats")
@@ -701,7 +805,7 @@ def signals(trade_date: str | None = None, signal_type: str | None = None,
     return [{"id": r.id, "code": r.code, "name": names.get(r.code, ""),
              "trade_date": r.trade_date.isoformat(),
              "signal_type": r.signal_type, "strength": r.strength,
-             "detail": json.loads(r.detail or "{}")} for r in rows]
+             "detail": _json_or_default(r.detail, {})} for r in rows]
 
 
 @router.get("/news")
@@ -896,7 +1000,7 @@ def strategy_cards(user_id: int = Depends(current_user_id), db: Session = Depend
     rows = db.execute(select(StrategyCard).order_by(StrategyCard.card_code)).scalars().all()
     return [{"id": r.id, "card_code": r.card_code, "title": r.title,
              "status": r.status, "hypothesis": r.hypothesis,
-             "evidence": json.loads(r.evidence or "{}"),
+             "evidence": _json_or_default(r.evidence, {}),
              "source_note": r.source_note, "review_note": r.review_note}
             for r in rows]
 

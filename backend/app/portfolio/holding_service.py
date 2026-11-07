@@ -8,7 +8,7 @@ G03 引擎(代码硬规则,不可被 AI 覆盖):
   执行   收盘确认、次日开盘执行;跳空越过止损线按开盘价处理(T+1/涨跌停意识)
 """
 import logging
-from datetime import date, timedelta
+from datetime import date
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -85,7 +85,7 @@ def update_daily(db: Session, user_id: int | None = None,
       日报一律走 report_service._alerts 只读计算。
     - 行情统一截止 completed_trade_day(经 stock_ref.latest_quote_date/
       latest_close/quote_history/atr14 的 as-of 过滤),禁止偷看未来;
-      长期停牌(>5天无有效收盘,qd < trade_date-5d)跳过,不推进止损。
+      行情不是指定收盘日或早于买入日时跳过,不推进止损。
     G03 相位(代码硬规则,不可被 AI 覆盖):
     - A:初始止损,禁止上移、禁止放宽;仅 _stage_b_reached 命中才晋升 B。
     - B:止损=真实保本价;当 trail(percent/ATR 取高) > 保本价时晋升 C 并抬止损到 trail。
@@ -93,7 +93,7 @@ def update_daily(db: Session, user_id: int | None = None,
       "stop > be 则晋升 C" 永不成立,G03 卡死在 B;现改为直接比较 trail > be。)
     - C:按 trail 持续抬升,只上不下,永不回退 A/B。
     """
-    trade_date = trade_date or stock_ref.latest_quote_date(db)
+    trade_date = trade_date or stock_ref.dg.completed_trade_day()
     if trade_date is None:
         return []
     alerts: list[dict] = []
@@ -106,8 +106,10 @@ def update_daily(db: Session, user_id: int | None = None,
         if latest is None:
             continue
         qd, close = latest
-        if qd < trade_date - timedelta(days=5):
-            continue  # 长期停牌:无有效收盘,跳过不推进止损,避免脏数据误触发
+        if qd < h.buy_date:
+            continue  # 买入前的行情不能驱动持仓止损或生成持仓风险提醒
+        if qd != trade_date:
+            continue  # 今日收盘缺失或停牌，不使用旧行情推进止损
         # 持仓期最高价只统计建仓日(含)以来的行情:若把买入前的前高算进来,
         # B/C 阶段的 trail 止损可能高于现价,导致"建仓即触发止损"的误报。
         since_buy = stock_ref.max_high_since(db, h.code, h.buy_date, as_of=trade_date)
@@ -197,9 +199,15 @@ def holdings_view(db: Session, user_id: int) -> list[dict]:
     result = []
     for h in db.execute(select(Holding).where(
             Holding.user_id == user_id, Holding.status == "holding")).scalars():
-        latest = stock_ref.latest_close(db, h.code)
-        close = latest[1] if latest else h.buy_price
-        unrealized = (close / h.breakeven_price - 1) * 100 if h.breakeven_price else 0
+        try:
+            latest = stock_ref.latest_close(db, h.code)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("holding quote unavailable for %s: %s", h.code, type(exc).__name__)
+            latest = None
+        if latest and latest[0] < h.buy_date:
+            latest = None
+        close = latest[1] if latest else None
+        unrealized = (close / h.breakeven_price - 1) * 100 if close is not None and h.breakeven_price else None
         rating_ref = stock_ref.pool_rating(db, h.code)
         result.append({
             "id": h.id, "code": h.code, "name": h.name, "quantity": h.quantity,
@@ -208,9 +216,9 @@ def holdings_view(db: Session, user_id: int) -> list[dict]:
             "stop_price": h.stop_price, "stop_stage": h.stop_stage, "stop_rule": h.stop_rule,
             "highest_price": h.highest_price, "risk_r": h.risk_r,
             "take_profit_price": h.take_profit_price,
-            "close": close,
-            "unrealized_pct": round((close / h.buy_price - 1) * 100, 2),
-            "unrealized_vs_breakeven_pct": round(unrealized, 2),
+            "close": close, "quote_at": latest[0].isoformat() if latest else None,
+            "unrealized_pct": round((close / h.buy_price - 1) * 100, 2) if close is not None else None,
+            "unrealized_vs_breakeven_pct": round(unrealized, 2) if unrealized is not None else None,
             "at_risk": bool(latest and close <= h.stop_price),
             "pool_rating": rating_ref,
             "note": h.note,

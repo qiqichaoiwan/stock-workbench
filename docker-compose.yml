@@ -6,11 +6,13 @@
 # - 数据备份:data/selectmoney.db(+ -wal/-shm)在 ./data 卷。建议宿主机 cron 每日:
 #     sqlite3 ./data/selectmoney.db ".backup './data/backup-$(date +%F).db'"
 #   保留 7 天;恢复前先停容器(docker compose stop)再整体拷回,不要热覆盖。
-# - 健康检查:/api/health;调度器靠 APScheduler 进程内单例,容器重启即重建,
+# - 健康检查:/api/ready(含数据库);调度器靠 APScheduler 进程内单例,容器重启即重建,
 #   zombie running 行由 cleanup_zombie_tasks 自愈。
 services:
   stock-workbench:
-    build: .
+    build:
+      context: .
+      target: app
     container_name: stock-workbench
     restart: unless-stopped
     ports:
@@ -31,13 +33,101 @@ services:
       - FETCH_TIMEOUT_SECONDS=${FETCH_TIMEOUT_SECONDS:-60}
       - FETCH_RETRY_TIMES=${FETCH_RETRY_TIMES:-3}
       - FETCH_RETRY_WAIT_SECONDS=${FETCH_RETRY_WAIT_SECONDS:-5}
+      # 可选推送行情层:默认关闭。启用前请先确认供应商授权、单租户范围与共享存储。
+      - MARKETDATA_STREAM_ENABLED=${MARKETDATA_STREAM_ENABLED:-false}
+      # API is a read-only consumer; only marketdata-worker owns OpenD.
+      - MARKETDATA_PROCESS_ROLE=api
+      - MARKETDATA_SINGLE_TENANT=${MARKETDATA_SINGLE_TENANT:-false}
+      - MARKETDATA_AUTHORIZED_PROVIDERS=${MARKETDATA_AUTHORIZED_PROVIDERS:-}
+      - MARKETDATA_INGEST_TOKEN=${MARKETDATA_INGEST_TOKEN:-}
+      - MARKETDATA_SYMBOLS=${MARKETDATA_SYMBOLS:-}
+      # 行情 worker/API 拆分时使用共享 Redis；默认 memory 仅适合单进程试运行。
+      # 这不会解除 SQLite 业务库的单写限制，整应用扩展仍需先切 PostgreSQL/MySQL。
+      - MARKETDATA_STORAGE_MODE=${MARKETDATA_STORAGE_MODE:-memory}
+      - MARKETDATA_REDIS_URL=${MARKETDATA_REDIS_URL:-}
+      - MARKETDATA_REDIS_PREFIX=${MARKETDATA_REDIS_PREFIX:-stock-workbench:marketdata}
+      - MARKETDATA_REDIS_STREAM_MAXLEN=${MARKETDATA_REDIS_STREAM_MAXLEN:-100000}
+      # The API never owns OpenD; the standalone worker is the sole connection
+      # owner.  Keep this false even when the worker profile is enabled.
+      # Hard-off in the API container: only marketdata-worker may own OpenD.
+      # Do not interpolate a shared FUTU_ENABLED variable here, otherwise an
+      # operator can accidentally make every API replica report a local Futu
+      # adapter as enabled.
+      - FUTU_ENABLED=false
+      - FUTU_OPEND_HOST=${FUTU_OPEND_HOST:-127.0.0.1}
+      - FUTU_OPEND_PORT=${FUTU_OPEND_PORT:-11111}
+      - FUTU_MAX_SYMBOLS=${FUTU_MAX_SYMBOLS:-100}
       # 后台任务全局并发上限(默认 3,超限 API 转 409)
       - MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-3}
       # 生产前后端分离部署时显式配置,如 CORS_ORIGINS=https://app.example.com
       - CORS_ORIGINS=${CORS_ORIGINS:-}
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health',timeout=5)"]
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/ready',timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  # Optional single-tenant Futu OpenD bridge.  Start this profile only after
+  # confirming the account's A-share quote rights and Redis configuration:
+  #   docker compose --profile marketdata up -d --build
+  # OpenD normally runs on the host; override FUTU_OPEND_HOST when it runs in
+  # another service or machine.  The worker writes only to Redis and never
+  # touches the business SQLite file.
+  marketdata-worker:
+    build:
+      context: .
+      target: futu-worker
+    profiles: ["marketdata"]
+    restart: unless-stopped
+    depends_on:
+      marketdata-redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - TZ=Asia/Shanghai
+      - MARKETDATA_STREAM_ENABLED=true
+      - MARKETDATA_PROCESS_ROLE=worker
+      - MARKETDATA_SINGLE_TENANT=true
+      - MARKETDATA_STORAGE_MODE=redis
+      - MARKETDATA_REDIS_URL=${MARKETDATA_REDIS_URL:-redis://marketdata-redis:6379/2}
+      - MARKETDATA_REDIS_PREFIX=${MARKETDATA_REDIS_PREFIX:-stock-workbench:marketdata}
+      - MARKETDATA_REDIS_STREAM_MAXLEN=${MARKETDATA_REDIS_STREAM_MAXLEN:-100000}
+      - MARKETDATA_AUTHORIZED_PROVIDERS=${MARKETDATA_AUTHORIZED_PROVIDERS:-}
+      # The worker validates an empty symbol list at startup; keeping this
+      # interpolation optional lets `docker compose config` work without the
+      # profile's production secrets.
+      - MARKETDATA_SYMBOLS=${MARKETDATA_SYMBOLS:-}
+      - FUTU_ENABLED=true
+      - FUTU_OPEND_HOST=${FUTU_OPEND_HOST:-host.docker.internal}
+      - FUTU_OPEND_PORT=${FUTU_OPEND_PORT:-11111}
+      - FUTU_MAX_SYMBOLS=${FUTU_MAX_SYMBOLS:-100}
+      - FUTU_RECONNECT_MAX_BACKOFF=${FUTU_RECONNECT_MAX_BACKOFF:-30}
+    command: ["python", "scripts/marketdata_worker.py"]
+    healthcheck:
+      test: ["CMD", "python", "scripts/marketdata_worker_health.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # 可选免费共享行情存储。启用前在 .env 设置
+  # MARKETDATA_STORAGE_MODE=redis
+  # MARKETDATA_REDIS_URL=redis://marketdata-redis:6379/2，随后执行：
+  # docker compose --profile marketdata up -d
+  marketdata-redis:
+    image: redis:7-alpine
+    profiles: ["marketdata"]
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - marketdata-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  marketdata-redis-data:

@@ -17,13 +17,11 @@ README.md
 **/.pytest_cache
 backend/.venv
 backend/venv
+.venv
+venv
+**/node_modules
 # backend/data contains required versioned seed assets; keep it in images.
 
-# 前端源码与依赖(镜像只需要 frontend/dist)
+# 前端依赖和本机构建产物不进入上下文;镜像自行构建前端。
 frontend/node_modules
-frontend/src
-frontend/public
-frontend/index.html
-frontend/package.json
-frontend/package-lock.json
-frontend/vite.config.js
+frontend/dist

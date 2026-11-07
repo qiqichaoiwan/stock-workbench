@@ -8,8 +8,8 @@
 单位与复权约定(落库前统一,下游可直接使用):
 - 日线 OHLC/close: 各源均为**前复权**(akshare adjust="qfq" / baostock adjustflag="2" /
   腾讯/新浪 adjust="qfq");除权除息导致的跳空已由源端消除,禁止二次复权。
-- volume(成交量): 统一为**股**。akshare 东财/新浪/腾讯各源返回**手**(1 手=100 股),
-  本模块统一 ×100;baostock 返回**股**,保持不变。见 _normalise_volume。
+- volume(成交量): 统一为**股**。东财历史/腾讯历史的手数需 ×100；新浪历史和
+  baostock 已是股，保持不变。见 _normalise_volume。
 - amount(成交额): 统一为**元**;total_mv/circ_mv 统一为**亿元**。见
   _normalise_amount/_normalise_market_cap,量级不符直接抛错不入库。
 - pct_chg 缺失的源(sina/tx 个别版本)由同一前复权 close 推导,与源端口径一致(%)。
@@ -229,11 +229,28 @@ def get_trade_calendar(start: str | None = None, end: str | None = None) -> list
 
 
 def is_trade_day(d: date | None = None) -> bool:
+    """Return whether *d* is an exchange trading day.
+
+    The calendar is an integrity gate for writes and scheduled jobs.  A
+    failed or unavailable calendar must therefore fail closed: treating a
+    weekday as a trading day can write a snapshot against the wrong date and
+    advance downstream indicators.  Callers that need to distinguish
+    ``unknown`` from a verified holiday should call :func:`get_trade_calendar`
+    directly and handle its exception; this boolean helper intentionally
+    exposes the safe ``False`` result to existing call sites.
+    """
     d = d or today()
     try:
-        return d in set(get_trade_calendar(d.strftime("%Y%m%d"), d.strftime("%Y%m%d")))
-    except Exception:  # 日历失败按工作日近似
-        return d.weekday() < 5
+        days = get_trade_calendar(d.strftime("%Y%m%d"), d.strftime("%Y%m%d"))
+    except Exception as exc:  # noqa: BLE001 - calendar gates must fail closed
+        log.warning("trade calendar unavailable for %s; fail closed: %s", d, exc)
+        return False
+    # An empty result is not evidence of a holiday.  It means the provider
+    # could not verify the date, and must be handled the same way as failure.
+    if not days:
+        log.warning("trade calendar returned no dates for %s; fail closed", d)
+        return False
+    return d in set(days)
 
 
 def prev_trade_day(d: date | None = None, n: int = 1) -> date:
@@ -552,7 +569,7 @@ def _sina_symbol(code: str) -> str:
 
 @resilient("daily_hist_sina", v8=True)
 def _daily_hist_sina(code: str, start: str, end: str) -> pd.DataFrame:
-    """第三源:新浪个股日线(**前复权**,adjust="qfq";成交量**手**→统一为股)。
+    """第三源:新浪个股日线(**前复权**,adjust="qfq";成交量单位为股)。
 
     本机对东财限流时的主力回填源。新浪 variants 可能缺 pct_change 列,
     此时由同一前复权 close 推导(与源端口径一致,%)。"""
@@ -565,7 +582,10 @@ def _daily_hist_sina(code: str, start: str, end: str) -> pd.DataFrame:
     # 新浪 variants may omit pct_change; derive it from the same adjusted close.
     if "pct_chg" not in df.columns or df["pct_chg"].isna().all():
         df["pct_chg"] = pd.to_numeric(df["close"], errors="coerce").pct_change().fillna(0.0) * 100
-    df["volume"] = df["volume"].map(lambda x: _normalise_volume(x, "sina", lot_source=True))
+    df["volume"] = df["volume"].map(lambda x: _normalise_volume(x, "sina", lot_source=False))
+    # akshare 的新浪历史 turnover 是 volume / outstanding_share 的比例，
+    # 而策略和其它行情源均以百分数表示。
+    df["turnover"] = pd.to_numeric(df["turnover"], errors="coerce") * 100
     s = datetime.strptime(start, "%Y%m%d").date()
     e = datetime.strptime(end, "%Y%m%d").date()
     df = df[(df["trade_date"] >= s) & (df["trade_date"] <= e)]
@@ -603,9 +623,24 @@ def get_daily_history(code: str, start: str, end: str | None = None,
       历史回填逐股请求时不再为东财重试白等 30s+。
     """
     end = end or today().strftime("%Y%m%d")
+
+    def usable(df: pd.DataFrame | None) -> bool:
+        """Treat an empty provider response as a failed attempt.
+
+        Providers occasionally return an empty frame for a transient gap (or
+        because a non-trading date was requested). Returning that frame as a
+        successful source prevents the fallback chain from trying a healthy
+        provider and makes a temporary outage look like permanent missing
+        history to callers.
+        """
+        return df is not None and not df.empty
+
     if source == "backfill":
         try:
-            return _daily_hist_sina(code, start, end), "sina"
+            df = _daily_hist_sina(code, start, end)
+            if usable(df):
+                return df, "sina"
+            log.warning("daily sina returned no rows for %s", code)
         except Exception as exc:  # noqa: BLE001
             log.warning("daily sina failed for %s: %s", code, exc)
         try:
@@ -618,8 +653,10 @@ def get_daily_history(code: str, start: str, end: str | None = None,
     if source in ("auto", "akshare") and not _cooldown_check("daily_hist_ak"):
         try:
             df = _daily_hist_ak(code, start, end)
-            _cooldown_clear("daily_hist_ak")
-            return df, "akshare"
+            if usable(df):
+                _cooldown_clear("daily_hist_ak")
+                return df, "akshare"
+            log.warning("daily akshare returned no rows for %s", code)
         except Exception as exc:  # noqa: BLE001
             log.warning("daily akshare failed for %s: %s", code, exc)
             _cooldown_set("daily_hist_ak")  # 东财限流后冷却(见 _SOURCE_COOLDOWN_SECONDS)
@@ -628,16 +665,21 @@ def get_daily_history(code: str, start: str, end: str | None = None,
     if source in ("auto", "tx"):
         try:
             df = _daily_hist_tx(code, start, end)
-            if not df.empty:
+            if usable(df):
                 return df, "tx"
+            log.warning("daily tx returned no rows for %s", code)
         except Exception as exc:  # noqa: BLE001
             log.warning("daily tx failed for %s: %s", code, exc)
     if source in ("auto", "sina"):
         try:
-            return _daily_hist_sina(code, start, end), "sina"
+            df = _daily_hist_sina(code, start, end)
+            if usable(df):
+                return df, "sina"
+            log.warning("daily sina returned no rows for %s", code)
         except Exception as exc:  # noqa: BLE001
             log.warning("daily sina failed for %s: %s", code, exc)
-    return _daily_hist_bs(code, start, end), "baostock"
+    df = _daily_hist_bs(code, start, end)
+    return df, "baostock"
 
 
 @resilient("index_daily_em")
@@ -706,10 +748,15 @@ def get_index_daily_with_source(index_code: str, start: str,
             continue
         try:
             df = fn(index_code, start, end)
-            if len(df) >= 30:
+            # The requested interval may intentionally be shorter than 30
+            # sessions (for example a single-day refresh). History length is
+            # a caller concern; this gateway only rejects an empty or
+            # structurally invalid provider response.
+            required = {"trade_date", "open", "high", "low", "close", "amount"}
+            if len(df) > 0 and required.issubset(df.columns):
                 _cooldown_clear(fn.__name__)
                 return df, source_names.get(fn.__name__, fn.__name__)
-            last_err = RuntimeError(f"{fn.__name__}: only {len(df)} rows")
+            last_err = RuntimeError(f"{fn.__name__}: empty or invalid response ({len(df)} rows)")
         except Exception as exc:  # noqa: BLE001
             last_err = exc
             _cooldown_set(fn.__name__)
@@ -1107,16 +1154,27 @@ def _fetch_sina_batch_quotes(codes: set[str]) -> tuple[dict[str, dict], str | No
                 amount = float(fields[9])
             except (TypeError, ValueError):
                 continue
+            try:
+                open_price = float(fields[1])
+            except (TypeError, ValueError):
+                open_price = 0.0
+            try:
+                volume = float(fields[8])
+            except (TypeError, ValueError):
+                volume = 0.0
             if price <= 0:
                 continue
             pct_chg = round((price / prev_close - 1) * 100, 2) if prev_close > 0 else None
             quotes[code] = {
                 "price": round(price, 3),
+                "open": round(open_price, 3) if open_price > 0 else None,
                 "pct_chg": pct_chg,
                 "high": round(high, 3) if high > 0 else None,
                 "low": round(low, 3) if low > 0 else None,
                 "amount": round(amount, 0) if amount > 0 else None,
+                "volume": volume if volume > 0 else None,
                 "turnover": None,  # 新浪批量报价不含换手率
+                "quote_at": f"{fields[30]}T{fields[31]}+08:00" if fields[30] and fields[31] else None,
             }
             if fields[30] and fields[31]:
                 stamps.add(f"{fields[30]}T{fields[31]}+08:00")

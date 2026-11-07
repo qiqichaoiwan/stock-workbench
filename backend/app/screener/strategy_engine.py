@@ -323,9 +323,9 @@ def hard_filter(df: pd.DataFrame, params: dict[str, str],
         & (df["ocf_to_profit"].isna() | (df["ocf_to_profit"] >= cash_min))
         & (df["debt_ratio"].isna() | (df["debt_ratio"] < float(params["debt_max"])))
         & (df["gross_margin"].isna() | (df["gross_margin"] >= gm_min))
-        # 换手率=0 视为数据源缺字段(优雅降级),有值时才执行区间过滤
-        & (df["turnover"].isna() | (df["turnover"] <= 0)
-           | df["turnover"].between(float(params["turnover_low"]), float(params["turnover_high"])))
+        # 无有效换手率不能视为通过流动性筛选。
+        & (df["turnover"].notna() & (df["turnover"] > 0)
+           & df["turnover"].between(float(params["turnover_low"]), float(params["turnover_high"])))
         & (df["mom20"].isna() | (df["mom20"] < mom_max))
         & ~df["crowd_avoid"].fillna(False)
         # 质量五维之 ROE 行业内分位(组内样本不足时分位为 NaN → 放行,由绝对阈值兜底)
@@ -391,7 +391,8 @@ def score_candidates(df: pd.DataFrame, params: dict[str, str],
         + 0.20 * s["val_score"]
         + 0.10 * _norm("mom20")
         + 0.10 * s["mv_fit"]
-        + 0.05 * s["pricing_power"].fillna(False).astype(float) * 100
+        # BooleanDtype avoids pandas' deprecated object downcast on fillna.
+        + 0.05 * s["pricing_power"].astype("boolean").fillna(False).astype(float) * 100
         + 0.10 * s["buy_setup"].astype(float) * 100
         + s.apply(lambda r: 5.0 if r["rs_strong"] else 0, axis=1)
         - s.apply(lambda r: 15.0 if r["rs_weak"] else 0, axis=1)

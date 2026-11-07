@@ -39,6 +39,33 @@
 - 前端:Vue3 + Element Plus + Pinia + vue-router + pypinyin(后端搜索索引)
 - 部署:Docker Compose 单容器(前端构建产物由 FastAPI 托管)
 
+实时行情接入边界、免费方案对比、质量门禁和授权源升级路径见
+[docs/REALTIME_SLA.md](docs/REALTIME_SLA.md)。免费公开源只作为 best-effort/降级源，不能宣称交易所级 SLA。
+
+### 实时行情试运行
+
+项目内置免费 GQuant Tick 桥接器、Futu OpenD 适配器和可选 Redis 共享快照。默认仍是单进程内存模式，
+适合本地试跑；生产最低成本方案是用 Futu OpenD 单租户 worker 写入 Redis，API 只读共享快照。免费
+GQuant 推送会显示为 `best_effort`，只有完成授权核验并加入 `MARKETDATA_AUTHORIZED_PROVIDERS` 的源才会显示为
+`realtime`。完整配置与启动命令见 [docs/REALTIME_SLA.md](docs/REALTIME_SLA.md)。
+
+```bash
+# .env 中配置强 JWT、Redis 模式、标的和 Futu OpenD 地址后启动
+MARKETDATA_STORAGE_MODE=redis
+MARKETDATA_REDIS_URL=redis://marketdata-redis:6379/2
+MARKETDATA_STREAM_ENABLED=true
+MARKETDATA_PROCESS_ROLE=api       # API 只读；独立 worker 使用 worker
+MARKETDATA_SINGLE_TENANT=true
+MARKETDATA_SYMBOLS=600000,000001,600519
+FUTU_OPEND_HOST=host.docker.internal
+FUTU_OPEND_PORT=11111
+FUTU_ENABLED=false                 # API 不连接 OpenD，避免重复订阅
+MARKETDATA_AUTHORIZED_PROVIDERS=futu # 确认账户权限后再填写
+
+docker compose --profile marketdata up -d --build
+docker compose logs -f marketdata-worker
+```
+
 ## 快速开始
 
 ### 本机开发
@@ -59,25 +86,37 @@ npm run dev        # 开发模式(5173,已代理 /api)
 npm run build      # 构建产物由 FastAPI 托管(8899 直接可用)
 ```
 
+首次登录后，先在任务中心运行「同步股票基础信息」，再在持仓或自选页输入股票代码。页面每 30 秒刷新行情，并显示每只股票的来源和行情时间；缺少可核验时间时显示为参考快照，源不可用时退回有日期的已落库收盘价或显示暂无行情。盘中自选提醒只使用时间可核验且新鲜的报价；数据源不可用时任务会报告降级，不保证触发提醒。免费公开数据源可能限流、延迟或不可用，行情并非交易所逐笔数据。
+
+如已取得授权推送源，可显式开启实时接入层：设置 `MARKETDATA_STREAM_ENABLED=true`、`MARKETDATA_INGEST_TOKEN`、`MARKETDATA_SYMBOLS`，并把完成授权核验的供应商加入 `MARKETDATA_AUTHORIZED_PROVIDERS`。系统会记录 provider_time、received_at、sequence、延迟和质量状态；没有授权、处于非交易时段或存在连续序列缺口时不会触发实时预警。序列缺口会持续标记为 delayed，直到供应商显式发送 `sequence_contiguous=true`/`sequence_resync=true` 证明已重同步，或运维重置 Hub；供应商不保证连续的 opaque 事件编号保留为 provider_sequence，不参与 gap 判定，但同一时间戳会按其单调顺序去重和排序。
+
+富途个人行情还必须设置 `MARKETDATA_SINGLE_TENANT=true`；多用户部署默认拒绝富途事件，避免把个人账户行情共享给其他租户。
+
+已有部署升级前请备份数据库和原密钥。旧版本删除用户可能留下无外键数据；升级仅修复此后的删除行为，历史数据需要先审计，不能仅凭用户 ID 安全判定其归属。
+
 ### 云服务器部署(Docker)
 
 ```bash
 git clone <本仓库> && cd 项目目录
-JWT_SECRET=$(python3 -c "import secrets;print(secrets.token_hex(32))") \
-FERNET_KEY=$(python3 -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())") \
+# 首次部署生成并安全保存 .env;后续部署复用,并将其纳入安全备份。
+umask 077
+if [ ! -e .env ]; then
+  printf 'JWT_SECRET=%s\nFERNET_KEY=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -base64 32 | tr '+/' '-_')" > .env
+fi
 docker compose up -d --build
 # 进入容器完成初始化
-docker exec -it selectmoney python scripts/init_data.py --admin-user admin --admin-password 你的密码 --backfill
+docker exec -it stock-workbench python scripts/init_data.py --admin-user admin --admin-password 你的密码 --backfill
 ```
 
 访问 `http://服务器IP:8000`。龙虎榜游资映射随镜像内置(`backend/data/hot_money_seats.json`)。
+镜像会自动构建前端。`.env` 包含敏感密钥,不要提交或公开;恢复数据库时同时恢复原密钥,更换 Fernet 密钥会使已保存的 LLM 密钥无法解密。
 
 ## 首次初始化顺序(任务中心或 CLI)
 
 1. `sync_members` 同步指数成分(候选域)
 2. `sync_basic` 股票基础信息
 3. `sync_tracks` / `tracks_backfill` 赛道成分(东财被墙时自动走降级链,见赛道管理"来源"列)
-4. `backfill_history` 历史日线回填(首次 5 年约 30-60 分钟;增量执行,已有日期自动跳过)
+4. `backfill_history` 历史日线回填(逐股联网，耗时取决于数量和数据源；增量追加前核验前复权基准)
 5. `sync_financials` 财务(近8报告期,point-in-time 公告日)
 6. `sync_indexes` / `lhb_sync` / `fund_flow` / `market_stat` 新模块数据
 7. 其余任务(估值/行业/商品/市场状态/信号/策略)可随时手动触发,此后由调度器自动运行
@@ -87,7 +126,7 @@ docker exec -it selectmoney python scripts/init_data.py --admin-user admin --adm
 | 时间 | 任务 |
 |---|---|
 | 09:00-14:30 每30分钟 | 盘中快照(候选域;9:00 在集合竞价前仅留痕) |
-| 09:35/10:05-13:35/14:05(各错峰1分钟) | fund_flow 板块资金流 + market_stat 大盘统计 + watch_alert 自选预警 |
+| 09:35/10:05-13:35/14:05/14:35(各错峰1分钟) | fund_flow 板块资金流 + market_stat 大盘统计 + watch_alert 自选预警 |
 | 11:40 / 14:40 | 新闻采集甄别 |
 | 15:35 / 15:45 | 收盘日线落库(带来源)/ 股票基础信息 |
 | 15:50 | 持仓巡检(G03 止损推进,唯一写入口) |
@@ -98,6 +137,8 @@ docker exec -it selectmoney python scripts/init_data.py --admin-user admin --adm
 | 周一 08:30/08:40 | 指数成分 / 赛道维护 |
 
 非交易日自动跳过;同名任务互斥,全局并发上限 `MAX_CONCURRENT_TASKS`(默认 3)。
+
+收盘日线任务有 120 秒等待预算，未处理或无法核验的股票会使任务显示降级，可重跑补齐；进程内轮转进度在重启后重置。前复权基准变化或旧行情不完整时，系统拒绝拼接新旧日线，持仓巡检也不会用过期收盘价推进止损。此时请先备份，在隔离库从可信来源重建并核验该股票完整历史及相关衍生指标，确认无误后停机切换；系统不会自动覆盖旧数据。
 
 ## 设计红线(来自回测教训,开发必读)
 
@@ -114,7 +155,7 @@ docker exec -it selectmoney python scripts/init_data.py --admin-user admin --adm
 - LLM Base URL 服务端 SSRF 校验(字面 IP + 域名解析结果双重校验,禁内网/环回/链路本地)
 - 多租户隔离:用户数据强制 user_id 过滤;Screener 无用户概念
 - SQLite 单文件 `data/selectmoney.db`(WAL,单写进程),备份即拷贝该目录;每日 `sqlite3 .backup` 保留 7 天
-- 生产必设 `JWT_SECRET`(≥32位,缺失/默认值拒绝启动);CORS 默认同源
+- 生产必设 `JWT_SECRET`(≥32位,缺失/默认值拒绝启动);CORS 默认同源。需要跨域时在 `CORS_ORIGINS` 中逐项填写可信来源；生产环境禁止 `*`。
 
 ## 项目结构
 
@@ -129,7 +170,7 @@ backend/app/
 backend/data/hot_money_seats.json   # 游资席位映射(随镜像)
 frontend/src/views/     # 登录/仪表盘/大盘指数/选股池/龙虎榜/行业/信号/新闻/策略配置/策略卡/任务/持仓/自选预警/交易/报告/设置/用户/帮助
 Dockerfile / docker-compose.yml
-backend/tests/          # 33 项测试(G03/SC-U08/底分型/PM02/权限/持仓隔离/赛道降级/审计回归)
+backend/tests/          # 后端回归测试(G03/SC-U08/底分型/PM02/权限/行情质量/持仓隔离/审计回归)
 ```
 
 ## 用户与权限(三角色 + 邀请码注册)

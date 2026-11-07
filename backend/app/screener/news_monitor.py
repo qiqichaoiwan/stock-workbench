@@ -7,7 +7,7 @@
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -121,7 +121,8 @@ def sync_news(db: Session, limit: int = 300) -> dict:
 
 def track_news_heat(db: Session) -> dict[str, float]:
     """各赛道近7日甄别后新闻热度(供行业景气评分引用)。"""
-    since = datetime.utcnow() - timedelta(days=7)
+    # NewsItem.created_at is a timezone-naive UTC column in the existing schema.
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=7)
     rows = db.execute(select(NewsItem.related_industry, NewsItem.heat).where(
         NewsItem.screened == True,  # noqa: E712
         NewsItem.created_at >= since,

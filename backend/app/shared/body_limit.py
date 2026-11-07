@@ -12,6 +12,9 @@ EVALUATION_BODY_LIMIT = 131072
 LIMITS = {
     "/api/screener/dual-core/evaluate-v2": EVALUATION_BODY_LIMIT,
     "/api/screener/dual-core/checklist": EVALUATION_BODY_LIMIT,
+    # 行情桥接批量通常几十到几百条；限制在 ASGI 读取阶段，避免 token 泄漏
+    # 或误配置时一次性把数 MB JSON 交给 Pydantic/hub。
+    "/api/marketdata/ingest": 262144,
 }
 
 

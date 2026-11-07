@@ -30,7 +30,11 @@ def analyze_stock(db: Session, user_id: int, code: str, holding_id: int | None =
                 f"当前止损价{v['stop_price']}(阶段{v['stop_stage']}),"
                 f"持仓最高价{v['highest_price']}。\n"
             )
-    quote_hist = stock_ref.quote_history(db, code, days=30)[-20:]
+    try:
+        quote_hist = stock_ref.quote_history(db, code, days=30)[-20:]
+    except Exception as exc:  # noqa: BLE001
+        log.warning("ai advisor quote history unavailable for %s: %s", code, type(exc).__name__)
+        quote_hist = []
     prices = ",".join(f"{q['close']}" for q in quote_hist)
     rating = stock_ref.pool_rating(db, code)
     rating_ctx = f"系统选股池评级:{rating['rating']}(池:{rating['pool_type']},评分{rating['score']})。\n" if rating else ""
@@ -50,14 +54,21 @@ def analyze_stock(db: Session, user_id: int, code: str, holding_id: int | None =
     try:
         content, model = llm_gateway.chat(db, user_id, system, user_prompt, json_mode=True)
         data = json.loads(content)
+        if not isinstance(data, dict):
+            raise ValueError("LLM response must be a JSON object")
     except Exception as exc:  # noqa: BLE001
         log.warning("ai advisor fallback: %s", exc)
-        latest = stock_ref.latest_close(db, code)
+        try:
+            latest = stock_ref.latest_close(db, code)
+        except Exception as quote_exc:  # noqa: BLE001
+            log.warning("ai advisor fallback quote unavailable for %s: %s", code,
+                        type(quote_exc).__name__)
+            latest = None
         close = latest[1] if latest else None
         views = [v for v in holdings_view(db, user_id) if v.get("code") == code]
         stop = views[0]["stop_price"] if views else None
         data = {
-            "analysis": f"AI服务不可用({exc}),以下为规则摘要:现价{close},"
+            "analysis": f"AI服务暂不可用，以下为规则摘要:现价{close},"
                         f"系统止损参考{stop}。请以止损纪律为准。",
             "sell_points": [{"price": stop, "reason": "系统止损线(硬规则)"}] if stop else [],
             "risk_note": "AI不可用,仅规则输出",

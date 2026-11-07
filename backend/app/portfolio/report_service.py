@@ -25,11 +25,22 @@ def _alerts(db: Session, user_id: int) -> list[dict]:
     定时任务逐用户调用);GET/日报一律只读,避免读请求触发跨租户写入。"""
     from .models import Holding
     alerts = []
+    try:
+        cutoff = stock_ref.dg.completed_trade_day()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("holding alert cutoff unavailable: %s", type(exc).__name__)
+        return alerts
     for h in db.execute(select(Holding).where(Holding.user_id == user_id, Holding.status == "holding")).scalars():
-        latest = stock_ref.latest_close(db, h.code)
+        try:
+            latest = stock_ref.latest_close(db, h.code, as_of=cutoff)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("holding alert quote unavailable for %s: %s", h.code, type(exc).__name__)
+            continue
         if not latest:
             continue
-        close = latest[1]
+        quote_date, close = latest
+        if quote_date < h.buy_date or quote_date != cutoff:
+            continue
         if close <= h.stop_price:
             alerts.append({"code": h.code, "name": h.name, "close": close,
                            "stop_price": h.stop_price, "stage": h.stop_stage,
@@ -65,12 +76,13 @@ def daily_report(db: Session, user_id: int) -> str:
         lines.append("")
     if views:
         lines.append("## 持仓")
-        lines.append("| 代码 | 名称 | 现价 | 浮盈% | 止损价 | 阶段 | 池评级 |")
-        lines.append("|---|---|---|---|---|---|---|")
+        lines.append("| 代码 | 名称 | 最近收盘 | 行情日期 | 浮盈% | 止损价 | 阶段 | 池评级 |")
+        lines.append("|---|---|---|---|---|---|---|---|")
         for v in views:
             pr = v.get("pool_rating") or {}
             lines.append(
-                f"| {v['code']} | {v['name']} | {v['close']} | {v['unrealized_pct']} | "
+                f"| {v['code']} | {v['name']} | {v['close'] if v['close'] is not None else '-'} | "
+                f"{v.get('quote_at') or '-'} | {v['unrealized_pct'] if v['unrealized_pct'] is not None else '-'} | "
                 f"{v['stop_price']} | {v['stop_stage']} | {pr.get('rating', '-')} |")
     else:
         lines.append("暂无持仓。")
@@ -85,7 +97,8 @@ def weekly_report(db: Session, user_id: int) -> WeeklyReport:
     # 旧逻辑恒减 weekday+7,周中也只出上一周,导致周报永远落后一周。
     days_back = today.weekday() or 7
     week_start = today - timedelta(days=days_back)
-    week_end = week_start + timedelta(days=4)
+    # 周中手动生成时不能把未来的周五写进报告范围；周末/周五收盘后仍覆盖完整工作周。
+    week_end = min(today, week_start + timedelta(days=4))
 
     trades = db.execute(select(TradeRecord).where(
         TradeRecord.user_id == user_id,
@@ -110,8 +123,10 @@ def weekly_report(db: Session, user_id: int) -> WeeklyReport:
         "## 当前持仓概览",
     ]
     for v in views:
-        lines.append(f"- {v['code']} {v['name']}:现价{v['close']},"
-                     f"浮盈{v['unrealized_pct']}%,阶段{v['stop_stage']},"
+        close = v['close'] if v['close'] is not None else '暂无行情'
+        pnl = f"{v['unrealized_pct']}%" if v['unrealized_pct'] is not None else '-'
+        lines.append(f"- {v['code']} {v['name']}:最近收盘{close}({v.get('quote_at') or '日期未知'}),"
+                     f"浮盈{pnl},阶段{v['stop_stage']},"
                      f"止损{v['stop_price']}")
     content = "\n".join(lines)
 

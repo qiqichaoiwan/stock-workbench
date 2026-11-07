@@ -4,7 +4,7 @@ from datetime import date
 
 import pandas as pd
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -174,3 +174,14 @@ def test_lhb_api_recomputes_matches_with_side(client, db):
     got = r.json()[0]["matched_traders"]
     # 机构/北向被过滤,只剩买方游资
     assert [(t["trader"], t["side"], t["kind"]) for t in got] == [("作手新一", "买入", "游资")]
+
+
+def test_lhb_database_failure_is_not_reported_as_empty(client, db, monkeypatch):
+    def fail_execute(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(db, "execute", fail_execute)
+    with pytest.raises(HTTPException) as caught:
+        api.lhb(user_id=1, db=db)
+    assert caught.value.status_code == 503
+    assert "数据库服务暂时不可用" in caught.value.detail

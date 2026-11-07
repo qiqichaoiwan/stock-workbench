@@ -89,10 +89,21 @@ def _load_calendar():
 
 def _session(now):
     calendar = _calendar.get(_load_calendar)
-    days = calendar["value"]
-    # An old calendar ending before today cannot verify a weekday holiday.
-    verified = bool(days and max(days) >= now.date())
-    trade_day = now.date() in days if verified else now.weekday() < 5
+    raw_days = calendar["value"]
+    days = set()
+    for value in raw_days or ():
+        try:
+            days.add(value if hasattr(value, "year") else datetime.fromisoformat(str(value)).date())
+        except (TypeError, ValueError):
+            continue
+    today = now.astimezone(TZ).date()
+    # A stale/failed feed and a range that does not contain today cannot
+    # establish whether today's holiday is a trading day.  Keep the weekday
+    # approximation for the dashboard label, but expose the unverified bit so
+    # consumers that can trigger alerts must fail closed.
+    verified = bool(calendar.get("status") == "ok" and days and
+                    min(days) <= today <= max(days))
+    trade_day = today in days if verified else now.weekday() < 5
     t = now.time().replace(tzinfo=None)
     if not trade_day:
         state, label = "non_trading", "非交易日"
@@ -132,9 +143,10 @@ def _points(frame):
     time_col = "时间" if "时间" in frame.columns else "day"
     value_col = "收盘" if "收盘" in frame.columns else "close"
     points = {}
+    cutoff = _now().astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
     for row in frame.to_dict("records"):
         stamp, value = _timestamp(row.get(time_col)), _number(row.get(value_col))
-        if stamp and value is not None:
+        if stamp and stamp <= cutoff and value is not None:
             clock = stamp[11:]
             if "09:30:00" <= clock <= "11:30:00" or "13:00:00" <= clock <= "15:00:00":
                 points[stamp] = value
@@ -155,16 +167,26 @@ def _load_minutes(code, provider):
 
 
 def _load_snapshot():
-    with _AK_LOCK:
-        import akshare as ak
-        df = ak.stock_zh_index_spot_sina()
+    # 指数逐项行情含提供方日期和时间,可核验昨收属于哪个交易日。
+    import requests
+    from ..shared.data_gateway import _SINA_QUOTE_HEADERS
+
+    response = requests.get("https://hq.sinajs.cn/list=" + ",".join(code for code, _ in INDEXES),
+                            headers=_SINA_QUOTE_HEADERS, timeout=(3, 6))
+    response.raise_for_status()
+    response.encoding = "gbk"
     result = {}
-    for row in df.to_dict("records"):
-        code = str(row.get("代码", ""))
-        if code in dict(INDEXES):
-            result[code] = {"last": _number(row.get("最新价")),
-                            "pct_chg": _number(row.get("涨跌幅")),
-                            "prev_close": _number(row.get("昨收"))}
+    for line in response.text.strip().splitlines():
+        if not line.startswith("var hq_str_") or '="' not in line:
+            continue
+        code, payload = line[len("var hq_str_"):].split('="', 1)
+        fields = payload.rsplit('";', 1)[0].split(",")
+        if code not in dict(INDEXES) or len(fields) < 32:
+            continue
+        stamp = _timestamp(f"{fields[30]} {fields[31]}")
+        previous = _number(fields[2])
+        if stamp and previous is not None and previous > 0:
+            result[code] = {"prev_close": previous, "quote_at": stamp}
     if not result:
         raise ValueError("empty snapshot")
     return result
@@ -202,22 +224,42 @@ def market():
     for code, name in INDEXES:
         feed = _choose(*_minutes[code], lambda c=code: _load_minutes(c, "em"),
                        lambda c=code: _load_minutes(c, "sina"), active=active)
-        points = feed["value"] or []
-        quote = (snapshot["value"] or {}).get(code, {})
+        # 缓存可能跨时钟调整或含有旧版本写入的未来数据,读取时也必须核验。
+        cutoff = now.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+        points = []
+        for point in feed["value"] or []:
+            point_time = _timestamp(point.get("time"))
+            if point_time and point_time <= cutoff:
+                points.append({**point, "time": point_time})
         stamp = points[-1]["time"] if points else None
+        quote = (snapshot["value"] or {}).get(code, {})
+        previous = None
+        quote_stamp = quote.get("quote_at")
+        try:
+            # 昨收必须来自同一交易日且不能来自未来时点。
+            if (stamp and quote_stamp and quote_stamp[:10] == stamp[:10]
+                    and datetime.fromisoformat(quote_stamp) <= now.replace(tzinfo=None)):
+                candidate = _number(quote.get("prev_close"))
+                previous = candidate if candidate is not None and candidate > 0 else None
+        except (ValueError, TypeError):
+            pass
         status, error = feed["status"], feed["error"]
-        if quote and snapshot["status"] == "stale":
-            status, error = "stale", snapshot["error"]
+        if not points and status == "ok":
+            status, error = "unavailable", "no valid minute data as of current time"
         if stamp:
             age = (now.replace(tzinfo=None) - datetime.fromisoformat(stamp)).total_seconds()
             if (active and age > 180) or (stamp[:10] < now.date().isoformat() and
                                          session["state"] in ("trading", "lunch", "closed")):
                 status, error = "stale", error or "minute data is behind current session"
+            elif session["state"] == "closed" and stamp[:10] == now.date().isoformat() and status == "ok":
+                # 收盘后的最后一分钟仍是有效收盘快照，但不能在 UI/API 中继续显示为盘中已更新。
+                status, error = "closed", "market closed; last session snapshot"
         indexes.append({"code": code, "name": name,
-                        "last": quote.get("last") if quote else (points[-1]["value"] if points else None),
-                        "pct_chg": quote.get("pct_chg"), "prev_close": quote.get("prev_close"),
+                        "last": points[-1]["value"] if points else None,
+                        "pct_chg": round((points[-1]["value"] / previous - 1) * 100, 2) if previous and points else None,
+                        "prev_close": previous,
                         "points": points, "data_time": stamp,
-                        "source": feed["source"] + (" / " + snapshot["source"] if quote else ""),
+                        "source": feed["source"] + (" / " + snapshot["source"] if previous else ""),
                         "status": status, "error": error})
     flows = {}
     for kind, cache in _flows.items():

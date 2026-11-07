@@ -19,6 +19,7 @@ import json
 import os
 import threading
 import time
+from bisect import bisect_right
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
@@ -43,6 +44,8 @@ log = logging.getLogger("tasks")
 _task_locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 _pending_tasks: set[str] = set()
+# 进程内公平游标；同名任务由 run_task 互斥，重跑从上次尝试后继续。
+_sync_quote_cursor: str | None = None
 # 全局并发上限:后台任务同时运行数,超限 run_task_async 返回 False(API 转 409)。
 # 取值见 config.max_concurrent_tasks(默认 3,环境变量 MAX_CONCURRENT_TASKS 覆盖)。
 def _max_concurrent_tasks() -> int:
@@ -457,36 +460,164 @@ def task_lhb_sync(db: Session, trade_date=None) -> dict:
     return {"date": ds, "lhb_rows": rows}
 
 
+def _same_quote_price(a, b) -> bool:
+    a, b = float(a), float(b)
+    return (pd.notna(a) and pd.notna(b) and 0 < a < float("inf")
+            and 0 < b < float("inf") and abs(a - b) <= max(0.015, abs(b) * 0.0001))
+
+
+def _verify_adjusted_history(db: Session, code: str, history: dict, before: date) -> None:
+    """已有前复权历史每一重叠行都必须可核验，避免除权后不同基准混写。"""
+    existing = db.execute(select(DailyQuote).where(
+        DailyQuote.code == code, DailyQuote.trade_date < before)).scalars().all()
+    for row in existing:
+        other = history[row.trade_date]
+        if not all(_same_quote_price(getattr(row, key), other[key])
+                   for key in ("open", "high", "low", "close")):
+            raise ValueError("adjustment baseline changed")
+
+
 def task_sync_quotes_from_spot(db: Session):
-    """收盘后:用全市场快照一次性生成当日日线行(候选域)。
+    """收盘后:用逐股带时间的行情生成当日日线行。
 
     落库前经 validate_quote_date 校验:非交易日/未来日期直接抛错,不写脏数据。
     TaskLog detail 首字段写数据来源(供前端显示):{"source": ...}。
     """
-    snap, source = dg.get_spot_snapshot_with_source()
-    codes = set(universe_manager.candidate_universe(db))
+    # 盘中价格不能标成上一交易日；休市日不能猜测快照日期。
+    global _sync_quote_cursor
+    now = dg.now_tz()
+    # Require an explicitly verified trading day.  ``is_trade_day`` fails
+    # closed on calendar outages; ``is not True`` also protects this write
+    # path if a future calendar adapter introduces an ``unknown`` state.
+    if dg.is_trade_day(now.date()) is not True or now.hour < 15:
+        raise ValueError("日线快照同步仅能在交易日收盘后运行")
     trade_date = dg.validate_quote_date(dg.completed_trade_day())
-    df = snap[snap["code"].isin(codes)].dropna(subset=["price"])
+    if trade_date != now.date():
+        raise ValueError("无法确认当日收盘日期，拒绝同步日线")
+    from .portfolio.models import Holding, Watchlist
+
+    # 风控与自选并不限于选股候选域，必须一并获取收盘价。
+    portfolio_codes = set(db.execute(select(Holding.code).where(Holding.status == "holding")).scalars())
+    portfolio_codes.update(db.execute(select(Watchlist.code)).scalars())
+    codes = set(universe_manager.candidate_universe(db)) | portfolio_codes
+    if not codes:
+        return {"source": "sina", "date": trade_date.isoformat(), "quotes": 0}
+
+    # 只能使用带逐股原始时间的报价；全市场快照/本机抓取时间无法证明
+    # 停牌股票的价格属于今天，不能降级后盲目覆盖日线。
+    # 限制整项任务和单股历史请求的等待；超时后的网关只读线程可能继续运行。
+    deadline = time.monotonic() + 120.0
     rows = 0
-    for _, r in df.iterrows():
-        # 逐条 savepoint:单 code 脏数据只回滚本条,不污染整批
+    missing = 0
+    unprocessed = 0
+    # 重跑优先补当日尚无日线的股票，避免每次超时都卡在同一批。
+    current = set(db.execute(select(DailyQuote.code).where(
+        DailyQuote.trade_date == trade_date, DailyQuote.code.in_(codes))).scalars())
+    def rotated(group):
+        ordered_group = sorted(group)
+        pos = bisect_right(ordered_group, _sync_quote_cursor) if _sync_quote_cursor else 0
+        return ordered_group[pos:] + ordered_group[:pos]
+
+    ordered = (rotated((codes - current) & portfolio_codes)
+               + rotated((codes - current) - portfolio_codes)
+               + rotated(current & portfolio_codes)
+               + rotated(current - portfolio_codes))
+    quotes = {}
+    for index, code in enumerate(ordered):
+        if time.monotonic() >= deadline:
+            unprocessed = len(ordered) - index
+            break
+        if index % 50 == 0:
+            batch = set(ordered[index:index + 50])
+            try:
+                quotes, _snapshot_at = dg._run_with_timeout(
+                    dg._fetch_sina_batch_quotes, min(8.0, max(0.01, deadline - time.monotonic())), batch)
+            except Exception as exc:  # noqa: BLE001 只放弃当前批次，不撤销已入库的股票
+                log.warning("closing snapshot batch unavailable: %s", exc)
+                quotes = {}
+            fetched_at = dg.now_tz()
+            if fetched_at.date() != trade_date:
+                unprocessed = len(ordered) - index
+                break
+            if fetched_at.tzinfo is None:
+                fetched_at = fetched_at.replace(tzinfo=dg.TZ)
+            if time.monotonic() >= deadline:
+                unprocessed = len(ordered) - index
+                break
+        _sync_quote_cursor = code
+        quote = quotes.get(code) or {}
+        try:
+            stamp = datetime.fromisoformat(quote.get("quote_at") or "")
+            if stamp.tzinfo is None:
+                raise ValueError("quote timestamp has no timezone")
+            stamp = stamp.astimezone(dg.TZ)
+            prices = {key: float(quote[key]) for key in ("open", "high", "low", "price")}
+            if (stamp.date() != trade_date or stamp.hour < 15 or stamp > fetched_at
+                    or not all(pd.notna(v) and 0 < v < float("inf") for v in prices.values())
+                    or prices["high"] < max(prices["open"], prices["price"], prices["low"])
+                    or prices["low"] > min(prices["open"], prices["price"])):
+                raise ValueError("quote timestamp or prices are invalid")
+        except (TypeError, ValueError, KeyError, OverflowError):
+            missing += 1
+            continue
+        # 日线是前复权口径。现货价无法证明历史复权因子未改变，需获取
+        # 当日完整前复权序列并核对所有已有重叠日，再允许写入。
+        previous = db.execute(select(DailyQuote).where(
+            DailyQuote.code == code, DailyQuote.trade_date < trade_date
+        ).order_by(DailyQuote.trade_date)).scalars().all()
+        start = previous[0].trade_date if previous else trade_date
+        try:
+            hist, _hist_source = dg._run_with_timeout(
+                dg.get_daily_history, min(8.0, max(0.01, deadline - time.monotonic())),
+                code, start.strftime("%Y%m%d"), trade_date.strftime("%Y%m%d"),
+                source="backfill")
+            history = {}
+            for record in hist.to_dict("records"):
+                day = _to_date(record.get("trade_date"))
+                if day in history:
+                    raise ValueError("duplicate daily date")
+                history[day] = record
+            daily = history[trade_date]
+            daily_prices = {key: float(daily[key]) for key in ("open", "high", "low", "close")}
+            if not all(_same_quote_price(daily_prices[key], prices["price" if key == "close" else key])
+                       for key in ("open", "high", "low", "close")):
+                raise ValueError("daily quote does not match verified closing snapshot")
+            _verify_adjusted_history(db, code, history, trade_date)
+        except Exception as exc:  # noqa: BLE001 单股缺失/除权重算不得污染已有序列
+            log.warning("daily quote %s could not be verified: %s", code, exc)
+            missing += 1
+            continue
+        # 只覆盖来源实际提供的字段，避免无换手率/市值的源将历史值清零。
+        vals = daily_prices
+        for field in ("amount", "turnover", "pct_chg", "total_mv", "volume"):
+            value = daily.get(field)
+            try:
+                number = float(value)
+                if pd.notna(number) and abs(number) < float("inf") and (field == "pct_chg" or number > 0):
+                    vals[field] = number
+            except (TypeError, ValueError, OverflowError):
+                pass
         with db.begin_nested():
             exists = db.execute(select(DailyQuote).where(
-                DailyQuote.code == r["code"], DailyQuote.trade_date == trade_date)).scalar_one_or_none()
-            vals = {
-                "open": _f(r.get("open")), "high": _f(r.get("high")),
-                "low": _f(r.get("low")), "close": _f(r["price"]),
-                "amount": _f(r.get("amount")), "turnover": _f(r.get("turnover")),
-                "pct_chg": _f(r.get("pct_chg")), "total_mv": _f(r.get("total_mv")),
-            }
+                DailyQuote.code == code, DailyQuote.trade_date == trade_date)).scalar_one_or_none()
             if exists is None:
-                db.add(DailyQuote(code=r["code"], trade_date=trade_date, **vals))
+                db.add(DailyQuote(code=code, trade_date=trade_date, **vals))
             else:
-                for k, v in vals.items():
-                    setattr(exists, k, v)
+                for key, value in vals.items():
+                    setattr(exists, key, value)
+        # 网络调用之间不持有 SQLite 写事务，避免阻塞持仓与其他任务。
+        db.commit()
         rows += 1
-    db.commit()
-    return {"source": source, "date": trade_date.isoformat(), "quotes": rows}
+    result = {"source": "sina", "date": trade_date.isoformat(), "quotes": rows,
+              "unprocessed": unprocessed}
+    errors = []
+    if missing:
+        errors.append(f"{missing} 只股票缺少可核验的当日收盘报价，已跳过")
+    if unprocessed:
+        errors.append(f"{unprocessed} 只股票因任务时限或跨日尚未处理")
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 def task_intraday_snapshot(db: Session):
@@ -625,13 +756,16 @@ def task_news(db: Session):
 def task_weekly_reports(db: Session):
     users = db.execute(select(User).where(User.is_active == True)).scalars().all()  # noqa: E712
     done = []
+    errors = []
     for u in users:
         try:
             rec = weekly_report(db, u.id)
             done.append({"user": u.username, "report_id": rec.id})
         except Exception as exc:  # noqa: BLE001
+            db.rollback()
             log.warning("weekly report for %s failed: %s", u.username, exc)
-    return {"reports": done}
+            errors.append({"user": u.username, "error": str(exc)})
+    return {"reports": done, "errors": errors}
 
 
 def task_fund_flow_snapshot(db: Session):
@@ -711,6 +845,9 @@ def task_market_stat(db: Session):
 
 
 WATCH_ALERT_WINDOW_HOURS = 24
+# 一次扫描最多等待被超时工作线程占用的预警槽 15 秒，避免后续批次瞬间丢弃。
+WATCH_ALERT_BUSY_WAIT_SECONDS = 15.0
+WATCH_ALERT_BUSY_RETRY_SECONDS = 0.25
 
 
 def task_watch_alert(db: Session):
@@ -723,48 +860,78 @@ def task_watch_alert(db: Session):
     from datetime import datetime, timedelta, timezone
 
     from .portfolio.models import WatchAlertLog, Watchlist
-    from .shared import stock_ref
+    from .portfolio import live_quotes
 
     watches = db.execute(select(Watchlist)).scalars().all()
+    # 每批取到后立刻处理，后续慢批次不会让前批行情过期。
+    # 独立预警并发槽使页面轮询不挤占扫描容量。
+    codes = list(dict.fromkeys(w.code for w in watches))
     alerts, errors = 0, []
-    # WatchAlertLog.created_at 默认存 naive UTC(_now());去重窗口必须同口径,
-    # 用本地时(datetime.now())在非 UTC 容器里会错位 8h。
     since = datetime.now(timezone.utc).replace(tzinfo=None) \
         - timedelta(hours=WATCH_ALERT_WINDOW_HOURS)
-    for w in watches:
+    busy_budget = WATCH_ALERT_BUSY_WAIT_SECONDS
+    for start in range(0, len(codes), 50):
+        batch = codes[start:start + 50]
+        quotes, batch_errors = live_quotes.fetch(batch, priority=True)
+        while batch_errors == ['行情请求繁忙'] and busy_budget > 0:
+            wait = min(WATCH_ALERT_BUSY_RETRY_SECONDS, busy_budget)
+            before = time.monotonic()
+            time.sleep(wait)
+            busy_budget = max(0, busy_budget - (time.monotonic() - before))
+            quotes, batch_errors = live_quotes.fetch(batch, priority=True)
+        errors.extend(f"批次 {start + 1}: {error}" for error in batch_errors)
+        batch_alerts = 0
         try:
-            # 逐自选 savepoint:单条失败只回滚本条,不整批回滚
-            with db.begin_nested():
-                latest = stock_ref.latest_close(db, w.code)
-                if latest is None:
-                    continue
-                _qd, close = latest
-                hist = stock_ref.quote_history(db, w.code, days=5)
-                prev = hist[-2]["close"] if len(hist) >= 2 else None
-                pct = ((close / prev - 1) * 100) if prev else 0.0
-                hits: list[tuple[str, str]] = []
-                if w.take_profit and close >= w.take_profit:
-                    hits.append(("take_profit", f"{w.code} 现价 {close} 已达止盈位 {w.take_profit}"))
-                if w.stop_loss and close <= w.stop_loss:
-                    hits.append(("stop_loss", f"{w.code} 现价 {close} 已触止损位 {w.stop_loss}"))
-                if w.alert_pct and abs(pct) >= w.alert_pct:
-                    hits.append(("alert_pct", f"{w.code} 涨跌幅 {pct:.2f}% 触阈值 ±{w.alert_pct}%"))
-                if w.cost_price and abs(close / w.cost_price - 1) <= 0.01:
-                    hits.append(("cost_touch", f"{w.code} 现价 {close} 触及成本 {w.cost_price}±1%"))
-                for rule, message in hits:
-                    dup = db.execute(select(WatchAlertLog.id).where(
-                        WatchAlertLog.user_id == w.user_id, WatchAlertLog.code == w.code,
-                        WatchAlertLog.rule == rule,
-                        WatchAlertLog.created_at >= since)).first()
-                    if dup:
-                        continue  # 24h 内已推送,去重跳过
-                    db.add(WatchAlertLog(user_id=w.user_id, code=w.code,
-                                         rule=rule, message=message))
-                    alerts += 1
-        except Exception as exc:  # noqa: BLE001 单行异常隔离(savepoint 已回滚本条)
-            errors.append(f"{w.code}: {exc}"[:200])
-            log.warning("watch alert %s failed: %s", w.code, exc)
-    db.commit()
+            # SQLite 的旧事务模式不会因 SELECT 自动 BEGIN；显式开启外层事务，
+            # 使逐条 SAVEPOINT 在本批提交失败时也能整体回滚。
+            conn = db.connection()
+            if conn.dialect.name == "sqlite" and not conn.connection.driver_connection.in_transaction:
+                conn.exec_driver_sql("BEGIN")
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            errors.append(f"批次 {start + 1} 开始事务失败: {exc}"[:200])
+            continue
+        for w in (item for item in watches if item.code in batch):
+            row_alerts = 0
+            try:
+                # 逐自选 savepoint:单条失败只回滚本条,不整批回滚
+                with db.begin_nested():
+                    quote = quotes.get(w.code)
+                    if not quote or not live_quotes.is_realtime(quote):
+                        errors.append(f"{w.code}: 无可核验的新鲜盘中行情")
+                        continue
+                    close = quote["price"]
+                    pct = quote.get("pct_chg")
+                    hits: list[tuple[str, str]] = []
+                    if w.take_profit and close >= w.take_profit:
+                        hits.append(("take_profit", f"{w.code} 现价 {close} 已达止盈位 {w.take_profit}"))
+                    if w.stop_loss and close <= w.stop_loss:
+                        hits.append(("stop_loss", f"{w.code} 现价 {close} 已触止损位 {w.stop_loss}"))
+                    if w.alert_pct and pct is not None and abs(pct) >= w.alert_pct:
+                        hits.append(("alert_pct", f"{w.code} 涨跌幅 {pct:.2f}% 触阈值 ±{w.alert_pct}%"))
+                    if w.cost_price and abs(close / w.cost_price - 1) <= 0.01:
+                        hits.append(("cost_touch", f"{w.code} 现价 {close} 触及成本 {w.cost_price}±1%"))
+                    for rule, message in hits:
+                        dup = db.execute(select(WatchAlertLog.id).where(
+                            WatchAlertLog.user_id == w.user_id, WatchAlertLog.code == w.code,
+                            WatchAlertLog.rule == rule,
+                            WatchAlertLog.created_at >= since)).first()
+                        if dup:
+                            continue  # 24h 内已推送,去重跳过
+                        db.add(WatchAlertLog(user_id=w.user_id, code=w.code,
+                                             rule=rule, message=message))
+                        row_alerts += 1
+                batch_alerts += row_alerts
+            except Exception as exc:  # noqa: BLE001 单行异常隔离(savepoint 已回滚本条)
+                errors.append(f"{w.code}: {exc}"[:200])
+                log.warning("watch alert %s failed: %s", w.code, exc)
+        try:
+            db.commit()
+            alerts += batch_alerts
+        except Exception as exc:  # noqa: BLE001 仅回滚本批，继续后续批次
+            db.rollback()
+            errors.append(f"批次 {start + 1} 提交失败: {exc}"[:200])
+            log.warning("watch alert batch %s commit failed: %s", start + 1, exc)
     out: dict = {"alerts": alerts}
     if errors:
         out["errors"] = errors
@@ -883,12 +1050,22 @@ def task_backfill_history(db: Session, years: int = 5, progress=None):
     failures: list[tuple[str, str, date]] = []
 
     def _fetch_one(code: str, fetch_start: date, src: str) -> int:
+        # 前复权会因除权调整历史；已有区间必须重取并核验基准。
+        cov = coverage.get(code)
+        if cov and cov[0] is not None:
+            fetch_start = min(fetch_start, cov[0])
         df, _source = dg.get_daily_history(
             code, fetch_start.strftime("%Y%m%d"), end_day.strftime("%Y%m%d"),
             source=src)
         rows = _quote_rows(code, df) if not df.empty else []
         if not rows:
-            return 0
+            raise ValueError("empty daily history")
+        history = {}
+        for row in rows:
+            if row["trade_date"] in history:
+                raise ValueError("duplicate daily date")
+            history[row["trade_date"]] = row
+        _verify_adjusted_history(db, code, history, end_day + timedelta(days=1))
         with db.begin_nested():
             added = _insert_quotes(db, rows)
         db.commit()

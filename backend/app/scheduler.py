@@ -2,7 +2,7 @@
 
 任务链(收盘后流水线顺序依赖,各步独立容错;与 build_scheduler 内 cron 保持同步):
   09:00-14:30 每30分钟  盘中快照(9:00 在集合竞价前仅作留痕,有效序列从 9:35 起)
-  09:35/10:05-13:35/14:05  fund_flow + market_stat + watch_alert(三任务各错峰 1 分钟)
+  09:35/10:05-13:35/14:05/14:35  fund_flow + market_stat + watch_alert(三任务各错峰 1 分钟)
   11:40 / 14:40         新闻低频采集
   15:35                 日线落库(快照口径)+ 股票基础信息
   15:50                 持仓巡检(G03 止损推进,唯一写入口)
@@ -15,7 +15,6 @@
 import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 from .config import settings
 from .shared import data_gateway as dg
@@ -30,10 +29,16 @@ _scheduler: BackgroundScheduler | None = None
 
 
 def _guarded(name: str, **kwargs):
-    """非交易日自动跳过 + 异常吞掉(APScheduler 线程内不允许抛出)。"""
+    """非交易日或日历未核验时跳过 + 异常吞掉。
+
+    ``is_trade_day`` fails closed when the external calendar is unavailable,
+    so scheduled jobs must require an explicit ``True`` result.  This keeps a
+    provider outage from being mistaken for a normal weekday and writing
+    snapshots or indicators against an unverified session.
+    """
     try:
-        if not dg.is_trade_day():
-            log.info("skip task %s: not a trade day", name)
+        if dg.is_trade_day() is not True:
+            log.warning("skip task %s: trading calendar not verified", name)
             return
         result = run_task(name, **kwargs)
         log.info("scheduled task %s -> %s", name, result)
@@ -49,7 +54,7 @@ def build_scheduler() -> BackgroundScheduler:
                   day_of_week="mon-fri", hour="9-14", minute=f"*/{interval}",
                   id="intraday_snapshot", max_instances=1, coalesce=True)
 
-    # P1 盘中快照(9:35-14:05 每30分钟):fund_flow(板块概念资金流) +
+    # P1 盘中快照(9:35-14:35 每30分钟):fund_flow(板块概念资金流) +
     # market_stat(大盘统计) + watch_alert(自购三价预警,只读不写止损)。
     # 三任务各错峰 1 分钟(35/36/37),避免与 intraday 同分钟齐发挤占 SQLite 写锁。
     for i, name in enumerate(("fund_flow", "market_stat", "watch_alert")):
@@ -63,6 +68,9 @@ def build_scheduler() -> BackgroundScheduler:
         sched.add_job(_guarded, "cron", args=[name],
                       day_of_week="mon-fri", hour=14, minute=5,
                       id=f"intraday_{name}_1405", max_instances=1, coalesce=True)
+        sched.add_job(_guarded, "cron", args=[name],
+                      day_of_week="mon-fri", hour=14, minute=35 + i,
+                      id=f"intraday_{name}_1435", max_instances=1, coalesce=True)
 
     for hm in ((11, 40), (14, 40)):
         sched.add_job(_guarded, "cron", args=["news"],

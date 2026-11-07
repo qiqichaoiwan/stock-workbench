@@ -86,17 +86,17 @@ def test_backfill_retries_failure_and_skips_covered_stocks(db, calls):
     assert len(calls) == before
 
 
-def test_backfill_incremental_only_fetches_new_days(db, calls, monkeypatch):
+def test_backfill_checks_existing_history_before_inserting_new_days(db, calls, monkeypatch):
     db.add(DailyQuote(code="600001", trade_date=START_5Y,
-                      open=1, high=1, low=1, close=1, volume=1,
+                      open=10, high=11, low=9, close=10.5, volume=1,
                       amount=1, turnover=1, pct_chg=1))
     db.commit()
 
     result = task_runner.task_backfill_history(db, years=5)
 
-    # 600001 已有起点数据 → 只补起点后一天;000001 无数据 → 全量
+    # 已有历史也要重取并核对前复权基准，最终仅插入缺失日期。
     starts = {(c, s): st for c, st, _e, s in calls}
-    assert starts[("600001", "backfill")] == "20211029"
+    assert starts[("600001", "backfill")] == "20211028"
     assert ("000001", "backfill") in starts
     assert result["codes_failed"] == 0
 

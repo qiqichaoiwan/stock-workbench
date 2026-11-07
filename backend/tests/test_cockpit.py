@@ -101,6 +101,26 @@ def test_minutes_sort_dedupe_latest_day_and_no_daily_fill():
         c._points(pd.DataFrame({"日期": ["2026-10-26"], "收盘": [10]}))
 
 
+def test_minutes_reject_future_points_before_selecting_latest_day(monkeypatch):
+    monkeypatch.setattr(c, "_now", lambda: datetime(2026, 10, 26, 10, 0, tzinfo=c.TZ))
+    frame = pd.DataFrame({"day": ["2026-10-26T01:58:00+00:00", "2026-10-26 09:59:00", "2026-10-26 10:01:00",
+                                   "2026-10-27 09:30:00"], "close": [99, 100, 101, 102]})
+    assert c._points(frame) == [{"time": "2026-10-26 09:58:00", "value": 99.0},
+                                {"time": "2026-10-26 09:59:00", "value": 100.0}]
+
+
+def test_market_rejects_future_cached_minutes(monkeypatch):
+    monkeypatch.setattr(c, "_now", lambda: datetime(2026, 10, 26, 10, 0, tzinfo=c.TZ))
+    monkeypatch.setattr(c, "_calendar", seed(c.Feed("calendar", 86400), {date(2026, 10, 26)}))
+    monkeypatch.setattr(c, "_snapshot", seed(c.Feed("snapshot"), {}))
+    monkeypatch.setattr(c, "_minutes", {code: (seed(c.Feed("em"), [{"time": "2026-10-27 10:00:00", "value": 999}]), c.Feed("sina")) for code, _ in c.INDEXES})
+    monkeypatch.setattr(c, "_flows", {})
+    row = c.market()["indexes"][0]
+    assert row["last"] is None
+    assert row["data_time"] is None
+    assert row["status"] != "ok"
+
+
 def test_news_combines_dates_sorts_and_deduplicates():
     df = pd.DataFrame([{"发布日期": date(2026, 10, 25), "发布时间": time(23, 59), "标题": "旧", "内容": "a"},
                        {"发布日期": date(2026, 10, 26), "发布时间": time(0, 1), "标题": "新", "内容": "b"},
@@ -212,6 +232,71 @@ def test_market_four_index_contract_and_independent_failure(monkeypatch):
     assert result["fund_flow"]["concept"]["status"] == "ok"
 
 
+def test_market_index_value_matches_its_minute_timestamp(monkeypatch):
+    monkeypatch.setattr(c, "_now", lambda: datetime(2026, 10, 26, 10, tzinfo=c.TZ))
+    monkeypatch.setattr(c, "_calendar", seed(c.Feed("calendar", 86400), {date(2026, 10, 26)}))
+    monkeypatch.setattr(c, "_snapshot", seed(c.Feed("snapshot"), {code: {"last": 99, "pct_chg": -1, "prev_close": 100} for code, _ in c.INDEXES}))
+    minutes = {code: (seed(c.Feed("em"), [{"time": "2026-10-26 09:59:00", "value": 101.0}]), c.Feed("sina")) for code, _ in c.INDEXES}
+    monkeypatch.setattr(c, "_minutes", minutes)
+    monkeypatch.setattr(c, "_flows", {})
+    row = c.market()["indexes"][0]
+    assert row["last"] == 101
+    assert row["data_time"] == "2026-10-26 09:59:00"
+    assert row["pct_chg"] is None  # 未核验日期的昨收不能计算涨跌幅
+
+
+def test_closed_session_snapshot_is_not_reported_as_intraday(monkeypatch):
+    monkeypatch.setattr(c, "_now", lambda: datetime(2026, 10, 26, 15, 1, tzinfo=c.TZ))
+    monkeypatch.setattr(c, "_calendar", seed(c.Feed("calendar", 86400), {date(2026, 10, 26)}))
+    monkeypatch.setattr(c, "_snapshot", seed(c.Feed("snapshot"), {
+        code: {"prev_close": 100, "quote_at": "2026-10-26 15:00:00"}
+        for code, _ in c.INDEXES
+    }))
+    monkeypatch.setattr(c, "_minutes", {
+        code: (seed(c.Feed("em"), [{"time": "2026-10-26 15:00:00", "value": 101.0}]), c.Feed("sina"))
+        for code, _ in c.INDEXES
+    })
+    monkeypatch.setattr(c, "_flows", {})
+    row = c.market()["indexes"][0]
+    assert row["status"] == "closed"
+    assert row["error"] == "market closed; last session snapshot"
+
+
+def test_market_uses_prev_close_only_for_same_day_timestamp(monkeypatch):
+    monkeypatch.setattr(c, "_now", lambda: datetime(2026, 10, 26, 10, tzinfo=c.TZ))
+    monkeypatch.setattr(c, "_calendar", seed(c.Feed("calendar", 86400), {date(2026, 10, 26)}))
+    monkeypatch.setattr(c, "_snapshot", seed(c.Feed("snapshot"), {
+        "sh000001": {"last": 99, "prev_close": 100, "quote_at": "2026-10-26 09:59:00"},
+        "sz399001": {"last": 99, "prev_close": 100, "quote_at": "2026-10-23 15:00:00"},
+        "sz399006": {"last": 99, "prev_close": 100, "quote_at": "2026-10-26 11:00:00"},
+    }))
+    minutes = {code: (seed(c.Feed("em"), [{"time": "2026-10-26 09:59:00", "value": 101.0}]), c.Feed("sina")) for code, _ in c.INDEXES}
+    monkeypatch.setattr(c, "_minutes", minutes)
+    monkeypatch.setattr(c, "_flows", {})
+    rows = c.market()["indexes"]
+    assert rows[0]["last"] == 101
+    assert rows[0]["prev_close"] == 100
+    assert rows[0]["pct_chg"] == 1
+    assert rows[1]["prev_close"] is None
+    assert rows[2]["prev_close"] is None
+
+
+def test_snapshot_parses_each_index_source_timestamp(monkeypatch):
+    import requests
+    fields = ["上证指数", "100.000", "100.000", "101.000", "102.000", "99.000", "0", "0", "1000", "100000"] + ["0"] * 20 + ["2026-10-26", "09:59:00", "00"]
+
+    class Response:
+        encoding = None
+        text = f'var hq_str_sh000001="{",".join(fields)}";\n'
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(requests, "get", lambda *a, **kw: Response())
+    row = c._load_snapshot()["sh000001"]
+    assert row["prev_close"] == 100
+    assert row["quote_at"] == "2026-10-26 09:59:00"
+
+
 def test_minute_provider_arguments(monkeypatch):
     import akshare as ak
     calls = []
@@ -318,10 +403,16 @@ def test_routes_require_auth_without_starting_app(monkeypatch):
     app = FastAPI()
     app.include_router(router)
     client = TestClient(app)
-    for path in ("market", "news"):
+    for path in ("market", "news", "session"):
         assert client.get(f"/api/screener/cockpit/{path}").status_code in (401, 403)
     app.dependency_overrides[current_user_id] = lambda: 1
     monkeypatch.setattr(c, "market", lambda: {"market": "mock"})
     monkeypatch.setattr(c, "news", lambda: {"news": "mock"})
+    monkeypatch.setattr(c, "_now", lambda: datetime(2026, 10, 26, 10, tzinfo=c.TZ))
+    monkeypatch.setattr(c, "_session", lambda now: {"state": "trading", "label": "交易中",
+                                                       "calendar_verified": True})
     assert client.get("/api/screener/cockpit/market").json() == {"market": "mock"}
     assert client.get("/api/screener/cockpit/news").json() == {"news": "mock"}
+    session = client.get("/api/screener/cockpit/session").json()
+    assert session["session"]["state"] == "trading"
+    assert session["server_time"].startswith("2026-10-26T10:00:00")

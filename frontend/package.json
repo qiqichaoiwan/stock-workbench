@@ -7,8 +7,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "npm run test:dual-core && npm run test:pool && npm run test:portfolio && npm run test:pages",
     "test:dual-core": "node --test src/utils/dualCoreCard.test.mjs src/utils/dualCorePage.test.mjs",
-    "test:pool": "node --test src/utils/poolQuotes.test.mjs"
+    "test:pool": "node --test src/utils/poolQuotes.test.mjs",
+    "test:portfolio": "node --test src/utils/portfolioQuotes.test.mjs",
+    "test:pages": "node --test src/utils/pageFailures.test.mjs"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.2",
@@ -22,6 +25,7 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.10",
+    "@vue/compiler-sfc": "^3.5.44",
     "happy-dom": "^21.0.4",
     "vite": "^8.3.4"
   }

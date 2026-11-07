@@ -4,14 +4,16 @@ import os
 import re
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import text
 
 from .config import ROOT_DIR, settings
 from .db import create_all, missing_tables
 from .portfolio.api import router as portfolio_router
 from .portfolio.dual_core_checklist_api import router as dual_core_cards_router
+from .marketdata.api import router as marketdata_router
 from .screener.api import router as screener_router
 from .shared.body_limit import PathBodyLimitMiddleware
 
@@ -93,6 +95,15 @@ def _startup() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # The API is a read-only consumer of the shared market-data snapshot.  A
+    # separate ``marketdata-worker`` owns the one Futu OpenD connection.  Fail
+    # fast if someone accidentally starts FastAPI with the worker role rather
+    # than silently creating a second broker connection.
+    if settings.marketdata_process_role != "api":
+        raise RuntimeError(
+            "FastAPI 进程必须设置 MARKETDATA_PROCESS_ROLE=api；"
+            "行情 worker 请运行 scripts/marketdata_worker.py 并设置为 worker"
+        )
     _startup()
     yield
 
@@ -109,6 +120,26 @@ app.add_middleware(PathBodyLimitMiddleware)
 #   为空则默认同源(不放行任意外域);allow_credentials=True 下不使用通配符。
 # - 5173 仅开发期需要(非生产才放行),生产不放行任何本机来源。
 _extra_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+
+
+def _validate_cors_origins(origins: list[str], *, production: bool | None = None) -> None:
+    """Reject wildcard CORS when credentials are enabled in production.
+
+    The app deliberately sets ``allow_credentials=True`` for bearer/cookie
+    based clients.  A wildcard origin would make that policy ambiguous and is
+    unsafe for a production deployment.  Keep the helper pure so configuration
+    checks can be regression-tested without importing a second FastAPI app.
+    """
+    if production is None:
+        production = _is_production()
+    if production and "*" in origins:
+        raise RuntimeError(
+            "拒绝启动:CORS_ORIGINS 不能包含 '*'(allow_credentials=true);"
+            "请显式配置可信 HTTPS 来源。"
+        )
+
+
+_validate_cors_origins(_extra_origins)
 _dev_origins = [] if _is_production() else ["http://localhost:5173", "http://127.0.0.1:5173"]
 if _is_production() and not _extra_origins:
     logging.getLogger("startup").info(
@@ -127,8 +158,23 @@ def health():
     return {"status": "ok", "app": settings.app_name}
 
 
+@app.get("/api/ready")
+def ready():
+    """Readiness probe: process is running and can execute a database query."""
+    from .db import engine
+
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001 avoid exposing connection details
+        logging.getLogger("startup").warning("database readiness check failed: %s", type(exc).__name__)
+        raise HTTPException(503, "数据库暂不可用") from exc
+    return {"status": "ok", "app": settings.app_name, "database": "ok"}
+
+
 app.include_router(portfolio_router)
 app.include_router(dual_core_cards_router)
+app.include_router(marketdata_router)
 app.include_router(screener_router)
 
 # 前端构建产物存在时由后端统一托管(单服务部署)

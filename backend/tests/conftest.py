@@ -10,7 +10,9 @@ from cryptography.fernet import Fernet
 
 _TMP_DIR = tempfile.mkdtemp(prefix="smtest_")
 
-os.environ.setdefault("DATABASE_URL", f"sqlite:///{_TMP_DIR}/tests.db")
+# Never inherit a developer or production database, including during collection:
+# some test modules create tables and users as soon as they are imported.
+os.environ["DATABASE_URL"] = f"sqlite:///{_TMP_DIR}/tests.db"
 os.environ.setdefault("JWT_SECRET", "test-secret-for-auth-0123456789abcdef")
 # 双核实时适配器默认关闭:单元测试不得联网,也不得依赖外部行情源的可用性。
 # 需要验证适配器的测试直接调用 dual_core_feed 并注入 provider(或 monkeypatch 本配置)。

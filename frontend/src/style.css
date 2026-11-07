@@ -1,5 +1,29 @@
+:root {
+  --wb-page: #f3f6fa;
+  --wb-surface: #fff;
+  --wb-line: #e4eaf1;
+  --wb-text: #1b2c40;
+  --wb-muted: #8393a5;
+  --wb-primary: #2d7df0;
+  --wb-sidebar: #122238;
+  --el-color-primary: #2d7df0;
+  --el-border-radius-base: 8px;
+}
+
 html, body, #app { height: 100%; margin: 0; }
-body { font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; background: #f5f7fa; }
+body { font-family: 'Inter', 'Segoe UI', 'Microsoft YaHei', sans-serif; background: var(--wb-page); color: var(--wb-text); -webkit-font-smoothing: antialiased; }
+button, input, textarea, select { font: inherit; }
+::selection { color: #174e9c; background: #dbeafe; }
+
+/* Shared light workbench surface. Dark cockpit panels opt out inside their scoped root. */
+.el-card { border-color: var(--wb-line); border-radius: 10px; box-shadow: 0 3px 14px rgb(26 54 86 / 4%); }
+.el-card__header { border-bottom-color: var(--wb-line); }
+.el-button { border-radius: 7px; }
+.el-input__wrapper, .el-select__wrapper { border-radius: 8px; box-shadow: 0 0 0 1px #dfe7f0 inset; }
+.el-input__wrapper.is-focus, .el-input__wrapper:focus-within { box-shadow: 0 0 0 1px #6ea9ec inset, 0 0 0 3px rgb(45 125 240 / 10%); }
+.el-table { --el-table-border-color: #e7edf3; --el-table-header-bg-color: #f7f9fb; --el-table-row-hover-bg-color: #f5f9ff; }
+.el-table th.el-table__cell { color: #607387; font-size: 11px; font-weight: 600; }
+.el-empty__description p { color: var(--wb-muted); }
 
 .page-card { margin-bottom: 16px; }
 .page-card .el-card__header { font-weight: 600; }

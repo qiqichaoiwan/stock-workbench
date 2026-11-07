@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, delete
+from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -169,6 +169,37 @@ def test_legacy_card_without_snapshot_still_reads(card_env, monkeypatch):
     monkeypatch.setattr(service, 'manual_calculation', counting)
     assert client.get(PATH).status_code == 200
     assert len(calls) == 1
+
+
+def test_malformed_historical_audit_is_visible_without_500(card_env):
+    from app.portfolio.dual_core_checklist_models import CardAudit
+
+    client, db, _ = card_env
+    assert client.put(PATH, json=body()).status_code == 200
+    row = db.scalar(select(CardAudit))
+    row.snapshot = '{broken'
+    db.commit()
+
+    audit_response = client.get(PATH + '/audit')
+    assert audit_response.status_code == 200
+    item = audit_response.json()['items'][0]
+    assert item['snapshot'] is None
+    assert item['snapshot_error'] == 'invalid_json'
+    assert client.get(PATH + '/export').status_code == 200
+
+
+def test_malformed_historical_card_payload_is_fail_soft(card_env):
+    from app.portfolio.dual_core_checklist_models import ExecutionCard
+
+    client, db, _ = card_env
+    assert client.put(PATH, json=body()).status_code == 200
+    row = db.scalar(select(ExecutionCard))
+    row.payload = '[]'
+    db.commit()
+
+    response = client.get(PATH)
+    assert response.status_code == 200
+    assert response.json()['payload_error'] is True
 
 
 # ---------- P1-3: bounded bodies on the public evaluation/checklist routes ----------

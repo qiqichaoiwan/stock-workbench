@@ -1,11 +1,13 @@
 <template>
-  <div>
-    <el-alert v-if="riskGuard === true" type="warning" :closable="false" style="margin-bottom:16px"
+  <div class="workbench-page pool-page">
+    <el-alert v-if="riskGuard === true" class="workbench-alert" type="warning" :closable="false" style="margin-bottom:16px"
               title="弱市守门已触发:主池暂停新增入选(存量继续按评级跟踪),此为规则层硬约束" />
-    <el-alert v-if="riskGuard === null" type="info" :closable="false" style="margin-bottom:16px"
-              title="守门状态加载失败(网络或服务端异常),当前按未触发展示,入选操作请谨慎" />
+    <el-alert v-if="riskGuard === null" class="workbench-alert" type="info" :closable="false" style="margin-bottom:16px"
+              title="守门状态加载失败，无法确认是否触发。">
+      <el-button size="small" link @click="loadRiskGuard">重试</el-button>
+    </el-alert>
 
-    <el-card class="page-card">
+    <el-card class="page-card workbench-card">
       <template #header>
         <div class="card-head">
           <el-radio-group v-model="poolType" @change="load">
@@ -20,11 +22,16 @@
             成员 {{ fmtInt(currentTrack.member_count) }} 只 · 来源{{ trackSourceLabel(currentTrack.member_source) }}
           </span>
           <span class="grow" />
-          <span class="muted" style="font-size:12px" :title="quoteStatusText(quoteMeta, quoteLoading)">{{ quoteStatusText(quoteMeta, quoteLoading) }}</span>
+          <span v-if="loadError" class="data-quality-label degraded">选股池读取失败</span>
+          <span v-else-if="!loading && !rows.length" class="data-quality-label">暂无选股池行情</span>
+          <span v-else class="data-quality-label" :class="{ degraded: effectiveQuoteMeta.errors?.length }" :title="quoteStatusText(effectiveQuoteMeta, quoteLoading)">{{ quoteStatusText(effectiveQuoteMeta, quoteLoading) }}</span>
           <el-input v-model="search" placeholder="搜索代码 / 名称" clearable style="width:200px" />
+          <el-button size="small" :loading="loading" @click="load">刷新</el-button>
         </div>
       </template>
-      <el-empty v-if="poolType === 'track' && allTrackEmpty" description="赛道成分尚未同步">
+      <el-alert v-if="loadError" class="quote-alert" type="error" :title="loadError" :closable="false" show-icon />
+      <el-alert v-if="rows.length && quoteMeta.errors?.length" class="quote-alert" type="warning" :closable="false" show-icon title="行情刷新失败，保留最近一次可用行情；请稍后重试。" />
+      <el-empty v-if="!loading && !loadError && poolType === 'track' && allTrackEmpty" description="赛道成分尚未同步">
         <template #description>
           <p>赛道成分尚未同步</p>
           <p class="muted" style="font-size:12px;line-height:1.6">
@@ -35,7 +42,7 @@
         <el-button type="primary" size="small" @click="goSyncTracks">去同步成分</el-button>
       </el-empty>
       <div class="table-scroll" v-else>
-      <el-table :data="pagedRows" size="small" v-loading="loading" stripe border>
+      <el-table class="workbench-table" :data="pagedRows" size="small" v-loading="loading" stripe border>
         <el-table-column prop="code" label="代码" width="90" />
         <el-table-column label="名称" min-width="110">
           <template #default="{ row }">{{ cleanName(row.name) }}</template>
@@ -44,6 +51,7 @@
           <template #default="{ row }">
             <span v-if="quoteOf(row)" class="num" :title="quoteTitle(row)">{{ fmtNum(quoteOf(row).price) }}</span>
             <span v-else class="muted">-</span>
+            <div v-if="quoteOf(row)" class="muted" style="font-size:10px">{{ quoteTitle(row) }}</div>
           </template>
         </el-table-column>
         <el-table-column label="今日涨跌幅" width="110" align="right">
@@ -96,12 +104,13 @@
                        :page-sizes="[20, 50, 100]" v-model:page-size="pageSize"
                        v-model:current-page="page" />
       </div>
-      <p v-if="!allTrackEmpty" class="muted" style="font-size:12px;margin:6px 0 0">前端分页 · 共 {{ filteredRows.length }} 只(服务端全量取回,已按评分全局排序);现价/涨跌幅优先取服务端实时行情(新浪批量报价),失败时降级为全市场快照缓存或已落库日线并标注来源;交易时段每 20 秒自动刷新,非交易时段为最近收盘快照。</p>
+      <p v-if="!allTrackEmpty" class="muted" style="font-size:12px;margin:6px 0 0">前端分页 · 共 {{ filteredRows.length }} 只(服务端全量取回,已按评分全局排序);行情显示逐股时间与状态,源不可用时显示已落库日线或缺失;交易时段每 20 秒自动刷新。</p>
     </el-card>
 
-    <el-card class="page-card">
-      <template #header>出池留档(含原因,可回溯)</template>
-      <el-table :data="history" size="small" max-height="300" stripe border>
+    <el-card class="page-card workbench-card">
+      <template #header><div class="card-head">出池留档(含原因,可回溯)<span class="grow" /><el-button size="small" @click="loadHistory">刷新</el-button></div></template>
+      <el-alert v-if="historyError" type="error" :title="historyError" :closable="false" show-icon />
+      <el-table class="workbench-table" :data="history" size="small" max-height="300" stripe border>
         <el-table-column prop="code" label="代码" width="90" />
         <el-table-column label="名称" min-width="110">
           <template #default="{ row }">{{ cleanName(row.name) }}</template>
@@ -126,7 +135,8 @@ import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 import { cleanName, fmtNum, fmtInt, fmtPct, ratingLabel, ratingType, upDownClass } from '../utils/fmt'
-import { isTradingSession, quoteStatusText, quoteStamp } from '../utils/poolQuotes'
+import { isTradingSession, quoteStatusText, quoteItemLabel, markQuoteRefreshFailed } from '../utils/poolQuotes'
+import { effectiveQuote } from '../utils/portfolioQuotes'
 import { useUserStore } from '../store'
 
 const store = useUserStore()
@@ -140,32 +150,58 @@ const tracks = ref([])
 const rows = ref([])
 const history = ref([])
 const loading = ref(false)
+const loadError = ref('')
+const historyError = ref('')
 const search = ref('')
 const page = ref(1)
 const pageSize = ref(20)
 // riskGuard 三态:false=未触发 / true=生效 / null=加载失败(显式区分失败态)
-const riskGuard = ref(false)
+const riskGuard = ref(undefined)
 let loadSeq = 0
+let historySeq = 0
+let riskSeq = 0
+let active = false
 
 // 行情:现价 / 今日涨跌幅(实时快照优先,失败降级已落库日线,口径在页头标注)
 const quotes = ref({})
 const quoteMeta = ref({})
 const quoteLoading = ref(false)
+const quoteClock = ref(Date.now())
 let quoteSeq = 0
 let quoteTimer = null
+let quoteClockTimer = null
 
 function quoteOf(row) {
-  return quotes.value[String(row?.code || '')] || null
+  const quote = quotes.value[String(row?.code || '')]
+  if (!quote) return null
+  const current = effectiveQuote(quote, quoteClock.value)
+  // A quote that was live during the session becomes a reference snapshot as
+  // soon as the market closes, even if its freshness window remains.
+  if (current.realtime && !isTradingSession(new Date(quoteClock.value))) {
+    return { ...current, realtime: false }
+  }
+  return current
 }
 
 function quoteTitle(row) {
-  const quote = quoteOf(row)
-  if (!quote) return ''
-  if (quote.quote_kind === 'stored') return `已落库日线 ${quote.trade_date || ''}`.trim()
-  const at = quoteStamp(quoteMeta.value.snapshot_at)
-  const kind = quoteMeta.value.realtime ? '实时行情' : '行情快照'
-  return at ? `${kind} ${at}` : kind
+  return quoteItemLabel(quoteOf(row))
 }
+
+// 顶部汇总必须跟逐股标签使用同一份“当前时刻”口径。页面休眠、网络超时或
+// 交易时段结束后，服务端返回的 realtime 标志可能已经过期，不能继续显示“均为实时”。
+const effectiveQuoteMeta = computed(() => {
+  const meta = quoteMeta.value || {}
+  const displayed = rows.value.map((row) => quoteOf(row))
+  const realtimeCount = displayed.filter((quote) => quote?.realtime).length
+  const storedCount = displayed.filter((quote) => quote?.quote_kind === 'stored').length
+  const missingCount = displayed.filter((quote) => !quote || quote.quote_kind === 'missing').length
+  return {
+    ...meta,
+    realtime: displayed.length > 0 && missingCount === 0 && realtimeCount === displayed.length,
+    realtime_count: realtimeCount,
+    counts: { ...(meta.counts || {}), stored: storedCount, missing: missingCount },
+  }
+})
 
 async function loadQuotes() {
   const seq = (quoteSeq += 1)
@@ -184,7 +220,10 @@ async function loadQuotes() {
     quotes.value = data?.items || {}
     quoteMeta.value = data || {}
   } catch {
-    // 刷新失败保留上一份行情,避免轮询抖动把已有现价/涨跌幅刷成空
+    if (seq !== quoteSeq) return
+    quotes.value = markQuoteRefreshFailed(quotes.value)
+    quoteMeta.value = { ...quoteMeta.value, realtime: false, realtime_count: 0,
+      as_of: quoteMeta.value.as_of || new Date().toISOString(), errors: ['refresh_failed'] }
   } finally {
     if (seq === quoteSeq) quoteLoading.value = false
   }
@@ -192,16 +231,25 @@ async function loadQuotes() {
 
 function scheduleQuoteRefresh() {
   if (quoteTimer) { clearInterval(quoteTimer); quoteTimer = null }
-  if (!isTradingSession()) return // 非交易时段不轮询,避免无意义打源
   quoteTimer = setInterval(() => {
     if (document.visibilityState === 'hidden') return
-    loadQuotes()
+    if (loading.value) return
+    if (isTradingSession()) {
+      // A slow provider must not accumulate requests or continually discard
+      // every response while the previous request is still in flight.
+      if (!quoteLoading.value) loadQuotes()
+    } else if (quoteMeta.value.realtime || quoteMeta.value.realtime_count) {
+      quotes.value = Object.fromEntries(Object.entries(quotes.value).map(([code, quote]) =>
+        [code, { ...quote, realtime: false }]))
+      quoteMeta.value = { ...quoteMeta.value, realtime: false, realtime_count: 0 }
+    }
   }, 20000)
 }
 
 function onVisibilityChange() {
   if (document.visibilityState !== 'visible') return
-  loadQuotes()
+  if (loading.value) return
+  if (!quoteLoading.value) loadQuotes()
   scheduleQuoteRefresh()
 }
 
@@ -240,19 +288,35 @@ watch(search, () => { page.value = 1 })
 async function load() {
   const seq = (loadSeq += 1)
   loading.value = true
+  loadError.value = ''
+  // The selected pool may have changed; never keep quotes from the previous
+  // filter while a new list is being loaded.
+  quoteSeq += 1
+  quoteLoading.value = false
+  rows.value = []
+  quotes.value = {}
+  quoteMeta.value = {}
   try {
     const q = { pool_type: poolType.value }
     if (poolType.value === 'track' && trackId.value) q.track_id = trackId.value
     const data = await api.get('/api/screener/pool', { params: q, silent: true })
     if (seq !== loadSeq) return // 竞态:丢弃过期响应
-    rows.value = Array.isArray(data) ? data : (data?.items || data?.data || [])
+    const items = Array.isArray(data) ? data : (data?.items || data?.data)
+    if (!Array.isArray(items)) throw new Error('invalid pool response')
+    rows.value = items
     page.value = 1
+  } catch {
+    if (seq === loadSeq) {
+      rows.value = []
+      loadError.value = '选股池读取失败，请点击刷新重试。'
+    }
+    return
   } finally {
     if (seq === loadSeq) loading.value = false
   }
   // 行情独立异步加载:列表先渲染,行情慢/失败都不阻塞表格
   await loadQuotes()
-  scheduleQuoteRefresh()
+  if (active && seq === loadSeq) scheduleQuoteRefresh()
 }
 
 async function forceOut(row) {
@@ -262,10 +326,26 @@ async function forceOut(row) {
 }
 
 async function loadHistory() {
+  const seq = ++historySeq
+  historyError.value = ''
   try {
     const data = await api.get('/api/screener/pool/history', { silent: true })
-    history.value = Array.isArray(data) ? data : (data?.items || data?.data || [])
-  } catch { history.value = [] }
+    if (seq !== historySeq) return
+    const items = Array.isArray(data) ? data : (data?.items || data?.data)
+    if (!Array.isArray(items)) throw new Error('invalid pool history response')
+    history.value = items
+  } catch {
+    if (seq === historySeq) historyError.value = `出池留档读取失败${history.value.length ? '，显示上次结果' : ''}；请点击刷新重试。`
+  }
+}
+
+async function loadRiskGuard() {
+  const seq = ++riskSeq
+  try {
+    const data = await api.get('/api/screener/dashboard', { silent: true })
+    if (seq !== riskSeq) return
+    riskGuard.value = typeof data?.risk_guard === 'boolean' ? data.risk_guard : null
+  } catch { if (seq === riskSeq) riskGuard.value = null }
 }
 
 // 全局搜股透传:Layout 通过 /pool?q=代码 跳转,这里填搜索框(不再走 localStorage + 整页刷新)
@@ -279,8 +359,12 @@ function applyQuerySearch() {
 watch(() => [route.query.q, route.query.t], applyQuerySearch)
 
 onMounted(async () => {
+  active = true
   applyQuerySearch()
   document.addEventListener('visibilitychange', onVisibilityChange)
+  quoteClockTimer = setInterval(() => { quoteClock.value = Date.now() }, 1000)
+  loadRiskGuard()
+  loadHistory()
   try {
     const list = await api.get('/api/screener/tracks', { silent: true })
     tracks.value = Array.isArray(list) ? list : []
@@ -290,18 +374,30 @@ onMounted(async () => {
       if (first) trackId.value = first.id
     }
   } catch { tracks.value = [] }
-  await loadHistory()
+  if (!active) return
   await load()
-  // 弱市守门横幅(来自仪表盘同一数据源);失败置 null 显式披露,不再静默当 false
-  try {
-    const d = await api.get('/api/screener/dashboard', { silent: true })
-    riskGuard.value = !!d.risk_guard
-  } catch { riskGuard.value = null }
 })
 onBeforeUnmount(() => {
+  active = false
   loadSeq += 1
+  historySeq += 1
+  riskSeq += 1
   quoteSeq += 1 // 丢弃在途行情响应
   if (quoteTimer) { clearInterval(quoteTimer); quoteTimer = null }
+  if (quoteClockTimer) { clearInterval(quoteClockTimer); quoteClockTimer = null }
   document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 </script>
+
+<style scoped>
+.workbench-card { border-radius: var(--radius-card, 12px); border-color: var(--line-soft, #e6ebf2); box-shadow: var(--shadow-card, 0 4px 16px rgba(24, 44, 72, .05)); }
+.workbench-table :deep(.el-table__header th) { background: #f7f9fc; color: #617089; font-size: 12px; }
+.workbench-table :deep(.el-table__row:hover > td) { background: #f4f8ff !important; }
+.data-quality-label { color: var(--success, #188c64); font-size: 12px; white-space: nowrap; }
+.data-quality-label.degraded { color: var(--warning, #b97700); }
+.quote-alert { margin: 0 0 12px; }
+@media (max-width: 768px) {
+  .pool-page :deep(.card-head) { align-items: stretch; }
+  .pool-page :deep(.el-input), .pool-page :deep(.el-select) { width: 100% !important; }
+}
+</style>
